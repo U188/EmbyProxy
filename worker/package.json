@@ -1,0 +1,16 @@
+{
+  "name": "embyproxy-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:obfuscate": "mkdir -p dist && javascript-obfuscator src/index.js --output dist/index.js --config obfuscator.config.json",
+    "dev": "wrangler dev",
+    "deploy": "npm run build:obfuscate && wrangler deploy",
+    "d1:init": "wrangler d1 execute media_c8af70 --file=./schema.sql"
+  },
+  "devDependencies": {
+    "javascript-obfuscator": "^5.4.3",
+    "wrangler": "^4.0.0"
+  }
+}

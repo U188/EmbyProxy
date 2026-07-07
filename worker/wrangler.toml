@@ -1,0 +1,28 @@
+name = "clear-bridge-d706"
+main = "dist/index.js"
+compatibility_date = "2026-07-06"
+
+workers_dev = true
+routes = [
+  { pattern = "hu.fuck.8899.qzz.io", custom_domain = true },
+  { pattern = "md.8899.qzz.io/*", zone_name = "8899.qzz.io" }
+]
+
+[triggers]
+crons = ["0 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "media_c8af70"
+database_id = "92f92005-ab1e-4847-afec-296d7fc3cb00"
+
+[vars]
+CF_ACCOUNT_ID = "90ac42d7b69175ced6546f4f76669e43"
+CF_ZONE_ID = "aba5bb98b1a466e1e3af840d966e9713"
+CF_DOMAIN = "hu.fuck.8899.qzz.io"
+CF_DNS_DOMAIN = "md.8899.qzz.io"
+CF_WORKER_NAME = "clear-bridge-d706"
+TG_REPORT_HOUR = "9"
+PREFERRED_IPS_URL = "https://raw.githubusercontent.com/ZhiXuanWang/cf-speed-dns/refs/heads/main/ipTop10.html"
+
+# Set ADMIN_TOKEN, CF_API_TOKEN, TG_BOT_TOKEN and TG_CHAT_ID with wrangler secret.

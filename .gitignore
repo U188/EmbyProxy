@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+worker/node_modules/
+
+# Wrangler local state
+.wrangler/
+worker/.wrangler/
+
+# Generated deployment bundle
+worker/dist/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local workspace files
+.mindfs/
+.codex/
+.claude/
+.vscode/
+AGENTS.md
+CLAUDE.md
+
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
