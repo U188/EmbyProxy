@@ -77,7 +77,7 @@ watch_seconds    模拟观看秒数，默认 300，最低 180
 统计分成几类，避免把 HTTP 请求数误认为观看次数：
 
 - 有效观看：写入 `watch_sessions`，来源于 `Sessions/Playing*` 播放控制上报；按节点、用户/设备、视频和播放会话去重，进度超过 60 秒才计 1 次。
-- 中转视频：`kind = stream_proxy`，只有真正经过 Worker 的视频/音频流才计入，流量按响应流实际转发字节累计。
+- 中转视频：`kind = stream_proxy`，只有真正经过 Worker 的视频/音频流才计入；为避免影响起播速度，默认按响应头估算流量，设置 `STREAM_BYTE_ACCOUNTING=exact` 或 `EXACT_STREAM_BYTES=1` 后才按响应流实际转发字节累计。
 - 直连跳转：`kind = stream_direct`，只记录 Worker 返回 302 的次数，字节为 0；真实视频流由客户端直连源站，Worker 无法得知真实 GB 流量。
 - 播放控制：`kind = playback_event`，例如 `Sessions/Playing` / `Progress`，用于识别观看会话，不作为视频流量。
 - 播放信息：`kind = playback_meta`，例如 `PlaybackInfo`，不作为观看次数。

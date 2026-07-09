@@ -425,6 +425,17 @@ async function handleProxy(request, env, ctx) {
         continue;
       }
 
+      const streamRedirect = await followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env);
+      if (streamRedirect) {
+        if (isRetryableStatus(streamRedirect.upstream.status) && targets.length > 1) {
+          lastResponse = streamRedirect.upstream;
+          lastResponseURL = streamRedirect.targetURL;
+          continue;
+        }
+        const response = await finishProxyResponse(streamRedirect.upstream, request, node, streamRedirect.targetURL, inboundURL, env);
+        return recordProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request), bodyBuffer);
+      }
+
       const response = await finishProxyResponse(upstream, request, node, targetURL, inboundURL, env);
       if (cacheableImage && response.ok) {
         ctx.waitUntil(caches.default.put(outbound, response.clone()));
@@ -501,8 +512,11 @@ async function handleRawProxy(request, env, ctx, node, routePath, bodyBuffer, in
     targetURL.search = new URL(request.url).search;
   }
   const upstream = await fetchRawWithRetries(request, targetURL, node, bodyBuffer, env);
-  const response = await finishProxyResponse(upstream, request, node, targetURL, inboundURL, env);
-  return recordProxyResponse(ctx, env, request, node.name, targetURL.pathname, response, requestKind(targetURL.pathname, response, request), bodyBuffer);
+  const streamRedirect = await followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env);
+  const finalUpstream = streamRedirect?.upstream || upstream;
+  const finalURL = streamRedirect?.targetURL || targetURL;
+  const response = await finishProxyResponse(finalUpstream, request, node, finalURL, inboundURL, env);
+  return recordProxyResponse(ctx, env, request, node.name, finalURL.pathname, response, requestKind(finalURL.pathname, response, request), bodyBuffer);
 }
 
 async function fetchRawWithRetries(request, targetURL, node, bodyBuffer, env) {
@@ -522,6 +536,43 @@ async function fetchRawWithRetries(request, targetURL, node, bodyBuffer, env) {
     }
   }
   return last;
+}
+
+async function followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env) {
+  if (!upstream || !isRedirectStatus(upstream.status) || !isPlaybackStreamRequest(request, targetURL)) {
+    return null;
+  }
+  if ((node.streamMode || "proxy") !== "proxy" || !["GET", "HEAD"].includes(request.method)) {
+    return null;
+  }
+  let currentResponse = upstream;
+  let currentURL = targetURL;
+  for (let i = 0; i < 3; i++) {
+    const location = currentResponse.headers.get("location");
+    if (!location) {
+      return null;
+    }
+    let nextURL;
+    try {
+      nextURL = new URL(location, currentURL);
+    } catch {
+      return null;
+    }
+    if (!["http:", "https:"].includes(nextURL.protocol)) {
+      return null;
+    }
+    try {
+      currentResponse.body?.cancel?.();
+    } catch {
+      // Ignore body cleanup errors while following stream redirects.
+    }
+    currentURL = nextURL;
+    currentResponse = await fetchRawWithRetries(request, currentURL, node, bodyBuffer, env);
+    if (!isRedirectStatus(currentResponse.status)) {
+      return { upstream: currentResponse, targetURL: currentURL };
+    }
+  }
+  return { upstream: currentResponse, targetURL: currentURL };
 }
 
 function bodyCanRetry(bodyBuffer) {
@@ -547,6 +598,9 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
   const streaming = isPlaybackStreamRequest(request, targetURL);
   if (!streaming) {
     deleteHeaders(headers, ["Origin", "Referer", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Sec-Fetch-User"]);
+  }
+  if ((!streaming || isManifestRequestPath(targetURL.pathname)) && !isImageRequest(targetURL.pathname)) {
+    headers.set("Accept-Encoding", "identity");
   }
 
   const clientIP = request.headers.get("cf-connecting-ip") || "";
@@ -1270,6 +1324,9 @@ async function finishProxyResponse(upstream, request, node, targetURL, inboundUR
       const textBody = await upstream.text();
       const rewritten = await rewriteResponseText(textBody, targetURL, inboundURL, node, env, headers);
       headers.delete("content-length");
+      headers.delete("content-encoding");
+      headers.delete("content-md5");
+      headers.delete("etag");
       return new Response(rewritten, { status: upstream.status, statusText: upstream.statusText, headers });
     }
   }
@@ -1339,10 +1396,7 @@ function rewriteMediaSourceURL(raw, inboundURL, node, currentHosts, hostMap) {
   const publicBase = publicNodeBase(inboundURL, node);
   const publicBasePath = new URL(publicBase).pathname;
   if (value.startsWith("/")) {
-    if (isKnownPublicRoutePath(value, publicBasePath, hostMap)) {
-      return "";
-    }
-    return publicBase + value;
+    return "";
   }
   let url;
   try {
@@ -1358,12 +1412,12 @@ function rewriteMediaSourceURL(raw, inboundURL, node, currentHosts, hostMap) {
   }
   const host = url.host.toLowerCase();
   if (currentHosts.has(host)) {
-    return publicBase + url.pathname + url.search + url.hash;
+    return publicBasePath + url.pathname + url.search + url.hash;
   }
   if (hostMap.has(host)) {
-    return publicRouteBase(inboundURL.origin, hostMap.get(host)) + url.pathname + url.search + url.hash;
+    return new URL(publicRouteBase(inboundURL.origin, hostMap.get(host))).pathname + url.pathname + url.search + url.hash;
   }
-  return publicBase + "/__raw__/" + encodeURIComponent(url.toString());
+  return publicBasePath + "/__raw__/" + encodeURIComponent(url.toString());
 }
 
 async function rewriteBodyLinks(body, targetURL, inboundURL, node, env) {
@@ -1632,6 +1686,10 @@ function isPlaybackStreamRequest(request, targetURL) {
     return false;
   }
   return isPlaybackStreamPath(targetURL.pathname, request);
+}
+
+function isManifestRequestPath(path) {
+  return /\.(m3u8|mpd)$/i.test(String(path || "").toLowerCase());
 }
 
 function isResourceIdentityRequest(request, targetURL) {
@@ -1928,6 +1986,10 @@ async function getStats(env) {
 
 function recordProxyResponse(ctx, env, request, nodeName, path, response, kind, bodyBuffer) {
   if (kind === "stream_proxy" && response.body) {
+    if (!exactStreamByteAccounting(env)) {
+      ctx.waitUntil(recordRequest(env, request, nodeName, path, response.status, streamByteEstimate(response), kind, bodyBuffer));
+      return response;
+    }
     const counted = countResponseBytes(response);
     ctx.waitUntil(counted.bytesPromise
       .then((bytes) => recordRequest(env, request, nodeName, path, response.status, bytes, kind, bodyBuffer))
@@ -1936,6 +1998,24 @@ function recordProxyResponse(ctx, env, request, nodeName, path, response, kind, 
   }
   ctx.waitUntil(recordRequest(env, request, nodeName, path, response.status, contentLength(response), kind, bodyBuffer));
   return response;
+}
+
+function exactStreamByteAccounting(env) {
+  return String(env.STREAM_BYTE_ACCOUNTING || env.EXACT_STREAM_BYTES || "").toLowerCase() === "exact" ||
+    String(env.EXACT_STREAM_BYTES || "").toLowerCase() === "1" ||
+    String(env.EXACT_STREAM_BYTES || "").toLowerCase() === "true";
+}
+
+function streamByteEstimate(response) {
+  const match = String(response.headers.get("content-range") || "").match(/bytes\s+(\d+)-(\d+)\/(\d+|\*)/i);
+  if (match) {
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    if (Number.isFinite(start) && Number.isFinite(end) && end >= start) {
+      return end - start + 1;
+    }
+  }
+  return contentLength(response);
 }
 
 function countResponseBytes(response) {
@@ -4069,6 +4149,10 @@ function trimSlash(path) {
 
 function isRetryableStatus(status) {
   return status >= 500 || status === 403 || status === 404 || status === 416;
+}
+
+function isRedirectStatus(status) {
+  return [301, 302, 303, 307, 308].includes(Number(status));
 }
 
 function stripResponseHeaders(headers) {
