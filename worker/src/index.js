@@ -5,6 +5,15 @@ const DEFAULT_CLIENT_PROFILE = "yamby";
 const DEFAULT_NODE_ICON = "🎬";
 const IDENTITY_KEY = "system:upstream_identity";
 const DEFAULT_DEVICE_NAME = "OnePlus-PKG110";
+const EMBY_TICKS_PER_SECOND = 10000000;
+const DEFAULT_SIMULATED_WATCH_SECONDS = 300;
+const MIN_SIMULATED_WATCH_SECONDS = 180;
+const MIN_PROGRESS_DELAY_SECONDS = 65;
+const MAX_AUTO_SIMULATED_WATCHES_PER_CRON = 3;
+const AUTO_WATCH_DAILY_PREFIX = "auto_watch_day:";
+const DEFAULT_WATCH_COUNT_MIN_SECONDS = 60;
+const DEFAULT_WATCH_SESSION_RETENTION_DAYS = 180;
+const WATCH_SESSION_BUCKET_MS = 6 * 60 * 60 * 1000;
 const CLIENT_PROFILES = [
   { id: "yamby", label: "Yamby Android", ua: "Yamby/2.0.4.3(Android", client: "Yamby", version: "2.0.4.3", device: DEFAULT_DEVICE_NAME, authStyle: "yamby", idFormat: "uuid" },
   { id: "hills_android", label: "Hills Android", ua: "Hills/1.7.1 (android; 15)", client: "Hills", version: "1.7.1", device: "OnePlus-PKG110", idLength: 16 },
@@ -27,11 +36,20 @@ export default {
   },
 
   async scheduled(_event, env, ctx) {
-    ctx.waitUntil(cleanOldVisitorLogs(env));
-    ctx.waitUntil(sendKeepaliveReminders(env));
-    ctx.waitUntil(sendTelegramDailyIfDue(env));
+    ctx.waitUntil(handleScheduled(env));
   }
 };
+
+async function handleScheduled(env) {
+  await ensureSchema(env);
+  return Promise.allSettled([
+    cleanOldVisitorLogs(env),
+    cleanOldWatchSessions(env),
+    runAutomaticSimulatedWatches(env),
+    sendKeepaliveReminders(env),
+    sendTelegramDailyIfDue(env)
+  ]);
+}
 
 async function handleFetch(request, env, ctx) {
   const url = new URL(request.url);
@@ -93,6 +111,13 @@ async function initializeSchema(env) {
       renew_days INTEGER DEFAULT 0,
       remind_before_days INTEGER DEFAULT 0,
       keepalive_at TEXT DEFAULT '',
+      auto_watch INTEGER DEFAULT 0,
+      watch_username TEXT DEFAULT '',
+      watch_password TEXT DEFAULT '',
+      watch_token TEXT DEFAULT '',
+      watch_user_id TEXT DEFAULT '',
+      watch_item_id TEXT DEFAULT '',
+      watch_seconds INTEGER DEFAULT 300,
       created_at INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL DEFAULT 0
     )`,
@@ -128,6 +153,24 @@ async function initializeSchema(env) {
       last_notify_day TEXT DEFAULT '',
       notify_count INTEGER DEFAULT 0
     )`,
+    `CREATE TABLE IF NOT EXISTS watch_sessions (
+      node TEXT NOT NULL,
+      day TEXT NOT NULL,
+      session_key TEXT NOT NULL,
+      user_id TEXT DEFAULT '',
+      item_id TEXT DEFAULT '',
+      play_session_id TEXT DEFAULT '',
+      device_id TEXT DEFAULT '',
+      first_ts INTEGER NOT NULL,
+      last_ts INTEGER NOT NULL,
+      max_position_seconds INTEGER DEFAULT 0,
+      duration_seconds INTEGER DEFAULT 0,
+      event_count INTEGER DEFAULT 0,
+      counted INTEGER DEFAULT 0,
+      synthetic INTEGER DEFAULT 0,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (node, day, session_key)
+    )`,
     `CREATE TABLE IF NOT EXISTS dns_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts INTEGER NOT NULL,
@@ -143,7 +186,9 @@ async function initializeSchema(env) {
     )`,
     `CREATE INDEX IF NOT EXISTS idx_nodes_sort ON nodes(sort_order, name)`,
     `CREATE INDEX IF NOT EXISTS idx_visitor_logs_ts ON visitor_logs(ts)`,
-    `CREATE INDEX IF NOT EXISTS idx_request_stats_day ON request_stats(day)`
+    `CREATE INDEX IF NOT EXISTS idx_request_stats_day ON request_stats(day)`,
+    `CREATE INDEX IF NOT EXISTS idx_watch_sessions_day ON watch_sessions(day, counted)`,
+    `CREATE INDEX IF NOT EXISTS idx_watch_sessions_last ON watch_sessions(last_ts)`
   ];
   for (const statement of statements) {
     await env.DB.prepare(statement).run();
@@ -167,6 +212,13 @@ async function initializeSchema(env) {
     renew_days: "INTEGER DEFAULT 0",
     remind_before_days: "INTEGER DEFAULT 0",
     keepalive_at: "TEXT DEFAULT ''",
+    auto_watch: "INTEGER DEFAULT 0",
+    watch_username: "TEXT DEFAULT ''",
+    watch_password: "TEXT DEFAULT ''",
+    watch_token: "TEXT DEFAULT ''",
+    watch_user_id: "TEXT DEFAULT ''",
+    watch_item_id: "TEXT DEFAULT ''",
+    watch_seconds: "INTEGER DEFAULT 300",
     created_at: "INTEGER NOT NULL DEFAULT 0",
     updated_at: "INTEGER NOT NULL DEFAULT 0"
   });
@@ -180,6 +232,18 @@ async function initializeSchema(env) {
   });
   await ensureColumns(env, "request_stats", {
     bytes: "INTEGER DEFAULT 0",
+    updated_at: "INTEGER NOT NULL DEFAULT 0"
+  });
+  await ensureColumns(env, "watch_sessions", {
+    user_id: "TEXT DEFAULT ''",
+    item_id: "TEXT DEFAULT ''",
+    play_session_id: "TEXT DEFAULT ''",
+    device_id: "TEXT DEFAULT ''",
+    max_position_seconds: "INTEGER DEFAULT 0",
+    duration_seconds: "INTEGER DEFAULT 0",
+    event_count: "INTEGER DEFAULT 0",
+    counted: "INTEGER DEFAULT 0",
+    synthetic: "INTEGER DEFAULT 0",
     updated_at: "INTEGER NOT NULL DEFAULT 0"
   });
 }
@@ -236,13 +300,17 @@ async function handleAPI(request, env, ctx) {
     const body = await readJSON(request);
     return json(await resetKeepalive(env, body));
   }
+  if (url.pathname === "/api/simulated-watch" && request.method === "POST") {
+    const body = await readJSON(request);
+    return json(await runSimulatedWatch(env, body));
+  }
   if (url.pathname === "/api/nodes" && request.method === "GET") {
     return json({ ok: true, nodes: await listNodesWithKeepalive(env) });
   }
   if (url.pathname === "/api/nodes" && request.method === "POST") {
     const body = await readJSON(request);
     const saved = await saveNode(env, body);
-    return json({ ok: true, node: saved });
+    return json({ ok: true, node: publicNode(saved) });
   }
   if (url.pathname.startsWith("/api/nodes/") && request.method === "DELETE") {
     const name = decodeURIComponent(url.pathname.slice("/api/nodes/".length));
@@ -255,7 +323,7 @@ async function handleAPI(request, env, ctx) {
     return json({ ok: true });
   }
   if (url.pathname === "/api/export" && request.method === "GET") {
-    return json({ ok: true, version: BUILD_VERSION, nodes: await listNodes(env) });
+    return json({ ok: true, version: BUILD_VERSION, nodes: (await listNodes(env)).map(publicNode) });
   }
   if (url.pathname === "/api/import" && request.method === "POST") {
     const body = await readJSON(request);
@@ -336,7 +404,7 @@ async function handleProxy(request, env, ctx) {
       const targetURL = buildTargetURL(target, route.path, inboundURL.search);
       const shouldRedirect = shouldUseDirectStream(node, request, route.path);
       if (shouldRedirect) {
-        ctx.waitUntil(recordRequest(env, request, node.name, route.path, 302, 0, "direct"));
+        ctx.waitUntil(recordRequest(env, request, node.name, route.path, 302, 0, "stream_direct", bodyBuffer));
         return Response.redirect(targetURL.toString(), 302);
       }
 
@@ -345,7 +413,7 @@ async function handleProxy(request, env, ctx) {
       if (cacheableImage) {
         const cached = await caches.default.match(outbound);
         if (cached) {
-          ctx.waitUntil(recordRequest(env, request, node.name, route.path, cached.status, contentLength(cached), "image"));
+          ctx.waitUntil(recordRequest(env, request, node.name, route.path, cached.status, contentLength(cached), "image", bodyBuffer));
           return cached;
         }
       }
@@ -361,8 +429,7 @@ async function handleProxy(request, env, ctx) {
       if (cacheableImage && response.ok) {
         ctx.waitUntil(caches.default.put(outbound, response.clone()));
       }
-      ctx.waitUntil(recordRequest(env, request, node.name, route.path, response.status, contentLength(response), requestKind(route.path, response)));
-      return response;
+      return recordProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request), bodyBuffer);
     } catch (err) {
       lastError = errMessage(err);
     }
@@ -435,8 +502,7 @@ async function handleRawProxy(request, env, ctx, node, routePath, bodyBuffer, in
   }
   const upstream = await fetchRawWithRetries(request, targetURL, node, bodyBuffer, env);
   const response = await finishProxyResponse(upstream, request, node, targetURL, inboundURL, env);
-  ctx.waitUntil(recordRequest(env, request, node.name, targetURL.pathname, response.status, contentLength(response), requestKind(targetURL.pathname, response)));
-  return response;
+  return recordProxyResponse(ctx, env, request, node.name, targetURL.pathname, response, requestKind(targetURL.pathname, response, request), bodyBuffer);
 }
 
 async function fetchRawWithRetries(request, targetURL, node, bodyBuffer, env) {
@@ -1231,7 +1297,7 @@ function shouldUseDirectStream(node, request, path) {
   if (mode === "proxy") {
     return false;
   }
-  if (!isStreamingPath(path) || request.method !== "GET") {
+  if (!isStreamingPath(path, request) || request.method !== "GET") {
     return false;
   }
   if (mode === "direct") {
@@ -1241,22 +1307,37 @@ function shouldUseDirectStream(node, request, path) {
   return Boolean(node.directExternal);
 }
 
-function isStreamingPath(path) {
-  return isPlaybackPath(path);
+function isStreamingPath(path, request) {
+  return isPlaybackStreamPath(path, request);
 }
 
 function isPlaybackPath(path) {
+  return isPlaybackControlPath(path) || isPlaybackMetaPath(path) || isPlaybackStreamPath(path);
+}
+
+function isPlaybackControlPath(path) {
   const value = normalizedEmbyAPIPath(path);
+  return value.includes("/sessions/playing");
+}
+
+function isPlaybackMetaPath(path) {
+  const value = normalizedEmbyAPIPath(path);
+  return value.includes("/playbackinfo") || value.includes("/additionalparts");
+}
+
+function isPlaybackStreamPath(path, request) {
+  const value = normalizedEmbyAPIPath(path);
+  if (isPlaybackControlPath(value) || isPlaybackMetaPath(value)) {
+    return false;
+  }
   return value.includes("/smartstrm") ||
-    value.includes("/videos/") ||
     value.includes("/playback/") ||
-    value.includes("/playbackinfo") ||
-    value.includes("/sessions/playing") ||
     (value.includes("/items/") && (value.includes("/download") || value.includes("/stream") || value.includes("/file"))) ||
     value.includes("/audio/") ||
     value.includes("/hls/") ||
     value.includes("/hls1/") ||
     value.includes("/dash/") ||
+    (value.includes("/videos/") && (!request || request.headers.get("Range") !== null || value.includes("/stream") || value.includes("/original"))) ||
     /\.(mp4|m4v|m4s|m4a|ogv|webm|mkv|mov|avi|wmv|flv|ts|m3u8|mpd)$/i.test(value) ||
     /\.(flac|mp3|aac)(\?|$)/i.test(value);
 }
@@ -1265,26 +1346,7 @@ function isPlaybackStreamRequest(request, targetURL) {
   if (!request || !targetURL || !["GET", "HEAD"].includes(request.method)) {
     return false;
   }
-  const path = normalizedEmbyAPIPath(targetURL.pathname);
-  if (path.includes("/sessions/playing") || path.includes("/playbackinfo") || path.includes("/additionalparts")) {
-    return false;
-  }
-  if (/\.(mp4|m4v|m4s|m4a|ogv|webm|mkv|mov|avi|wmv|flv|ts|m3u8|mpd)$/i.test(path) || /\.(m3u8|mpd|mkv|mp4|ts|m4s)$/i.test(path)) {
-    return true;
-  }
-  if (path.includes("/smartstrm") || path.includes("/hls/") || path.includes("/hls1/") || path.includes("/dash/")) {
-    return true;
-  }
-  if (path.includes("/items/") && (path.includes("/download") || path.includes("/stream") || path.includes("/file"))) {
-    return true;
-  }
-  if (path.includes("/videos/")) {
-    return request.headers.get("Range") !== null || path.includes("/stream") || path.includes("/original");
-  }
-  if (path.includes("/audio/")) {
-    return request.headers.get("Range") !== null || path.includes("/stream") || path.includes("/universal") || path.includes("/original");
-  }
-  return false;
+  return isPlaybackStreamPath(targetURL.pathname, request);
 }
 
 function normalizedEmbyAPIPath(path) {
@@ -1305,9 +1367,15 @@ function isImageRequest(path) {
     /\.(jpg|jpeg|png|webp|gif|svg|ico)(\?|$)/i.test(value);
 }
 
-function requestKind(path, response) {
-  if (isStreamingPath(path)) {
-    return "playback";
+function requestKind(path, response, request) {
+  if (isPlaybackControlPath(path)) {
+    return "playback_event";
+  }
+  if (isPlaybackMetaPath(path)) {
+    return "playback_meta";
+  }
+  if (isPlaybackStreamPath(path, request)) {
+    return "stream_proxy";
   }
   const type = response.headers.get("content-type") || "";
   if (type.startsWith("image/")) {
@@ -1337,7 +1405,7 @@ async function listNodes(env) {
 async function listNodesWithKeepalive(env) {
   const nodes = await listNodes(env);
   const statuses = await keepaliveStatusMap(env, nodes);
-  return nodes.map((node) => ({ ...node, keepalive: statuses.get(node.name) || null }));
+  return nodes.map((node) => publicNode({ ...node, keepalive: statuses.get(node.name) || null }));
 }
 
 async function getNode(env, name) {
@@ -1362,8 +1430,9 @@ async function saveNode(env, input) {
       name, display_name, targets, stream_target, secret, client_profile, impersonate,
       header_mode, stream_mode, direct_external, cache_image, tag, remark,
       icon, sort_order, enabled, renew_days, remind_before_days, keepalive_at,
-      created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      auto_watch, watch_username, watch_password, watch_token, watch_user_id,
+      watch_item_id, watch_seconds, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(name) DO UPDATE SET
       display_name = excluded.display_name,
       targets = excluded.targets,
@@ -1383,6 +1452,13 @@ async function saveNode(env, input) {
       renew_days = excluded.renew_days,
       remind_before_days = excluded.remind_before_days,
       keepalive_at = excluded.keepalive_at,
+      auto_watch = excluded.auto_watch,
+      watch_username = excluded.watch_username,
+      watch_password = excluded.watch_password,
+      watch_token = excluded.watch_token,
+      watch_user_id = excluded.watch_user_id,
+      watch_item_id = excluded.watch_item_id,
+      watch_seconds = excluded.watch_seconds,
       updated_at = excluded.updated_at
   `).bind(
     node.name,
@@ -1404,6 +1480,13 @@ async function saveNode(env, input) {
     node.renewDays,
     node.remindBeforeDays,
     node.keepaliveAt,
+    node.autoWatch ? 1 : 0,
+    node.watchUsername,
+    node.watchPassword,
+    node.watchToken,
+    node.watchUserId,
+    node.watchItemId,
+    node.watchSeconds,
     current?.createdAt || now,
     now
   ).run();
@@ -1459,8 +1542,26 @@ function rowToNode(row) {
     renewDays: Number(row.renew_days || 0),
     remindBeforeDays: Number(row.remind_before_days || 0),
     keepaliveAt: row.keepalive_at || "",
+    autoWatch: Boolean(row.auto_watch),
+    watchUsername: row.watch_username || "",
+    watchPassword: row.watch_password || "",
+    watchToken: row.watch_token || "",
+    watchUserId: row.watch_user_id || "",
+    watchItemId: row.watch_item_id || "",
+    watchSeconds: Number(row.watch_seconds || DEFAULT_SIMULATED_WATCH_SECONDS),
     createdAt: Number(row.created_at || 0),
     updatedAt: Number(row.updated_at || 0)
+  };
+}
+
+function publicNode(node) {
+  return {
+    ...node,
+    watchPassword: "",
+    watchToken: "",
+    watchPasswordSet: Boolean(node.watchPassword),
+    watchTokenSet: Boolean(node.watchToken),
+    watchConfigured: hasSimulatedWatchCredentials(node)
   };
 }
 
@@ -1493,6 +1594,13 @@ function normalizeNode(input, current, now) {
     renewDays: intValue(input.renewDays ?? input.renew_days ?? current?.renewDays ?? 0),
     remindBeforeDays: intValue(input.remindBeforeDays ?? input.remind_before_days ?? current?.remindBeforeDays ?? 0),
     keepaliveAt: cleanString(input.keepaliveAt ?? input.keepalive_at ?? current?.keepaliveAt ?? ""),
+    autoWatch: boolValue(input.autoWatch ?? input.auto_watch ?? current?.autoWatch ?? false),
+    watchUsername: cleanString(input.watchUsername ?? input.watch_username ?? current?.watchUsername ?? ""),
+    watchPassword: credentialValue(input.watchPassword ?? input.watch_password, current?.watchPassword),
+    watchToken: credentialValue(input.watchToken ?? input.watch_token, current?.watchToken),
+    watchUserId: cleanString(input.watchUserId ?? input.watch_user_id ?? current?.watchUserId ?? ""),
+    watchItemId: cleanString(input.watchItemId ?? input.watch_item_id ?? current?.watchItemId ?? ""),
+    watchSeconds: clampNumber(input.watchSeconds ?? input.watch_seconds ?? current?.watchSeconds ?? DEFAULT_SIMULATED_WATCH_SECONDS, MIN_SIMULATED_WATCH_SECONDS, 7200),
     createdAt: current?.createdAt || now,
     updatedAt: now
   };
@@ -1503,14 +1611,86 @@ async function getStats(env) {
   const rows = await env.DB.prepare(`
     SELECT node, kind, count, bytes FROM request_stats WHERE day = ? ORDER BY count DESC
   `).bind(day).all();
+  const watches = await env.DB.prepare(`
+    SELECT node, COUNT(*) AS count, MAX(last_ts) AS last_ts, SUM(max_position_seconds) AS seconds
+    FROM watch_sessions
+    WHERE day = ? AND counted = 1 AND synthetic = 0
+    GROUP BY node
+    ORDER BY count DESC
+  `).bind(day).all();
+  const recentWatches = await env.DB.prepare(`
+    SELECT node, user_id, item_id, play_session_id, first_ts, last_ts, max_position_seconds
+    FROM watch_sessions
+    WHERE counted = 1 AND synthetic = 0
+    ORDER BY last_ts DESC LIMIT 20
+  `).all();
   const recent = await env.DB.prepare(`
     SELECT node, ts, ip, country, ua, method, path, status
     FROM visitor_logs ORDER BY ts DESC LIMIT 30
   `).all();
-  return { day, today: rows.results || [], recent: recent.results || [] };
+  return { day, today: rows.results || [], watches: watches.results || [], recentWatches: recentWatches.results || [], recent: recent.results || [] };
 }
 
-async function recordRequest(env, request, nodeName, path, status, bytes, kind) {
+function recordProxyResponse(ctx, env, request, nodeName, path, response, kind, bodyBuffer) {
+  if (kind === "stream_proxy" && response.body) {
+    const counted = countResponseBytes(response);
+    ctx.waitUntil(counted.bytesPromise
+      .then((bytes) => recordRequest(env, request, nodeName, path, response.status, bytes, kind, bodyBuffer))
+      .catch((err) => console.log("record stream bytes error", errMessage(err))));
+    return counted.response;
+  }
+  ctx.waitUntil(recordRequest(env, request, nodeName, path, response.status, contentLength(response), kind, bodyBuffer));
+  return response;
+}
+
+function countResponseBytes(response) {
+  const reader = response.body.getReader();
+  let total = 0;
+  let settled = false;
+  let settle;
+  const bytesPromise = new Promise((resolve) => {
+    settle = (value) => {
+      if (!settled) {
+        settled = true;
+        resolve(value);
+      }
+    };
+  });
+  const stream = new ReadableStream({
+    async pull(controller) {
+      try {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          settle(total);
+          controller.close();
+          return;
+        }
+        total += chunk.value?.byteLength || chunk.value?.length || 0;
+        controller.enqueue(chunk.value);
+      } catch (err) {
+        settle(total);
+        throw err;
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason);
+      } finally {
+        settle(total);
+      }
+    }
+  });
+  return {
+    response: new Response(stream, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: new Headers(response.headers)
+    }),
+    bytesPromise
+  };
+}
+
+async function recordRequest(env, request, nodeName, path, status, bytes, kind, bodyBuffer) {
   const now = Date.now();
   const day = beijingDay(now);
   const ip = request.headers.get("cf-connecting-ip") || "";
@@ -1530,17 +1710,129 @@ async function recordRequest(env, request, nodeName, path, status, bytes, kind) 
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(nodeName, now, ip, country, ua.slice(0, 300), request.method, path.slice(0, 500), status)
   ]);
-  if (kind === "playback" && status < 400 && isKeepalivePlaybackPath(path)) {
+  if (kind === "playback_event" && status < 400) {
+    await recordWatchSession(env, request, nodeName, path, status, bodyBuffer, now);
+  }
+}
+
+async function recordWatchSession(env, request, nodeName, path, status, bodyBuffer, now) {
+  if (!env.DB || status >= 400 || !isPlaybackControlPath(path)) {
+    return;
+  }
+  const event = parsePlaybackEvent(request, bodyBuffer, now);
+  if (!event || !event.itemId) {
+    return;
+  }
+  const day = beijingDay(now);
+  const counted = event.positionSeconds >= watchCountMinSeconds(env) ? 1 : 0;
+  await env.DB.prepare(`
+    INSERT INTO watch_sessions (
+      node, day, session_key, user_id, item_id, play_session_id, device_id,
+      first_ts, last_ts, max_position_seconds, duration_seconds, event_count,
+      counted, synthetic, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, ?)
+    ON CONFLICT(node, day, session_key) DO UPDATE SET
+      user_id = CASE WHEN excluded.user_id != '' THEN excluded.user_id ELSE watch_sessions.user_id END,
+      item_id = CASE WHEN excluded.item_id != '' THEN excluded.item_id ELSE watch_sessions.item_id END,
+      play_session_id = CASE WHEN excluded.play_session_id != '' THEN excluded.play_session_id ELSE watch_sessions.play_session_id END,
+      device_id = CASE WHEN excluded.device_id != '' THEN excluded.device_id ELSE watch_sessions.device_id END,
+      last_ts = MAX(watch_sessions.last_ts, excluded.last_ts),
+      max_position_seconds = MAX(watch_sessions.max_position_seconds, excluded.max_position_seconds),
+      duration_seconds = MAX(watch_sessions.duration_seconds, excluded.duration_seconds),
+      event_count = watch_sessions.event_count + 1,
+      counted = CASE WHEN watch_sessions.counted = 1 OR excluded.counted = 1 THEN 1 ELSE 0 END,
+      updated_at = excluded.updated_at
+  `).bind(
+    nodeName,
+    day,
+    event.sessionKey,
+    event.userId,
+    event.itemId,
+    event.playSessionId,
+    event.deviceId,
+    now,
+    now,
+    event.positionSeconds,
+    event.durationSeconds,
+    counted,
+    now
+  ).run();
+  if (counted) {
     await markKeepalivePlayback(env, nodeName, now);
   }
 }
 
-function isKeepalivePlaybackPath(path) {
-  const value = normalizedEmbyAPIPath(path);
-  if (value.includes("/playbackinfo") || value.includes("/sessions/playing") || value.includes("/additionalparts")) {
-    return false;
+function parsePlaybackEvent(request, bodyBuffer, now) {
+  const body = parseJSONBody(bodyBuffer);
+  const url = new URL(request.url);
+  const headers = request.headers;
+  const itemId = cleanString(
+    body.ItemId || body.ItemID || body.itemId ||
+    body.NowPlayingItem?.Id || body.Item?.Id ||
+    (Array.isArray(body.ItemIds) ? body.ItemIds[0] : "") ||
+    url.searchParams.get("ItemId")
+  );
+  const userId = cleanString(
+    body.UserId || body.UserID || body.userId || body.User?.Id ||
+    url.searchParams.get("UserId") ||
+    headers.get("X-Emby-UserId") ||
+    headers.get("X-MediaBrowser-UserId")
+  );
+  const playSessionId = cleanString(
+    body.PlaySessionId || body.PlaySessionID || body.playSessionId ||
+    url.searchParams.get("PlaySessionId")
+  );
+  const deviceId = cleanString(
+    body.DeviceId || body.DeviceID || body.deviceId ||
+    url.searchParams.get("DeviceId") ||
+    headers.get("X-Emby-Device-Id") ||
+    headers.get("X-Emby-DeviceId") ||
+    headers.get("X-MediaBrowser-DeviceId")
+  );
+  if (!itemId && !playSessionId) {
+    return null;
   }
-  return isPlaybackPath(value);
+  const positionSeconds = ticksToSeconds(body.PositionTicks ?? body.positionTicks ?? body.Position ?? body.position ?? 0);
+  const durationSeconds = ticksToSeconds(
+    body.RunTimeTicks ?? body.DurationTicks ?? body.Item?.RunTimeTicks ?? body.NowPlayingItem?.RunTimeTicks ?? 0
+  );
+  const actor = userId || deviceId || simpleHash(`${headers.get("user-agent") || ""}|${headers.get("cf-connecting-ip") || ""}`);
+  const bucket = Math.floor(now / WATCH_SESSION_BUCKET_MS);
+  const sessionKey = simpleHash([actor, itemId || "-", playSessionId || bucket].join("|"));
+  return { itemId, userId, playSessionId, deviceId, positionSeconds, durationSeconds, sessionKey };
+}
+
+function parseJSONBody(bodyBuffer) {
+  if (!bodyBuffer || !bodyBuffer.byteLength) {
+    return {};
+  }
+  try {
+    const textBody = new TextDecoder().decode(bodyBuffer);
+    if (!/^\s*[\[{]/.test(textBody)) {
+      return {};
+    }
+    return JSON.parse(textBody);
+  } catch {
+    return {};
+  }
+}
+
+function ticksToSeconds(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n <= 0) {
+    return 0;
+  }
+  return Math.floor(n / EMBY_TICKS_PER_SECOND);
+}
+
+function simpleHash(value) {
+  let hash = 2166136261;
+  const textValue = String(value || "");
+  for (let i = 0; i < textValue.length; i++) {
+    hash ^= textValue.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
 }
 
 async function ensureKeepaliveTable(env) {
@@ -1630,6 +1922,497 @@ async function resetKeepalive(env, body) {
   return { ok: true, node: name, ts };
 }
 
+async function runSimulatedWatch(env, body) {
+  const name = normalizeName(body.node || body.name || "");
+  if (!name) {
+    return { ok: false, error: "missing node name" };
+  }
+  const node = await getNode(env, name);
+  if (!node || !node.enabled) {
+    return { ok: false, error: "node not found or disabled" };
+  }
+  const targets = selectTargets(node, "/");
+  if (!targets.length) {
+    return { ok: false, error: "node has no target" };
+  }
+
+  const identityState = await getIdentityState(env);
+  const snap = profileSnapshot(node.clientProfile || DEFAULT_CLIENT_PROFILE, identityState);
+  const requestedTarget = cleanString(body.target || "");
+  const target = requestedTarget && targets.includes(requestedTarget) ? requestedTarget : targets[0];
+  const watchInput = simulatedWatchInput(node, body);
+  const watchSeconds = clampNumber(watchInput.seconds ?? watchInput.time ?? DEFAULT_SIMULATED_WATCH_SECONDS, MIN_SIMULATED_WATCH_SECONDS, 7200);
+  const credentials = await resolveSimulatedWatchCredentials(target, snap, watchInput);
+  if (!credentials.ok) {
+    return credentials;
+  }
+
+  const requestedItemId = cleanString(watchInput.itemId || watchInput.item_id || watchInput.playId || watchInput.play_id);
+  const item = requestedItemId
+    ? await embyJSON(target, `/Users/${encodeURIComponent(credentials.userId)}/Items/${encodeURIComponent(requestedItemId)}`, {}, snap, credentials)
+    : await pickSimulatedWatchItem(target, snap, credentials);
+  if (!item?.Id) {
+    return { ok: false, error: "no playable item found" };
+  }
+
+  const playback = await startSimulatedPlayback(target, snap, credentials, item, watchSeconds);
+  if (playback.ok) {
+    await markKeepalivePlayback(env, node.name, Date.now());
+  }
+  await recordSyntheticPlayback(env, node.name, `/Sessions/Playing/Progress`, playback.status, playback.bytes, snap.ua);
+  return {
+    ok: playback.ok,
+    node: node.name,
+    target,
+    clientProfile: node.clientProfile,
+    client: snap.client,
+    device: snap.device,
+    deviceId: snap.deviceId,
+    item: { id: item.Id, name: item.Name || "" },
+    seconds: watchSeconds,
+    progressReports: playback.progressReports,
+    actualDelaySeconds: playback.actualDelaySeconds,
+    streamBytes: playback.bytes,
+    status: playback.status
+  };
+}
+
+function simulatedWatchInput(node, body = {}) {
+  return {
+    username: cleanString(body.username) || node.watchUsername || "",
+    password: cleanString(body.password) || node.watchPassword || "",
+    token: cleanString(body.token || body.accessToken || body.access_token) || node.watchToken || "",
+    userId: cleanString(body.userId || body.user_id) || node.watchUserId || "",
+    itemId: cleanString(body.itemId || body.item_id || body.playId || body.play_id) || node.watchItemId || "",
+    seconds: body.seconds ?? body.time ?? node.watchSeconds ?? DEFAULT_SIMULATED_WATCH_SECONDS
+  };
+}
+
+function hasSimulatedWatchCredentials(node) {
+  return Boolean(node?.watchToken || (node?.watchUsername && node?.watchPassword));
+}
+
+async function runAutomaticSimulatedWatches(env) {
+  if (!env.DB) {
+    return { ok: false, skipped: true };
+  }
+  await ensureSchema(env);
+  const nodes = await listNodes(env);
+  const statuses = await keepaliveStatusMap(env, nodes);
+  const day = beijingDay();
+  let attempted = 0;
+  const results = [];
+  const attemptedNodes = new Set();
+  for (const node of nodes) {
+    if (attempted >= MAX_AUTO_SIMULATED_WATCHES_PER_CRON) {
+      break;
+    }
+    if (attemptedNodes.has(node.name)) {
+      continue;
+    }
+    const status = statuses.get(node.name);
+    if (!node.enabled || !node.renewDays || !node.autoWatch || !status) {
+      continue;
+    }
+    if (!["warn", "due"].includes(status.status) || !hasSimulatedWatchCredentials(node)) {
+      continue;
+    }
+    const key = AUTO_WATCH_DAILY_PREFIX + node.name;
+    const last = await getKV(env, key);
+    if (last === day) {
+      continue;
+    }
+    attempted++;
+    attemptedNodes.add(node.name);
+    try {
+      const result = await runSimulatedWatch(env, { node: node.name, auto: true });
+      if (result.ok) {
+        await setKV(env, key, day);
+      }
+      results.push({ node: node.name, ok: result.ok, status: result.status, error: result.error || "" });
+    } catch (err) {
+      results.push({ node: node.name, ok: false, error: errMessage(err) });
+    }
+  }
+  return { ok: true, attempted, results };
+}
+
+async function resolveSimulatedWatchCredentials(target, snap, body) {
+  let token = cleanString(body.token || body.accessToken || body.access_token);
+  let userId = cleanString(body.userId || body.user_id);
+  const username = cleanString(body.username);
+  const password = cleanString(body.password);
+  if (!token && username && password) {
+    const res = await embyRaw(target, "/Users/AuthenticateByName", {
+      method: "POST",
+      body: JSON.stringify({ Username: username, Pw: password })
+    }, snap, { token: "", userId: "" });
+    if (!res.ok) {
+      return { ok: false, error: `login failed: ${res.status}` };
+    }
+    const data = await res.json().catch(() => ({}));
+    token = cleanString(data.AccessToken);
+    userId = cleanString(data.User?.Id || userId);
+  }
+  if (!token) {
+    return { ok: false, error: "missing token or username/password" };
+  }
+  const credentials = { token, userId };
+  if (!credentials.userId) {
+    const me = await embyJSON(target, "/Users/Me", {}, snap, credentials).catch(() => null);
+    credentials.userId = cleanString(me?.Id);
+  }
+  if (!credentials.userId) {
+    return { ok: false, error: "missing userId and /Users/Me did not return one" };
+  }
+  return { ok: true, token: credentials.token, userId: credentials.userId };
+}
+
+async function pickSimulatedWatchItem(target, snap, credentials) {
+  const userId = encodeURIComponent(credentials.userId);
+  const views = await embyJSON(target, `/Users/${userId}/Views`, {
+    params: { IncludeExternalContent: "false" }
+  }, snap, credentials).catch(() => ({}));
+  const collectionIds = (views.Items || [])
+    .filter((item) => ["movies", "tvshows"].includes(String(item.CollectionType || "").toLowerCase()))
+    .map((item) => item.Id)
+    .filter(Boolean);
+  const candidates = [];
+  for (const parentId of collectionIds.slice(0, 8)) {
+    const latest = await embyJSON(target, `/Users/${userId}/Items/Latest`, {
+      params: {
+        ParentId: parentId,
+        Limit: "16",
+        GroupItems: "true",
+        EnableImageTypes: "Primary,Backdrop,Thumb",
+        Fields: "PrimaryImageAspectRatio,BasicSyncInfo,ProductionYear,Status,EndDate,CanDelete"
+      }
+    }, snap, credentials).catch(() => []);
+    candidates.push(...(Array.isArray(latest) ? latest : []));
+  }
+  if (!candidates.length) {
+    const resume = await embyJSON(target, `/Users/${userId}/Items/Resume`, {
+      params: {
+        Limit: "12",
+        MediaTypes: "Video",
+        Recursive: "true",
+        EnableImageTypes: "Primary,Backdrop,Thumb",
+        Fields: "PrimaryImageAspectRatio,BasicSyncInfo,ProductionYear,CanDelete"
+      }
+    }, snap, credentials).catch(() => ({}));
+    candidates.push(...(resume.Items || []));
+  }
+  if (!candidates.length && collectionIds.length) {
+    const folder = await embyJSON(target, `/Users/${userId}/Items`, {
+      params: {
+        ParentId: collectionIds[0],
+        IncludeItemTypes: "Movie",
+        Limit: "50",
+        Recursive: "true",
+        SortBy: "SortName",
+        SortOrder: "Ascending",
+        Fields: "BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,ProductionYear"
+      }
+    }, snap, credentials).catch(() => ({}));
+    candidates.push(...(folder.Items || []));
+  }
+  const playable = candidates.filter((item) => item?.Id && String(item.MediaType || "Video") === "Video");
+  return sample(playable, 1)[0] || null;
+}
+
+async function startSimulatedPlayback(target, snap, credentials, item, seconds) {
+  const itemId = String(item.Id);
+  const playbackInfoData = simulatedPlaybackInfoBody();
+  await embyRaw(target, `/Videos/${encodeURIComponent(itemId)}/AdditionalParts`, {
+    params: {
+      Fields: "PrimaryImageAspectRatio,UserData,CanDelete",
+      IncludeItemTypes: "Playlist,BoxSet",
+      Recursive: "true",
+      SortBy: "SortName"
+    }
+  }, snap, credentials).catch(() => null);
+
+  const playbackInfo = await embyJSON(target, `/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, {
+    method: "POST",
+    params: {
+      AutoOpenLiveStream: "false",
+      IsPlayback: "false",
+      MaxStreamingBitrate: "40000000",
+      StartTimeTicks: "0",
+      UserID: credentials.userId
+    },
+    body: playbackInfoData
+  }, snap, credentials);
+  const mediaSource = playbackInfo.MediaSources?.[0] || {};
+  const mediaSourceId = mediaSource.Id || randomHex(32);
+  const playSessionId = playbackInfo.PlaySessionId || randomUUID().toUpperCase();
+
+  for (let i = 0; i < 3; i++) {
+    await embyRaw(target, `/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, {
+      method: "POST",
+      params: {
+        AudioStreamIndex: "1",
+        AutoOpenLiveStream: "true",
+        IsPlayback: "true",
+        MaxStreamingBitrate: "42000000",
+        MediaSourceId: mediaSourceId,
+        StartTimeTicks: "0",
+        UserID: credentials.userId
+      },
+      body: playbackInfoData
+    }, snap, credentials);
+  }
+
+  const bytes = await warmupSimulatedStream(target, itemId, mediaSource.DirectStreamUrl, playSessionId, snap, credentials);
+  await embyRaw(target, "/Sessions/Playing", {
+    method: "POST",
+    body: playingStatePayload({ itemId, mediaSourceId, playSessionId, tick: 0 })
+  }, snap, credentials);
+
+  const progressPlan = simulatedProgressPlan(seconds);
+  let progressReports = 0;
+  let actualDelaySeconds = 0;
+  for (const step of progressPlan) {
+    await sleep(step.delaySeconds * 1000);
+    actualDelaySeconds += step.delaySeconds;
+    if (step.stop) {
+      continue;
+    }
+    const res = await embyRaw(target, "/Sessions/Playing/Progress", {
+      method: "POST",
+      body: playingStatePayload({ itemId, mediaSourceId, playSessionId, tick: step.tick, update: true })
+    }, snap, credentials);
+    if (res.ok) {
+      progressReports++;
+    }
+  }
+  const stop = await embyRaw(target, "/Sessions/Playing/Progress", {
+    method: "POST",
+    body: playingStatePayload({
+      itemId,
+      mediaSourceId,
+      playSessionId,
+      tick: Math.floor(seconds * 0.98) * EMBY_TICKS_PER_SECOND,
+      update: true,
+      stop: true
+    })
+  }, snap, credentials);
+  return { ok: stop.ok, status: stop.status, bytes, progressReports, actualDelaySeconds };
+}
+
+async function warmupSimulatedStream(target, itemId, directStreamURL, playSessionId, snap, credentials) {
+  const path = directStreamURL || `/Videos/${encodeURIComponent(itemId)}/stream`;
+  const res = await embyRaw(target, path, {
+    headers: {
+      Range: "bytes=0-1023",
+      "X-Playback-Session-Id": playSessionId,
+      "User-Agent": "VLC/3.0.21 LibVLC/3.0.21"
+    }
+  }, snap, credentials).catch(() => null);
+  if (!res?.ok && res?.status !== 206) {
+    return 0;
+  }
+  const body = await res.arrayBuffer().catch(() => new ArrayBuffer(0));
+  return body.byteLength;
+}
+
+async function embyJSON(target, path, options, snap, credentials) {
+  const res = await embyRaw(target, path, options, snap, credentials);
+  if (!res.ok) {
+    throw new Error(`Emby request failed: ${res.status} ${path}`);
+  }
+  return res.json();
+}
+
+async function embyRaw(target, path, options = {}, snap, credentials) {
+  const url = embyTargetURL(target, path, options.params);
+  const headers = simulatedWatchHeaders(snap, credentials, options.headers);
+  const init = {
+    method: options.method || "GET",
+    headers,
+    redirect: "follow"
+  };
+  if (options.body !== undefined) {
+    init.body = typeof options.body === "string" ? options.body : JSON.stringify(options.body);
+  }
+  return fetch(url.toString(), init);
+}
+
+function embyTargetURL(target, path, params) {
+  const rawPath = String(path || "/");
+  let url;
+  if (/^https?:\/\//i.test(rawPath)) {
+    url = new URL(rawPath);
+  } else {
+    const [pathname, search = ""] = rawPath.split("?", 2);
+    url = buildTargetURL(target, pathname, search ? "?" + search : "");
+  }
+  const query = params && typeof params === "object" ? params : {};
+  for (const [key, value] of Object.entries(query)) {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  }
+  return url;
+}
+
+function simulatedWatchHeaders(snap, credentials, extra = {}) {
+  const headers = new Headers(extra);
+  if (!headers.get("User-Agent")) {
+    headers.set("User-Agent", snap.ua);
+  }
+  if (!headers.get("Accept")) {
+    headers.set("Accept", "*/*");
+  }
+  if (!headers.get("Accept-Language")) {
+    headers.set("Accept-Language", "zh-CN,zh-Hans;q=0.9");
+  }
+  if (!headers.get("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  headers.set("X-Emby-Authorization", simulatedAuthorization(snap, credentials));
+  headers.set("X-MediaBrowser-Authorization", simulatedAuthorization(snap, credentials));
+  if (credentials?.token) {
+    headers.set("X-Emby-Token", sanitizeHeaderValue(credentials.token));
+    headers.set("X-MediaBrowser-Token", sanitizeHeaderValue(credentials.token));
+  }
+  headers.set("X-Emby-Client", snap.client);
+  headers.set("X-MediaBrowser-Client", snap.client);
+  headers.set("X-Emby-Client-Version", snap.version);
+  headers.set("X-MediaBrowser-Client-Version", snap.version);
+  headers.set("X-Emby-Device-Name", snap.device);
+  headers.set("X-MediaBrowser-Device-Name", snap.device);
+  headers.set("X-Emby-Device-Id", snap.deviceId);
+  headers.set("X-MediaBrowser-Device-Id", snap.deviceId);
+  return headers;
+}
+
+function simulatedAuthorization(snap, credentials) {
+  const fields = [
+    ["Token", credentials?.token || ""],
+    ["Emby UserId", credentials?.userId || ""],
+    ["Client", snap.client],
+    ["Device", snap.device],
+    ["DeviceId", snap.deviceId],
+    ["Version", snap.version]
+  ];
+  return "MediaBrowser " + fields
+    .filter(([, value]) => value !== "")
+    .map(([key, value]) => `${key}="${escapeAuthField(value)}"`)
+    .join(", ");
+}
+
+function playingStatePayload({ itemId, mediaSourceId, playSessionId, tick, update = false, stop = false }) {
+  const queue = stop ? [] : [{ Id: String(itemId), PlaylistItemId: "playlistItem0" }];
+  return {
+    SubtitleOffset: 0,
+    MaxStreamingBitrate: 420000000,
+    MediaSourceId: String(mediaSourceId),
+    SubtitleStreamIndex: -1,
+    VolumeLevel: 100,
+    PlaybackRate: 1,
+    PlaybackStartTimeTicks: Math.floor(Date.now() / 10000) * 10 * EMBY_TICKS_PER_SECOND,
+    PositionTicks: Number(tick || 0),
+    PlaySessionId: playSessionId,
+    ...(update ? { EventName: "timeupdate" } : {}),
+    PlaylistLength: 1,
+    NowPlayingQueue: queue,
+    IsMuted: false,
+    PlaylistIndex: 0,
+    ItemId: String(itemId),
+    RepeatMode: "RepeatNone",
+    AudioStreamIndex: -1,
+    PlayMethod: "DirectStream",
+    CanSeek: true,
+    IsPaused: false
+  };
+}
+
+function simulatedProgressPlan(seconds) {
+  const total = Math.max(MIN_SIMULATED_WATCH_SECONDS, Number(seconds || DEFAULT_SIMULATED_WATCH_SECONDS));
+  const maxRealDelay = Math.max(MIN_PROGRESS_DELAY_SECONDS + 20, Math.min(180, Math.floor(total / 2)));
+  const reportCount = Math.max(1, Math.min(5, Math.floor(total / MIN_PROGRESS_DELAY_SECONDS) - 1));
+  const steps = [];
+  let elapsed = 0;
+  for (let i = 0; i < reportCount; i++) {
+    const remainingReports = reportCount - i;
+    const maxForStep = Math.max(
+      MIN_PROGRESS_DELAY_SECONDS,
+      Math.min(maxRealDelay, Math.floor((total * 0.9 - elapsed - remainingReports * MIN_PROGRESS_DELAY_SECONDS) + MIN_PROGRESS_DELAY_SECONDS))
+    );
+    const delaySeconds = randomInt(MIN_PROGRESS_DELAY_SECONDS, maxForStep);
+    elapsed += delaySeconds;
+    const jitter = randomInt(-8, 12);
+    const positionSeconds = Math.max(1, Math.min(Math.floor(total * 0.92), elapsed + jitter));
+    steps.push({ delaySeconds, tick: positionSeconds * EMBY_TICKS_PER_SECOND });
+  }
+  steps.push({ delaySeconds: randomInt(MIN_PROGRESS_DELAY_SECONDS, maxRealDelay), stop: true });
+  return steps;
+}
+
+function simulatedPlaybackInfoBody() {
+  return {
+    DeviceProfile: {
+      CodecProfiles: [
+        { Type: "Video", Codec: "h264" },
+        { Type: "Video", Codec: "hevc" }
+      ],
+      SubtitleProfiles: [
+        { Method: "Embed", Format: "ass" },
+        { Method: "Embed", Format: "ssa" },
+        { Method: "Embed", Format: "subrip" },
+        { Method: "External", Format: "subrip" },
+        { Method: "External", Format: "ass" },
+        { Method: "External", Format: "vtt" }
+      ],
+      MaxStreamingBitrate: 40000000,
+      DirectPlayProfiles: [
+        {
+          Container: "mov,mp4,mkv,webm",
+          Type: "Video",
+          VideoCodec: "h264,hevc,dvhe,dvh1,hev1,mpeg4,vp9",
+          AudioCodec: "aac,mp3,wav,ac3,eac3,flac,truehd,dts,dca,opus"
+        }
+      ],
+      TranscodingProfiles: [
+        {
+          MinSegments: 2,
+          AudioCodec: "aac,mp3,wav,ac3,eac3,flac,opus",
+          VideoCodec: "hevc,h264,mpeg4",
+          BreakOnNonKeyFrames: true,
+          Type: "Video",
+          Protocol: "hls",
+          MaxAudioChannels: "6",
+          Container: "ts",
+          Context: "Streaming"
+        }
+      ],
+      ContainerProfiles: [],
+      ResponseProfiles: [{ MimeType: "video/mp4", Container: "m4v", Type: "Video" }],
+      MusicStreamingTranscodingBitrate: 40000000,
+      MaxStaticBitrate: 40000000
+    }
+  };
+}
+
+async function recordSyntheticPlayback(env, nodeName, path, status, bytes, ua) {
+  const now = Date.now();
+  const day = beijingDay(now);
+  await env.DB.batch([
+    env.DB.prepare(`
+      INSERT INTO request_stats (node, day, kind, count, bytes, updated_at)
+      VALUES (?, ?, 'simulated_watch', 1, 0, ?)
+      ON CONFLICT(node, day, kind) DO UPDATE SET
+        count = count + 1,
+        updated_at = excluded.updated_at
+    `).bind(nodeName, day, now),
+    env.DB.prepare(`
+      INSERT INTO visitor_logs (node, ts, ip, country, ua, method, path, status)
+      VALUES (?, ?, 'worker', 'SIM', ?, 'POST', ?, ?)
+    `).bind(nodeName, now, String(ua || "").slice(0, 300), path, status || 0)
+  ]);
+}
+
 function parseKeepaliveAt(value) {
   const raw = cleanString(value);
   if (!raw) {
@@ -1649,6 +2432,14 @@ async function cleanOldVisitorLogs(env) {
   }
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
   await env.DB.prepare(`DELETE FROM visitor_logs WHERE ts < ?`).bind(cutoff).run();
+}
+
+async function cleanOldWatchSessions(env) {
+  if (!env.DB) {
+    return;
+  }
+  const cutoff = Date.now() - watchSessionRetentionDays(env) * 24 * 60 * 60 * 1000;
+  await env.DB.prepare(`DELETE FROM watch_sessions WHERE last_ts < ?`).bind(cutoff).run();
 }
 
 async function pingTarget(target) {
@@ -2088,6 +2879,16 @@ function sample(items, limit) {
   return list.slice(0, limit);
 }
 
+function randomInt(min, max) {
+  const lo = Math.ceil(min);
+  const hi = Math.max(lo, Math.floor(max));
+  return lo + Math.floor(Math.random() * (hi - lo + 1));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function purgeZoneCache(env) {
   const cfg = cloudflareConfig(env, ["CF_API_TOKEN", "CF_ZONE_ID"]);
   if (!cfg.ok) {
@@ -2335,21 +3136,30 @@ async function buildTelegramReport(env, section = "full") {
     getDNSRecordsCompat(env).catch((err) => ({ success: false, error: errMessage(err), result: [] }))
   ]);
   const rows = stats.today || [];
+  const watchRows = stats.watches || [];
   const enabled = nodes.filter((node) => node.enabled).length;
   const byKind = (kind) => rows.filter((row) => row.kind === kind);
   const sum = (items, key) => items.reduce((n, row) => n + Number(row[key] || 0), 0);
-  const playbackRows = byKind("playback");
+  const playbackEventRows = byKind("playback_event");
+  const playbackMetaRows = byKind("playback_meta");
+  const streamRows = byKind("stream_proxy");
   const imageRows = byKind("image");
   const requestRows = byKind("request");
-  const directRows = byKind("direct");
-  const playbackCount = sum(playbackRows, "count");
-  const playbackBytes = sum(playbackRows, "bytes");
+  const directRows = byKind("stream_direct");
+  const simulatedRows = byKind("simulated_watch");
+  const watchCount = sum(watchRows, "count");
+  const playbackEventCount = sum(playbackEventRows, "count");
+  const playbackMetaCount = sum(playbackMetaRows, "count");
+  const streamCount = sum(streamRows, "count");
+  const streamBytes = sum(streamRows, "bytes");
   const imageCount = sum(imageRows, "count");
   const imageBytes = sum(imageRows, "bytes");
   const requestCount = sum(requestRows, "count");
   const requestBytes = sum(requestRows, "bytes");
   const directCount = sum(directRows, "count");
+  const simulatedCount = sum(simulatedRows, "count");
   const statusRows = stats.recent || [];
+  const recentWatches = stats.recentWatches || [];
   const failures = statusRows.filter((row) => Number(row.status || 0) >= 400).slice(0, 3);
   const dnsRecords = (dns.result || []).filter((record) => ["A", "AAAA", "CNAME"].includes(record.type));
   const dnsCounts = dnsRecords.reduce((acc, record) => {
@@ -2362,19 +3172,23 @@ async function buildTelegramReport(env, section = "full") {
   sections.today = [
     "📊 今日概况",
     `🟢 节点：${enabled} 启用 / ${nodes.length} 总数`,
-    `🎬 播放请求：${playbackCount} 次`,
-    `💾 播放流量：${formatBytes(playbackBytes)}`,
+    `🎬 有效观看：${watchCount} 次`,
+    `🧭 播放控制：${playbackEventCount} 次 · 信息 ${playbackMetaCount} 次`,
+    `💾 中转视频：${streamCount} 次 · ${formatBytes(streamBytes)}`,
+    `🚀 直连跳转：${directCount} 次`,
     traffic.ok ? `🌐 全站 CF 流量：${traffic.humanBytes}` : `🌐 全站 CF 流量：${traffic.error || "未配置"}`,
     `🖼️ 图片/海报：${imageCount} 次 · ${formatBytes(imageBytes)}`,
     `📦 普通请求：${requestCount} 次 · ${formatBytes(requestBytes)}`,
-    `🚀 直达跳转：${directCount} 次`
+    `🤖 模拟观看：${simulatedCount} 次`
   ];
 
-  sections.playback = ["🏆 今日播放 TOP 5"];
-  pushTopRows(sections.playback, playbackRows, "count", true);
+  sections.playback = ["🏆 今日有效观看 TOP 5"];
+  pushWatchTopRows(sections.playback, watchRows);
 
-  sections.traffic = ["💾 今日流量 TOP 5"];
-  pushTopRows(sections.traffic, rows, "bytes", false);
+  sections.traffic = ["💾 今日 Worker 中转视频流量 TOP 5"];
+  pushTopRows(sections.traffic, streamRows, "bytes", false);
+  sections.traffic.push("", "🚀 今日直连跳转 TOP 5");
+  pushCountTopRows(sections.traffic, directRows);
 
   sections.keepalive = ["⏰ 观看提醒"];
   if (keepWarn.length) {
@@ -2409,14 +3223,13 @@ async function buildTelegramReport(env, section = "full") {
     sections.dns.push(`⚠️ DNS 获取失败：${dns.error || "未知错误"}`);
   }
 
-  sections.recent = ["🧾 最近播放记录"];
-  const recentPlayback = statusRows.filter((row) => row.kind === "playback" || isKeepalivePlaybackPath(row.path || "")).slice(0, 5);
-  if (recentPlayback.length) {
-    recentPlayback.forEach((row, index) => {
-      sections.recent.push(`${index + 1}. ${row.node} · ${row.country || "-"} · ${formatDateTime(row.ts).slice(11)} · ${row.status}`);
+  sections.recent = ["🧾 最近有效观看"];
+  if (recentWatches.length) {
+    recentWatches.slice(0, 5).forEach((row, index) => {
+      sections.recent.push(`${index + 1}. ${row.node} · ${formatDuration(row.max_position_seconds)} · ${formatDateTime(row.last_ts).slice(11)} · ${row.item_id || "-"}`);
     });
   } else {
-    sections.recent.push("暂无播放记录");
+    sections.recent.push("暂无有效观看记录");
   }
 
   const header = [
@@ -2437,7 +3250,7 @@ function buildTelegramKeyboard(env, section = "full") {
   const keyboard = [
     [
       { text: "📊 今日概况", callback_data: "report:today" },
-      { text: "🏆 播放排行", callback_data: "report:playback" }
+      { text: "🏆 观看排行", callback_data: "report:playback" }
     ],
     [
       { text: "💾 流量排行", callback_data: "report:traffic" },
@@ -2456,6 +3269,32 @@ function buildTelegramKeyboard(env, section = "full") {
     keyboard.push([{ text: "🌐 打开控制台", url: "https://" + env.CF_DOMAIN + "/admin" }]);
   }
   return { inline_keyboard: keyboard };
+}
+
+function pushWatchTopRows(lines, rows) {
+  const medals = ["🥇", "🥈", "🥉"];
+  const top = [...rows].sort((a, b) => Number(b.count || 0) - Number(a.count || 0)).slice(0, 5);
+  if (!top.length) {
+    lines.push("暂无数据");
+    return;
+  }
+  top.forEach((row, index) => {
+    const prefix = medals[index] || `${index + 1}.`;
+    lines.push(`${prefix} ${row.node}：${Number(row.count || 0)} 次 · ${formatDuration(row.seconds)}`);
+  });
+}
+
+function pushCountTopRows(lines, rows) {
+  const medals = ["🥇", "🥈", "🥉"];
+  const top = aggregateNodeRows(rows).sort((a, b) => Number(b.count || 0) - Number(a.count || 0)).slice(0, 5);
+  if (!top.length) {
+    lines.push("暂无数据");
+    return;
+  }
+  top.forEach((row, index) => {
+    const prefix = medals[index] || `${index + 1}.`;
+    lines.push(`${prefix} ${row.node}：${Number(row.count || 0)} 次`);
+  });
 }
 
 function pushTopRows(lines, rows, sortKey, playbackOnly) {
@@ -2637,22 +3476,30 @@ async function ensureKVStore(env) {
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)`).run();
 }
 
+async function getKV(env, key) {
+  await ensureKVStore(env);
+  const row = await env.DB.prepare(`SELECT value FROM kv_store WHERE key = ?`).bind(key).first();
+  return cleanString(row?.value);
+}
+
+async function setKV(env, key, value) {
+  await ensureKVStore(env);
+  await env.DB.prepare(`INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)`)
+    .bind(key, String(value ?? "")).run();
+}
+
 async function getTelegramLastMessageId(env, chatId) {
   if (!env.DB || !chatId) {
     return "";
   }
-  await ensureKVStore(env);
-  const row = await env.DB.prepare(`SELECT value FROM kv_store WHERE key = ?`).bind(`tg_last_msg_id_${chatId}`).first();
-  return cleanString(row?.value);
+  return getKV(env, `tg_last_msg_id_${chatId}`);
 }
 
 async function setTelegramLastMessageId(env, chatId, messageId) {
   if (!env.DB || !chatId || !messageId) {
     return;
   }
-  await ensureKVStore(env);
-  await env.DB.prepare(`INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)`)
-    .bind(`tg_last_msg_id_${chatId}`, String(messageId)).run();
+  await setKV(env, `tg_last_msg_id_${chatId}`, messageId);
 }
 
 function formatDateTime(ts) {
@@ -2715,6 +3562,19 @@ function formatBytes(bytes) {
     idx++;
   }
   return `${value.toFixed(idx === 0 ? 0 : 2)} ${units[idx]}`;
+}
+
+function formatDuration(seconds) {
+  const value = Math.max(0, Math.floor(Number(seconds || 0)));
+  if (value >= 3600) {
+    const hours = Math.floor(value / 3600);
+    const minutes = Math.floor((value % 3600) / 60);
+    return minutes ? `${hours} 小时 ${minutes} 分钟` : `${hours} 小时`;
+  }
+  if (value >= 60) {
+    return `${Math.floor(value / 60)} 分钟`;
+  }
+  return `${value} 秒`;
 }
 
 function checkAdmin(request, env) {
@@ -2852,9 +3712,51 @@ function boolDefault(value, fallback) {
   return boolValue(value);
 }
 
+function credentialValue(value, current = "") {
+  if (value === undefined || value === null) {
+    return cleanString(current);
+  }
+  const raw = cleanString(value);
+  if (!raw) {
+    return cleanString(current);
+  }
+  if (raw === "__clear__") {
+    return "";
+  }
+  return raw;
+}
+
 function intValue(value) {
   const n = Number.parseInt(String(value ?? "0"), 10);
   return Number.isFinite(n) ? n : 0;
+}
+
+function clampNumber(value, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    return min;
+  }
+  return Math.min(max, Math.max(min, n));
+}
+
+function envInt(env, key, fallback, min, max) {
+  const raw = env?.[key];
+  if (raw === undefined || raw === null || raw === "") {
+    return fallback;
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    return fallback;
+  }
+  return Math.floor(Math.min(max, Math.max(min, n)));
+}
+
+function watchCountMinSeconds(env) {
+  return envInt(env, "WATCH_COUNT_MIN_SECONDS", DEFAULT_WATCH_COUNT_MIN_SECONDS, 10, 3600);
+}
+
+function watchSessionRetentionDays(env) {
+  return envInt(env, "WATCH_SESSION_RETENTION_DAYS", DEFAULT_WATCH_SESSION_RETENTION_DAYS, 7, 3650);
 }
 
 function enumValue(value, allowed, fallback) {
@@ -3029,6 +3931,7 @@ body.dark .x{background:rgba(44,44,46,.72)}
 @media(max-width:900px){body{padding:10px 10px 86px}.trace-grid,.metrics,.two-col,.chart-grid{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr 1fr}.node-form{grid-template-columns:repeat(2,minmax(0,1fr))}.node-form .field,.node-form .field.w2,.node-form .field.w4,.node-form .field.w6,.node-form .field.full,.node-form .field.w12{grid-column:span 1}.option-row{grid-template-columns:repeat(2,minmax(0,1fr))}.field.span2,.field.full{grid-column:1/-1}.topbar{align-items:flex-start}.actions,.toolbar,.card-actions{width:100%}.actions .btn:not(.icon),.toolbar .btn,.card-actions .btn{flex:1}.page-tabs{bottom:10px;width:calc(100vw - 16px);justify-content:flex-start}.page-tab{min-height:38px;padding:0 11px;font-size:12px}.search-input{width:100%;min-width:0}.node-grid{grid-template-columns:1fr}.info-row{display:grid}.info-value{text-align:left}}
 @media(max-width:520px){.container{gap:10px}.card{padding:12px}.brand h1{font-size:20px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.metric b{font-size:20px}.form-grid,.node-form,.option-row{grid-template-columns:1fr}.node-form .field,.node-form .field.w2,.node-form .field.w4,.node-form .field.w6,.node-form .field.full,.node-form .field.w12{grid-column:1/-1}.node-grid{gap:10px}.topbar .actions{display:grid;grid-template-columns:1fr auto auto auto;gap:7px}.status-pill{min-width:0}.bar-row{grid-template-columns:80px 1fr}.bar-value{grid-column:2/3}.page-tabs{padding:6px;gap:4px}.page-tab{min-height:36px;padding:0 10px}.ip-table table,.ip-table thead,.ip-table tbody,.ip-table tr,.ip-table td{display:block;width:100%;min-width:0}.ip-table table{border-collapse:separate}.ip-table thead{display:none}.ip-table tr{position:relative;margin:10px 0;padding:12px;border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.58);box-shadow:0 6px 18px rgba(0,0,0,.05)}body.dark .ip-table tr{background:rgba(44,44,46,.58)}.ip-table td{border:0;padding:4px 0}.ip-table td:first-child{position:absolute;right:12px;top:12px;width:auto}.ip-table .ip-text{display:block;max-width:calc(100% - 42px);font-size:13px;word-break:break-all}.ip-table .latency:before{content:"延迟 ";color:var(--text-sec);font-weight:650}.ip-table .speed:before{content:"状态 ";color:var(--text-sec);font-weight:650}.ip-table .loc:before{content:"归属 ";color:var(--text-sec);font-weight:650}.ip-table td:last-child{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.ip-table td:last-child .btn{flex:1}.ip-table tr:not(.test-row) td{padding:16px 8px;text-align:center}.ip-table tr:not(.test-row) td:before{content:""}}
 </style>
+
 </head>
 <body>
 <div id="toast"></div>
@@ -3065,17 +3968,17 @@ body.dark .x{background:rgba(44,44,46,.72)}
       </div>
     </section>
     <div id="notice" class="notice"></div>
-    <nav class="page-tabs">
-      <button class="page-tab active" data-page-tab="overview">总览</button>
-      <button class="page-tab" data-page-tab="nodes">线路配置</button>
-      <button class="page-tab" data-page-tab="network">测速与 DNS</button>
-      <button class="page-tab" data-page-tab="deploy">代码更新</button>
-      <button class="page-tab" data-page-tab="dashboard">数据大屏</button>
-    </nav>
+	    <nav class="page-tabs">
+	      <button class="page-tab active" data-page-tab="overview">总览</button>
+	      <button class="page-tab" data-page-tab="nodes">线路配置</button>
+	      <button class="page-tab" data-page-tab="network">测速与 DNS</button>
+	      <button class="page-tab" data-page-tab="deploy">代码更新</button>
+	      <button class="page-tab" data-page-tab="dashboard">数据大屏</button>
+	    </nav>
 
-    <section class="trace-grid page active" data-page="overview">
-      <div class="trace-box">
-        <div class="trace-icon">⌖</div>
+	    <section class="trace-grid page active" data-page="overview">
+	      <div class="trace-box">
+	        <div class="trace-icon">⌖</div>
         <div><div class="trace-label">访客入口</div><div id="traceEntry" class="trace-value mono">读取中...</div></div>
       </div>
       <div class="trace-box">
@@ -3087,8 +3990,8 @@ body.dark .x{background:rgba(44,44,46,.72)}
     <section class="metrics page active" data-page="overview">
       <div class="metric"><span>节点总数</span><b id="metricNodes">0</b></div>
       <div class="metric"><span>已启用</span><b id="metricEnabled">0</b></div>
-      <div class="metric"><span>今日请求</span><b id="metricRequests">0</b></div>
-      <div class="metric"><span>今日流量</span><b id="metricBytes">0 B</b></div>
+      <div class="metric"><span>有效观看</span><b id="metricRequests">0</b></div>
+      <div class="metric"><span>中转流量</span><b id="metricBytes">0 B</b></div>
     </section>
 
     <section class="card page" data-page="deploy" style="border-left:4px solid var(--danger)">
@@ -3124,8 +4027,15 @@ body.dark .x{background:rgba(44,44,46,.72)}
         <div class="field w2"><label>周期</label><input id="renewDays" type="number" min="0" step="1" placeholder="21"></div>
         <div class="field w2"><label>提醒</label><input id="remindBeforeDays" type="number" min="0" step="1" placeholder="3"></div>
         <div class="field w2"><label>起算</label><input id="keepaliveAt" placeholder="2026-07-07"></div>
+        <div class="field w2"><label>模拟秒数</label><input id="watchSeconds" type="number" min="180" max="7200" step="1" placeholder="300"></div>
+        <div class="field w4"><label>保活账号</label><input id="watchUsername" autocomplete="off" placeholder="可空，Token 优先"></div>
+        <div class="field w4"><label>保活密码</label><input id="watchPassword" type="password" autocomplete="new-password" placeholder="留空保留，__clear__ 清空"></div>
+        <div class="field w6"><label>保活 Token</label><input id="watchToken" autocomplete="off" placeholder="留空保留，Token 优先"></div>
+        <div class="field w2"><label>User ID</label><input id="watchUserId" autocomplete="off" placeholder="可空"></div>
+        <div class="field w4"><label>指定视频 ID</label><input id="watchItemId" autocomplete="off" placeholder="可空，留空自动选片"></div>
         <div class="option-row">
           <label class="check"><input id="impersonate" type="checkbox" checked>启用模拟客户端</label>
+          <label class="check"><input id="autoWatch" type="checkbox">到期自动模拟观看</label>
           <label class="check"><input id="directExternal" type="checkbox">自动模式允许直链</label>
           <label class="check"><input id="cacheImage" type="checkbox" checked>海报及图片缓存</label>
           <label class="check"><input id="enabled" type="checkbox" checked>启用节点</label>
@@ -3201,6 +4111,12 @@ body.dark .x{background:rgba(44,44,46,.72)}
       <div class="metric"><span>D1 日期</span><b id="statsDay" style="font-size:18px">--</b></div>
     </section>
     <div id="dashboardCharts" class="chart-grid"></div>
+    <div class="table-wrapper" style="margin-bottom:12px">
+      <table>
+        <thead><tr><th>时间</th><th>节点</th><th>视频 ID</th><th>播放进度</th><th>用户</th><th>会话</th></tr></thead>
+        <tbody id="watchRows"><tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无有效观看</td></tr></tbody>
+      </table>
+    </div>
     <div class="table-wrapper">
       <table>
         <thead><tr><th>时间</th><th>节点</th><th>IP</th><th>地区</th><th>状态</th><th>路径</th></tr></thead>
@@ -3357,13 +4273,21 @@ function renderNodes(){
       infoRow("线路地址", '<span class="masked" data-secret="' + attr((n.targets || []).join("\\n")) + '">' + esc(firstTarget ? "••••••••••••" : "未配置") + '</span>') +
       infoRow("Header", esc(n.headerMode || "dual") + " / " + esc(n.streamMode || "proxy")) +
       infoRow("模拟", n.impersonate === false ? "关闭" : esc(CLIENT_LABELS[n.clientProfile] || n.clientProfile || "")) +
+      infoRow("自动观看", autoWatchHTML(n)) +
       infoRow("观看提醒", keepaliveHTML(n)) +
       infoRow("密钥", n.secret ? '<span class="masked" data-secret="' + attr(n.secret) + '">••••••</span>' : "无") +
-      '<div class="card-footer"><div class="card-actions"><button class="btn small" data-act="up" data-name="' + attr(n.name) + '" ' + (index === 0 ? "disabled" : "") + '>上移</button><button class="btn small" data-act="down" data-name="' + attr(n.name) + '" ' + (index === list.length - 1 ? "disabled" : "") + '>下移</button></div><div class="card-actions"><button class="btn small" data-act="copy" data-name="' + attr(n.name) + '">复制</button><button class="btn small" data-act="edit" data-name="' + attr(n.name) + '">编辑</button><button class="btn small" data-act="ping" data-name="' + attr(n.name) + '">测速</button><button class="btn small" data-act="keepalive" data-name="' + attr(n.name) + '">已观看</button><button class="btn small danger" data-act="delete" data-name="' + attr(n.name) + '">删除</button></div></div>' +
+      '<div class="card-footer"><div class="card-actions"><button class="btn small" data-act="up" data-name="' + attr(n.name) + '" ' + (index === 0 ? "disabled" : "") + '>上移</button><button class="btn small" data-act="down" data-name="' + attr(n.name) + '" ' + (index === list.length - 1 ? "disabled" : "") + '>下移</button></div><div class="card-actions"><button class="btn small" data-act="copy" data-name="' + attr(n.name) + '">复制</button><button class="btn small" data-act="edit" data-name="' + attr(n.name) + '">编辑</button><button class="btn small" data-act="ping" data-name="' + attr(n.name) + '">测速</button><button class="btn small" data-act="simulate" data-name="' + attr(n.name) + '">模拟观看</button><button class="btn small" data-act="keepalive" data-name="' + attr(n.name) + '">已观看</button><button class="btn small danger" data-act="delete" data-name="' + attr(n.name) + '">删除</button></div></div>' +
     '</article>';
   }).join("") || '<div class="empty">暂无节点</div>';
 }
 function infoRow(label, value){ return '<div class="info-row"><div class="info-label">' + esc(label) + '</div><div class="info-value">' + value + '</div></div>'; }
+function autoWatchHTML(n){
+  if (!n.autoWatch) return '<span class="badge">关闭</span>';
+  const ok = n.watchConfigured;
+  const label = ok ? "已配置" : "缺少凭据";
+  const detail = (n.watchUsername ? "账号 " + n.watchUsername : (n.watchTokenSet ? "Token" : "未配置")) + " · " + (n.watchSeconds || 300) + " 秒";
+  return '<span class="badge ' + (ok ? "ok" : "warn") + '">' + label + '</span><div class="hint">' + esc(detail) + '</div>';
+}
 function keepaliveHTML(n){
   if (!n.renewDays) return '<span class="badge">关闭</span>';
   const k = n.keepalive || {};
@@ -3381,9 +4305,9 @@ function renderMetrics(){
   $("metricNodes").textContent = nodes.length;
   $("metricEnabled").textContent = nodes.filter(n => n.enabled).length;
   if (stats && stats.today) {
-    const requests = stats.today.reduce((n,r) => n + Number(r.count || 0), 0);
-    const bytes = stats.today.reduce((n,r) => n + Number(r.bytes || 0), 0);
-    $("metricRequests").textContent = requests;
+    const watches = (stats.watches || []).reduce((n,r) => n + Number(r.count || 0), 0);
+    const bytes = stats.today.filter(r => r.kind === "stream_proxy").reduce((n,r) => n + Number(r.bytes || 0), 0);
+    $("metricRequests").textContent = watches;
     $("metricBytes").textContent = humanBytes(bytes);
   }
 }
@@ -3420,7 +4344,14 @@ async function saveNode(){
     remark: $("remark").value,
     renewDays: Number($("renewDays").value || 0),
     remindBeforeDays: Number($("remindBeforeDays").value || 0),
-    keepaliveAt: $("keepaliveAt").value
+    keepaliveAt: $("keepaliveAt").value,
+    autoWatch: $("autoWatch").checked,
+    watchUsername: $("watchUsername").value,
+    watchPassword: $("watchPassword").value,
+    watchToken: $("watchToken").value,
+    watchUserId: $("watchUserId").value,
+    watchItemId: $("watchItemId").value,
+    watchSeconds: Number($("watchSeconds").value || 300)
   };
   try {
     await api("/api/nodes", { method:"POST", body: JSON.stringify(body) });
@@ -3491,6 +4422,15 @@ function editNode(name){
   $("renewDays").value = n.renewDays || "";
   $("remindBeforeDays").value = n.remindBeforeDays || "";
   $("keepaliveAt").value = n.keepaliveAt || "";
+  $("autoWatch").checked = !!n.autoWatch;
+  $("watchUsername").value = n.watchUsername || "";
+  $("watchPassword").value = "";
+  $("watchPassword").placeholder = n.watchPasswordSet ? "已保存，留空保留，__clear__ 清空" : "留空保留，__clear__ 清空";
+  $("watchToken").value = "";
+  $("watchToken").placeholder = n.watchTokenSet ? "已保存，留空保留，__clear__ 清空" : "留空保留，Token 优先";
+  $("watchUserId").value = n.watchUserId || "";
+  $("watchItemId").value = n.watchItemId || "";
+  $("watchSeconds").value = n.watchSeconds || 300;
   $("tag").value = n.tag || ""; $("remark").value = n.remark || "";
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
@@ -3518,6 +4458,25 @@ async function markWatched(name){
     loadNodes({ quietAuth: true });
   } catch(e){ handleError(e); }
 }
+async function simulateWatch(name){
+  const raw = await uiPrompt('输入 Emby Token，或 JSON：{"token":"...","userId":"...","itemId":"...","seconds":300}\\n也可临时输入：{"username":"...","password":"...","seconds":300}', "模拟观看", "token 或 JSON");
+  if (!raw) return;
+  let body = { node: name, token: String(raw).trim() };
+  const trimmed = String(raw).trim();
+  if (trimmed.startsWith("{")) {
+    try {
+      body = { node: name, ...JSON.parse(trimmed) };
+    } catch (e) {
+      return handleError(new Error("JSON 格式无效"));
+    }
+  }
+  try {
+    const data = await api("/api/simulated-watch", { method:"POST", body: JSON.stringify(body) });
+    showToast("模拟完成：" + (data.item?.name || data.item?.id || name));
+    await loadNodes({ quietAuth: true });
+    await loadStats();
+  } catch(e){ handleError(e); }
+}
 async function loadStats(){
   try {
     const data = await api("/api/stats");
@@ -3525,6 +4484,7 @@ async function loadStats(){
     renderMetrics();
     $("statsOut").textContent = JSON.stringify(stats, null, 2);
     $("statsDay").textContent = stats.day || "--";
+    renderWatchRows(stats.recentWatches || []);
     renderLogs(stats.recent || []);
     renderDashboardCharts();
   }
@@ -3547,15 +4507,27 @@ function renderDashboardCharts(){
   const box = $("dashboardCharts");
   if (!box) return;
   const rows = stats?.today || [];
-  const kindNames = { playback:"播放", image:"图片", request:"普通", direct:"直达" };
+  const kindNames = {
+    playback_event:"播放控制",
+    playback_meta:"播放信息",
+    stream_proxy:"中转视频",
+    stream_direct:"直连跳转",
+    simulated_watch:"模拟观看",
+    playback:"旧播放",
+    image:"图片",
+    request:"普通",
+    direct:"旧直达"
+  };
   const kindRows = Object.values(rows.reduce((acc, row) => {
     const key = row.kind || "request";
     acc[key] = acc[key] || { label: kindNames[key] || key, value: 0 };
     acc[key].value += Number(row.count || 0);
     return acc;
   }, {}));
-  const playbackRows = aggregateForChart(rows.filter(row => row.kind === "playback"), "count").slice(0, 6);
-  const trafficRows = aggregateForChart(rows, "bytes").slice(0, 6);
+  const watchRows = (stats?.watches || []).map(row => ({ label: row.node || "-", value: Number(row.count || 0) })).sort((a,b) => b.value - a.value).slice(0, 6);
+  const streamRows = rows.filter(row => row.kind === "stream_proxy");
+  const trafficRows = aggregateForChart(streamRows, "bytes").slice(0, 6);
+  const directRows = aggregateForChart(rows.filter(row => row.kind === "stream_direct"), "count").slice(0, 6);
   const trendRows = (analytics?.trend || []).map(row => ({ label: row.date || "-", value: Number(row.count || 0) })).slice(-7);
   const healthRows = (stats?.recent || []).reduce((acc, row) => {
     const key = Number(row.status || 0) >= 400 ? "异常" : "正常";
@@ -3565,8 +4537,9 @@ function renderDashboardCharts(){
   }, {});
   box.innerHTML =
     chartCard("请求类型分布", kindRows, item => item.value + " 次") +
-    chartCard("播放最多节点", playbackRows, item => item.value + " 次") +
-    chartCard("节点流量排行", trafficRows, item => humanBytes(item.value)) +
+    chartCard("有效观看节点", watchRows, item => item.value + " 次") +
+    chartCard("中转视频流量", trafficRows, item => humanBytes(item.value)) +
+    chartCard("直连跳转节点", directRows, item => item.value + " 次") +
     chartCard("7 日请求趋势", trendRows, item => item.value + " 次") +
     chartCard("最近状态", Object.values(healthRows), item => item.value + " 条");
 }
@@ -3626,14 +4599,19 @@ async function updateDNS(){
     loadDNS({ quiet: true });
   } catch(e){ handleError(e); }
 }
+function renderWatchRows(rows){
+  const body = $("watchRows");
+  if (!body) return;
+  body.innerHTML = rows.map(r => '<tr><td>' + esc(new Date(Number(r.last_ts || 0)).toLocaleString()) + '</td><td>' + esc(r.node || "") + '</td><td class="mono">' + esc(r.item_id || "") + '</td><td>' + esc(durationText(r.max_position_seconds)) + '</td><td class="mono">' + esc(r.user_id || "-") + '</td><td class="mono">' + esc(r.play_session_id || "-") + '</td></tr>').join("") || '<tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无有效观看</td></tr>';
+}
 function renderLogs(rows){
   $("logRows").innerHTML = rows.map(r => '<tr><td>' + esc(new Date(Number(r.ts || 0)).toLocaleString()) + '</td><td>' + esc(r.node || "") + '</td><td class="mono">' + esc(r.ip || "") + '</td><td>' + esc(r.country || "") + '</td><td>' + esc(r.status || "") + '</td><td>' + esc(r.path || "") + '</td></tr>').join("") || '<tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无数据</td></tr>';
 }
 function resetForm(){
   $("formTitle").textContent = "部署 / 编辑媒体线路";
-  for (const id of ["editingName","name","displayName","icon","targets","streamTarget","secret","tag","remark","renewDays","remindBeforeDays","keepaliveAt"]) $(id).value = "";
+  for (const id of ["editingName","name","displayName","icon","targets","streamTarget","secret","tag","remark","renewDays","remindBeforeDays","keepaliveAt","watchUsername","watchPassword","watchToken","watchUserId","watchItemId","watchSeconds"]) $(id).value = "";
   $("clientProfile").value = "yamby"; $("headerMode").value = "dual"; $("streamMode").value = "proxy";
-  $("impersonate").checked = true; $("directExternal").checked = false; $("cacheImage").checked = true; $("enabled").checked = true;
+  $("impersonate").checked = true; $("autoWatch").checked = false; $("directExternal").checked = false; $("cacheImage").checked = true; $("enabled").checked = true;
 }
 async function importNodes(){
   const raw = await uiPrompt("粘贴导出的 JSON 内容。", "导入节点", "{\\n  \\"nodes\\": []\\n}");
@@ -3894,6 +4872,16 @@ function humanBytes(bytes){
   while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
   return v.toFixed(i ? 2 : 0) + " " + units[i];
 }
+function durationText(seconds){
+  const value = Math.max(0, Math.floor(Number(seconds || 0)));
+  if (value >= 3600) {
+    const hours = Math.floor(value / 3600);
+    const minutes = Math.floor((value % 3600) / 60);
+    return minutes ? hours + " 小时 " + minutes + " 分钟" : hours + " 小时";
+  }
+  if (value >= 60) return Math.floor(value / 60) + " 分钟";
+  return value + " 秒";
+}
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function attr(v){ return esc(v).replace(/\\n/g, " "); }
 $("loginToken").addEventListener("keydown", (event) => {
@@ -3939,6 +4927,7 @@ $("nodeGrid").addEventListener("click", (event) => {
   if (btn.dataset.act === "copy") copyText(proxyURL(nodes.find(n => n.name === name) || {}));
   if (btn.dataset.act === "edit") editNode(name);
   if (btn.dataset.act === "ping") pingNode(name);
+  if (btn.dataset.act === "simulate") simulateWatch(name);
   if (btn.dataset.act === "keepalive") markWatched(name);
   if (btn.dataset.act === "delete") deleteNode(name);
   if (btn.dataset.act === "up") moveNode(name, -1);

@@ -22,11 +22,73 @@ worker/
 - 播放入口：按节点名分流，支持节点密钥
 - 节点播放模式：全代理、直链、自动
 - 请求 Header 策略和客户端模拟
-- 默认节点图标、节点延迟、流量统计、播放统计
+- 默认节点图标、节点延迟、Worker 中转流量统计、有效观看统计
 - 优选 IP 拉取、调度域名 DNS 更新
 - Telegram 定时报告、手动报告、观看提醒
 - 前端弹窗式交互提醒
+- 后台手动模拟观看：使用节点保存的模拟客户端 profile 发起 Emby 播放状态上报
 - 部署前自动混淆，只上传 `worker/dist/index.js`
+
+## 模拟观看实现路径
+
+模拟观看集中在 `worker/src/index.js`，有两种入口：
+
+- 自动入口：Cloudflare Cron 每小时执行一次，节点开启“到期自动模拟观看”且观看提醒状态为 `warn` / `due` 时触发。
+- 手动入口：后台节点卡片的“模拟观看”按钮，或直接调用后端接口：
+
+```text
+POST /api/simulated-watch
+```
+
+请求体至少需要节点名和临时认证信息：
+
+```json
+{ "node": "vip-1", "token": "EmbyAccessToken", "userId": "可选", "itemId": "可选", "seconds": 300 }
+```
+
+也可以临时传入 `username` / `password`，Worker 会登录获取 token，但不会把账号密码写入 D1。客户端身份不从请求体指定，而是读取节点表里的 `client_profile`，复用代理 Header 的 `CLIENT_PROFILES`、`profileSnapshot()` 和设备 ID 缓存。
+
+自动模拟观看使用节点表中的保活字段：
+
+```text
+auto_watch       是否开启自动模拟观看
+watch_username   Emby 用户名，可空
+watch_password   Emby 密码，可空
+watch_token      Emby AccessToken，可空，优先于账号密码
+watch_user_id    Emby UserId，可空，缺省时尝试 /Users/Me
+watch_item_id    指定视频 ID，可空，缺省时自动选片
+watch_seconds    模拟观看秒数，默认 300，最低 180
+```
+
+后台保存密码或 token 时会写入 D1，但不会在节点列表和导出接口里回显明文。编辑节点时留空会保留旧值，输入 `__clear__` 才清空。
+
+执行流程：
+
+1. 读取 D1 `nodes.client_profile`，生成该节点固定客户端、版本、设备名和设备 ID。
+2. 使用 token 或临时账号连接节点目标站点。
+3. 未指定 `itemId` 时，从用户首页、最新项目、继续观看里挑一个视频。
+4. 调用 `PlaybackInfo`、`Sessions/Playing`、`Sessions/Playing/Progress`，并用小 Range 请求预热视频流。
+5. 成功后写入模拟观看统计，并更新 `keepalive_state.last_play_ts`。
+
+模拟观看会随机生成进度上报计划，每个进度点之间真实等待至少 65 秒；`watch_seconds = 300` 通常会运行数分钟。Cloudflare Worker 长时间等待存在平台超时风险，真实用户播放仍由代理链路记录。
+
+## 统计口径
+
+统计分成几类，避免把 HTTP 请求数误认为观看次数：
+
+- 有效观看：写入 `watch_sessions`，来源于 `Sessions/Playing*` 播放控制上报；按节点、用户/设备、视频和播放会话去重，进度超过 60 秒才计 1 次。
+- 中转视频：`kind = stream_proxy`，只有真正经过 Worker 的视频/音频流才计入，流量按响应流实际转发字节累计。
+- 直连跳转：`kind = stream_direct`，只记录 Worker 返回 302 的次数，字节为 0；真实视频流由客户端直连源站，Worker 无法得知真实 GB 流量。
+- 播放控制：`kind = playback_event`，例如 `Sessions/Playing` / `Progress`，用于识别观看会话，不作为视频流量。
+- 播放信息：`kind = playback_meta`，例如 `PlaybackInfo`，不作为观看次数。
+- 图片/API：`image` 和 `request` 单独统计，不混入中转视频流量。
+
+可选环境变量：
+
+```text
+WATCH_COUNT_MIN_SECONDS       有效观看阈值，默认 60 秒
+WATCH_SESSION_RETENTION_DAYS  观看会话保留天数，默认 180 天
+```
 
 ## 准备环境
 
