@@ -4,11 +4,11 @@ const DEFAULT_RETRY_BODY_BYTES = 16 * 1024 * 1024;
 const DEFAULT_CLIENT_PROFILE = "yamby";
 const DEFAULT_NODE_ICON = "🎬";
 const IDENTITY_KEY = "system:upstream_identity";
-const DEFAULT_DEVICE_NAME = "OnePlus-PKG110";
+const LEGACY_DEFAULT_DEVICE_NAME = "OnePlus-PKG110";
 const CLIENT_PROFILES = [
-  { id: "yamby", label: "Yamby Android", ua: "Yamby/2.0.4.3(Android", client: "Yamby", version: "2.0.4.3", device: DEFAULT_DEVICE_NAME, authStyle: "yamby", idFormat: "uuid" },
-  { id: "hills_android", label: "Hills Android", ua: "Hills/1.7.1 (android; 15)", client: "Hills", version: "1.7.1", device: "OnePlus-PKG110", idLength: 16 },
-  { id: "hills_windows", label: "Hills Windows", ua: "Hills Windows/1.2.4 (windows; 19041.vb_release.191206-1406)", client: "Hills Windows", version: "1.2.4", device: DEFAULT_DEVICE_NAME, idLength: 32 }
+  { id: "yamby", label: "Yamby Android", ua: "Yamby/2.0.4.6(Android", client: "Yamby", version: "2.0.4.6", device: "Android", authStyle: "yamby", idFormat: "uuid" },
+  { id: "hills_android", label: "Hills Android", ua: "Hills/1.7.2 (android; 15)", client: "Hills", version: "1.7.2", device: "diting", authStyle: "hills", idLength: 16 },
+  { id: "hills_windows", label: "Hills Windows", ua: "Hills Windows/1.3.1 (windows; 19041.vb_release.191206-1406)", client: "Hills Windows", version: "1.3.1", device: "", authStyle: "hills", idLength: 32, devicePrefix: "DESKTOP-" }
 ];
 
 let schemaReady;
@@ -495,8 +495,14 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
 
   if (node.impersonate !== false) {
     const identityState = await getIdentityState(env);
-    applyClientProfileToURL(targetURL, headers, node.clientProfile || DEFAULT_CLIENT_PROFILE, identityState);
-    applyClientProfile(headers, node.clientProfile || DEFAULT_CLIENT_PROFILE, true, identityState);
+    const profile = node.clientProfile || DEFAULT_CLIENT_PROFILE;
+    const resourceIdentity = isResourceIdentityRequest(request, targetURL);
+    if (resourceIdentity) {
+      applyClientProfileToResourceURL(targetURL, headers, profile, identityState);
+    } else {
+      applyClientProfileToURL(targetURL, headers, profile, identityState);
+    }
+    applyClientProfile(headers, profile, true, identityState, { hillsHeaders: resourceIdentity });
   }
   if (mode === "strict") {
     headers.set("Origin", targetURL.origin);
@@ -508,11 +514,23 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
   return headers;
 }
 
-function applyClientProfile(headers, profile, overwrite, identityState) {
+function applyClientProfile(headers, profile, overwrite, identityState, options = {}) {
   const values = profileSnapshot(profile, identityState);
-  promoteAuthorizationTokenFromHeaders(headers);
+  const token = identityTokenFromHeaders(headers);
   rewriteIdentityHeaders(headers, values);
   setHeader(headers, "User-Agent", values.ua, overwrite);
+  if (values.authStyle === "hills") {
+    if (options.hillsHeaders) {
+      headers.set("X-Emby-Authorization", rewriteMediaBrowserAuthorization("Emby", values));
+    }
+    if (token) {
+      headers.set("X-Emby-Token", token);
+    }
+    return;
+  }
+  if (token) {
+    headers.set("X-Emby-Token", token);
+  }
   if (values.authStyle !== "yamby") {
     setHeader(headers, "X-Emby-Client", values.client, overwrite);
     setHeader(headers, "X-MediaBrowser-Client", values.client, overwrite);
@@ -608,7 +626,7 @@ function profileSnapshot(profile, identityState) {
   const state = identityState?.profiles?.[item.id] || {};
   return {
     ...item,
-    device: DEFAULT_DEVICE_NAME,
+    device: state.deviceName || defaultProfileDeviceName(item),
     deviceId: state.deviceId || stableDeviceID(item),
     authStyle: item.authStyle || "quoted"
   };
@@ -621,11 +639,34 @@ function applyClientProfileToURL(targetURL, headers, profile, identityState) {
     promoteAuthorizationTokenFromHeaders(headers);
     return;
   }
+  if (snap.authStyle === "hills") {
+    applyHillsQueryIdentityToURL(targetURL, headers, snap);
+    return;
+  }
+  promoteQueryAuthorizationToken(targetURL, headers);
+  rewriteIdentityQuery(targetURL, snap);
+}
+
+function applyClientProfileToResourceURL(targetURL, headers, profile, identityState) {
+  const snap = profileSnapshot(profile, identityState);
+  if (snap.authStyle === "yamby") {
+    promoteYambyQueryAuth(targetURL, headers);
+    promoteAuthorizationTokenFromHeaders(headers);
+    return;
+  }
+  if (snap.authStyle === "hills") {
+    applyHillsResourceIdentityToURL(targetURL, headers);
+    return;
+  }
   promoteQueryAuthorizationToken(targetURL, headers);
   rewriteIdentityQuery(targetURL, snap);
 }
 
 function rewriteIdentityHeaders(headers, snap) {
+  if (snap.authStyle === "hills") {
+    stripImpersonationHeaders(headers);
+    return;
+  }
   const dropIdentity = snap.authStyle === "yamby";
   const updates = [];
   headers.forEach((value, key) => {
@@ -655,6 +696,29 @@ function rewriteIdentityHeaders(headers, snap) {
     const value = headers.get(key);
     if (value && isEmbyAuthorization(value)) {
       headers.set(key, rewriteMediaBrowserAuthorization(value, snap));
+    }
+  }
+}
+
+function stripImpersonationHeaders(headers) {
+  for (const key of [...headers.keys()]) {
+    const nk = normalizeIdentityKey(key);
+    if (nk === "xembytoken") {
+      if (key !== "X-Emby-Token") {
+        headers.delete(key);
+      }
+      continue;
+    }
+    if (nk === "xembyauthorization" ||
+      nk.startsWith("xmediabrowser") ||
+      nk === "xauthorization" ||
+      nk === "xapplication" ||
+      ["xembyclient", "xembyclientversion", "xembydevicename", "xembydeviceid", "xembylanguage"].includes(nk)) {
+      headers.delete(key);
+      continue;
+    }
+    if (nk === "authorization" && isEmbyAuthorization(headers.get(key))) {
+      headers.delete(key);
     }
   }
 }
@@ -699,6 +763,127 @@ function promoteQueryAuthorizationToken(targetURL, headers) {
       return;
     }
   }
+}
+
+function applyHillsQueryIdentityToURL(targetURL, headers, snap) {
+  const token = hillsTokenForURL(targetURL, headers);
+  const params = targetURL.searchParams;
+  removeHillsQueryIdentity(params);
+  params.set("X-Emby-Authorization", rewriteMediaBrowserAuthorization("Emby", snap));
+  params.set("X-Emby-Client", snap.client);
+  params.set("X-Emby-Device-Name", snap.device);
+  params.set("X-Emby-Device-Id", snap.deviceId);
+  params.set("X-Emby-Client-Version", snap.version);
+  params.set("X-Emby-Language", hillsLanguageForURL(targetURL));
+  if (token) {
+    params.set("X-Emby-Token", token);
+    headers.set("X-Emby-Token", token);
+  }
+}
+
+function applyHillsResourceIdentityToURL(targetURL, headers) {
+  const token = hillsTokenForURL(targetURL, headers);
+  removeHillsQueryIdentity(targetURL.searchParams);
+  if (token) {
+    headers.set("X-Emby-Token", token);
+  }
+}
+
+function removeHillsQueryIdentity(params) {
+  const deleteKeys = [];
+  for (const [key, value] of params.entries()) {
+    if (isHillsQueryIdentityParam(normalizeIdentityKey(key), value)) {
+      deleteKeys.push(key);
+    }
+  }
+  for (const key of deleteKeys) {
+    params.delete(key);
+  }
+}
+
+function isHillsQueryIdentityParam(normalizedKey, value) {
+  if (normalizedKey.startsWith("xemby") || normalizedKey.startsWith("xmediabrowser")) {
+    return true;
+  }
+  if (["authorization", "xauthorization"].includes(normalizedKey)) {
+    return isEmbyAuthorization(value);
+  }
+  return false;
+}
+
+function hillsTokenForURL(targetURL, headers) {
+  return firstNonEmpty(
+    headers.get("X-Emby-Token"),
+    headers.get("X-MediaBrowser-Token"),
+    firstQueryValueByNormalizedKey(targetURL, "xembytoken"),
+    firstQueryValueByNormalizedKey(targetURL, "xmediabrowsertoken"),
+    authTokenFromURL(targetURL),
+    authTokenFromHeaders(headers)
+  );
+}
+
+function authTokenFromURL(targetURL) {
+  for (const [key, value] of targetURL.searchParams.entries()) {
+    if (!["authorization", "xauthorization", "xembyauthorization", "xmediabrowserauthorization"].includes(normalizeIdentityKey(key))) {
+      continue;
+    }
+    const token = authTokenFromValue(value);
+    if (token) {
+      return sanitizeHeaderValue(token);
+    }
+  }
+  return "";
+}
+
+function authTokenFromHeaders(headers) {
+  for (const key of ["X-Emby-Authorization", "X-MediaBrowser-Authorization", "Authorization", "X-Authorization"]) {
+    const token = authTokenFromValue(headers.get(key) || "");
+    if (token) {
+      return sanitizeHeaderValue(token);
+    }
+  }
+  return "";
+}
+
+function firstQueryValueByNormalizedKey(targetURL, normalizedKey) {
+  for (const [key, value] of targetURL.searchParams.entries()) {
+    if (normalizeIdentityKey(key) === normalizedKey && String(value || "").trim()) {
+      return sanitizeHeaderValue(value);
+    }
+  }
+  return "";
+}
+
+function identityTokenFromHeaders(headers) {
+  return firstNonEmpty(
+    headers.get("X-Emby-Token"),
+    headers.get("X-MediaBrowser-Token"),
+    authTokenFromHeaders(headers)
+  );
+}
+
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    const clean = sanitizeHeaderValue(value || "").trim();
+    if (clean) {
+      return clean;
+    }
+  }
+  return "";
+}
+
+function hillsLanguageForURL(targetURL) {
+  return isUsersRootPath(targetURL) ? "en-us" : "zh-cn";
+}
+
+function isUsersRootPath(targetURL) {
+  const parts = trimSlash(targetURL?.pathname || "").split("/").filter(Boolean);
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i].toLowerCase() === "users") {
+      return i + 2 === parts.length && Boolean(parts[i + 1]);
+    }
+  }
+  return false;
 }
 
 function rewriteIdentityQuery(targetURL, snap) {
@@ -832,12 +1017,26 @@ function normalizeIdentityState(saved) {
 
 function normalizeDeviceState(profile, saved) {
   const raw = saved && typeof saved === "object" ? saved : {};
-  const deviceName = DEFAULT_DEVICE_NAME;
+  let deviceName = cleanString(raw.deviceName || "");
+  if (!deviceName || deviceName === LEGACY_DEFAULT_DEVICE_NAME) {
+    deviceName = defaultProfileDeviceName(profile);
+  }
   let deviceId = cleanString(raw.deviceId || "").toLowerCase();
   if (!validDeviceID(profile, deviceId)) {
     deviceId = randomDeviceID(profile);
   }
   return { deviceName, deviceId };
+}
+
+function defaultProfileDeviceName(profile) {
+  const name = cleanString(profile.device || "");
+  if (name) {
+    return name;
+  }
+  if (profile.devicePrefix) {
+    return profile.devicePrefix + randomHex(6).toUpperCase();
+  }
+  return LEGACY_DEFAULT_DEVICE_NAME;
 }
 
 function validDeviceID(profile, value) {
@@ -1030,22 +1229,81 @@ async function rewriteResponseText(body, targetURL, inboundURL, node, env, heade
   if ((headers.get("content-type") || "").toLowerCase().includes("application/json") && isSystemInfoPath(new URL(inboundURL).pathname)) {
     return rewriteSystemInfo(body, publicNodeBase(inboundURL, node));
   }
-  return rewriteBodyLinks(body, targetURL, inboundURL, node, env);
+  const mediaSourceBody = await rewriteMediaSourceJSON(body, targetURL, inboundURL, node, env);
+  return rewriteBodyLinks(mediaSourceBody || body, targetURL, inboundURL, node, env);
+}
+
+async function rewriteMediaSourceJSON(body, targetURL, inboundURL, node, env) {
+  let payload;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    return "";
+  }
+  const sources = Array.isArray(payload?.MediaSources) ? payload.MediaSources : null;
+  if (!sources) {
+    return "";
+  }
+  const currentHosts = currentNodeHosts(node, targetURL);
+  const hostMap = await nodeHostMap(env);
+  let changed = false;
+  for (const source of sources) {
+    if (!source || typeof source !== "object") {
+      continue;
+    }
+    for (const key of ["DirectStreamUrl", "TranscodingUrl", "StreamUrl"]) {
+      if (typeof source[key] !== "string") {
+        continue;
+      }
+      const rewritten = rewriteMediaSourceURL(source[key], inboundURL, node, currentHosts, hostMap);
+      if (rewritten && rewritten !== source[key]) {
+        source[key] = rewritten;
+        changed = true;
+      }
+    }
+  }
+  return changed ? JSON.stringify(payload) : "";
+}
+
+function rewriteMediaSourceURL(raw, inboundURL, node, currentHosts, hostMap) {
+  const value = String(raw || "").trim();
+  if (!value || node.directExternal) {
+    return "";
+  }
+  const publicBase = publicNodeBase(inboundURL, node);
+  const publicBasePath = new URL(publicBase).pathname;
+  if (value.startsWith("/")) {
+    if (isKnownPublicRoutePath(value, publicBasePath, hostMap)) {
+      return "";
+    }
+    return publicBase + value;
+  }
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return "";
+  }
+  if (!["http:", "https:"].includes(url.protocol)) {
+    return "";
+  }
+  if (url.origin === inboundURL.origin && isKnownPublicRoutePath(url.pathname, publicBasePath, hostMap)) {
+    return "";
+  }
+  const host = url.host.toLowerCase();
+  if (currentHosts.has(host)) {
+    return publicBase + url.pathname + url.search + url.hash;
+  }
+  if (hostMap.has(host)) {
+    return publicRouteBase(inboundURL.origin, hostMap.get(host)) + url.pathname + url.search + url.hash;
+  }
+  return publicBase + "/__raw__/" + encodeURIComponent(url.toString());
 }
 
 async function rewriteBodyLinks(body, targetURL, inboundURL, node, env) {
   const publicBase = publicNodeBase(inboundURL, node);
   const publicURL = new URL(publicBase);
-  const currentHosts = new Set(splitTargets(node.targets).map((target) => {
-    try {
-      return new URL(target).host.toLowerCase();
-    } catch {
-      return "";
-    }
-  }).filter(Boolean));
-  if (targetURL?.host) {
-    currentHosts.add(targetURL.host.toLowerCase());
-  }
+  const currentHosts = currentNodeHosts(node, targetURL);
   const hostMap = await nodeHostMap(env);
   const replacements = new Map();
   for (const full of uniqueMatches(body, /https?:\/\/[^\s"'<>\\]+/gi)) {
@@ -1055,7 +1313,7 @@ async function rewriteBodyLinks(body, targetURL, inboundURL, node, env) {
     } catch {
       continue;
     }
-    if (url.origin === inboundURL.origin && (url.pathname === new URL(publicBase).pathname || url.pathname.startsWith(new URL(publicBase).pathname + "/"))) {
+    if (url.origin === inboundURL.origin && isKnownPublicRoutePath(url.pathname, publicURL.pathname, hostMap)) {
       continue;
     }
     const host = url.host.toLowerCase();
@@ -1074,6 +1332,33 @@ async function rewriteBodyLinks(body, targetURL, inboundURL, node, env) {
   }
   out = rewriteRelativeMediaPaths(out, publicURL.pathname, publicBase);
   return out;
+}
+
+function currentNodeHosts(node, targetURL) {
+  const hosts = new Set(splitTargets(node.targets).map((target) => {
+    try {
+      return new URL(target).host.toLowerCase();
+    } catch {
+      return "";
+    }
+  }).filter(Boolean));
+  if (targetURL?.host) {
+    hosts.add(targetURL.host.toLowerCase());
+  }
+  return hosts;
+}
+
+function isKnownPublicRoutePath(path, currentPublicBasePath, hostMap) {
+  if (path === currentPublicBasePath || path.startsWith(currentPublicBasePath + "/")) {
+    return true;
+  }
+  for (const node of hostMap.values()) {
+    const routePath = new URL(publicRouteBase("https://example.invalid", node)).pathname;
+    if (path === routePath || path.startsWith(routePath + "/")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function rewriteRelativeMediaPaths(body, publicBasePath, publicBase) {
@@ -1285,6 +1570,16 @@ function isPlaybackStreamRequest(request, targetURL) {
     return request.headers.get("Range") !== null || path.includes("/stream") || path.includes("/universal") || path.includes("/original");
   }
   return false;
+}
+
+function isResourceIdentityRequest(request, targetURL) {
+  if (!targetURL) {
+    return false;
+  }
+  const path = targetURL.pathname || "/";
+  return isPlaybackStreamRequest(request, targetURL) ||
+    isImageRequest(path) ||
+    normalizedEmbyAPIPath(path).includes("/additionalparts");
 }
 
 function normalizedEmbyAPIPath(path) {
