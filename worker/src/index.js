@@ -357,12 +357,22 @@ async function handleProxy(request, env, ctx) {
         continue;
       }
 
+      const streamRedirect = await followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env);
+      if (streamRedirect) {
+        if (isRetryableStatus(streamRedirect.upstream.status) && targets.length > 1) {
+          lastResponse = streamRedirect.upstream;
+          lastResponseURL = streamRedirect.targetURL;
+          continue;
+        }
+        const response = await finishProxyResponse(streamRedirect.upstream, request, node, streamRedirect.targetURL, inboundURL, env);
+        return recordProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request));
+      }
+
       const response = await finishProxyResponse(upstream, request, node, targetURL, inboundURL, env);
       if (cacheableImage && response.ok) {
         ctx.waitUntil(caches.default.put(outbound, response.clone()));
       }
-      ctx.waitUntil(recordRequest(env, request, node.name, route.path, response.status, contentLength(response), requestKind(route.path, response)));
-      return response;
+      return recordProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request));
     } catch (err) {
       lastError = errMessage(err);
     }
@@ -400,7 +410,7 @@ function applyNodeSecret(parsed, node) {
 }
 
 function selectTargets(node, path) {
-  const targets = path && isStreamingPath(path) && node.streamTarget
+  const targets = path && isPlaybackStreamPath(path) && node.streamTarget
     ? splitTargets(node.streamTarget)
     : splitTargets(node.targets);
   return targets.filter((target) => /^https?:\/\//i.test(target));
@@ -434,9 +444,11 @@ async function handleRawProxy(request, env, ctx, node, routePath, bodyBuffer, in
     targetURL.search = new URL(request.url).search;
   }
   const upstream = await fetchRawWithRetries(request, targetURL, node, bodyBuffer, env);
-  const response = await finishProxyResponse(upstream, request, node, targetURL, inboundURL, env);
-  ctx.waitUntil(recordRequest(env, request, node.name, targetURL.pathname, response.status, contentLength(response), requestKind(targetURL.pathname, response)));
-  return response;
+  const streamRedirect = await followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env);
+  const finalUpstream = streamRedirect?.upstream || upstream;
+  const finalURL = streamRedirect?.targetURL || targetURL;
+  const response = await finishProxyResponse(finalUpstream, request, node, finalURL, inboundURL, env);
+  return recordProxyResponse(ctx, env, request, node.name, finalURL.pathname, response, requestKind(finalURL.pathname, response, request));
 }
 
 async function fetchRawWithRetries(request, targetURL, node, bodyBuffer, env) {
@@ -456,6 +468,43 @@ async function fetchRawWithRetries(request, targetURL, node, bodyBuffer, env) {
     }
   }
   return last;
+}
+
+async function followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env) {
+  if (!upstream || !isRedirectStatus(upstream.status) || !isPlaybackStreamRequest(request, targetURL)) {
+    return null;
+  }
+  if ((node.streamMode || "proxy") !== "proxy" || !["GET", "HEAD"].includes(request.method)) {
+    return null;
+  }
+  let currentResponse = upstream;
+  let currentURL = targetURL;
+  for (let i = 0; i < 3; i++) {
+    const location = currentResponse.headers.get("location");
+    if (!location) {
+      return null;
+    }
+    let nextURL;
+    try {
+      nextURL = new URL(location, currentURL);
+    } catch {
+      return null;
+    }
+    if (!["http:", "https:"].includes(nextURL.protocol)) {
+      return null;
+    }
+    try {
+      currentResponse.body?.cancel?.();
+    } catch {
+      // Ignore body cleanup errors while following stream redirects.
+    }
+    currentURL = nextURL;
+    currentResponse = await fetchRawWithRetries(request, currentURL, node, bodyBuffer, env);
+    if (!isRedirectStatus(currentResponse.status)) {
+      return { upstream: currentResponse, targetURL: currentURL };
+    }
+  }
+  return { upstream: currentResponse, targetURL: currentURL };
 }
 
 function bodyCanRetry(bodyBuffer) {
@@ -481,6 +530,9 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
   const streaming = isPlaybackStreamRequest(request, targetURL);
   if (!streaming) {
     deleteHeaders(headers, ["Origin", "Referer", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Sec-Fetch-User"]);
+  }
+  if ((!streaming || isManifestRequestPath(targetURL.pathname)) && !isImageRequest(targetURL.pathname)) {
+    headers.set("Accept-Encoding", "identity");
   }
 
   const clientIP = request.headers.get("cf-connecting-ip") || "";
@@ -1204,6 +1256,9 @@ async function finishProxyResponse(upstream, request, node, targetURL, inboundUR
       const textBody = await upstream.text();
       const rewritten = await rewriteResponseText(textBody, targetURL, inboundURL, node, env, headers);
       headers.delete("content-length");
+      headers.delete("content-encoding");
+      headers.delete("content-md5");
+      headers.delete("etag");
       return new Response(rewritten, { status: upstream.status, statusText: upstream.statusText, headers });
     }
   }
@@ -1273,10 +1328,7 @@ function rewriteMediaSourceURL(raw, inboundURL, node, currentHosts, hostMap) {
   const publicBase = publicNodeBase(inboundURL, node);
   const publicBasePath = new URL(publicBase).pathname;
   if (value.startsWith("/")) {
-    if (isKnownPublicRoutePath(value, publicBasePath, hostMap)) {
-      return "";
-    }
-    return publicBase + value;
+    return "";
   }
   let url;
   try {
@@ -1292,12 +1344,12 @@ function rewriteMediaSourceURL(raw, inboundURL, node, currentHosts, hostMap) {
   }
   const host = url.host.toLowerCase();
   if (currentHosts.has(host)) {
-    return publicBase + url.pathname + url.search + url.hash;
+    return publicBasePath + url.pathname + url.search + url.hash;
   }
   if (hostMap.has(host)) {
-    return publicRouteBase(inboundURL.origin, hostMap.get(host)) + url.pathname + url.search + url.hash;
+    return new URL(publicRouteBase(inboundURL.origin, hostMap.get(host))).pathname + url.pathname + url.search + url.hash;
   }
-  return publicBase + "/__raw__/" + encodeURIComponent(url.toString());
+  return publicBasePath + "/__raw__/" + encodeURIComponent(url.toString());
 }
 
 async function rewriteBodyLinks(body, targetURL, inboundURL, node, env) {
@@ -1516,7 +1568,7 @@ function shouldUseDirectStream(node, request, path) {
   if (mode === "proxy") {
     return false;
   }
-  if (!isStreamingPath(path) || request.method !== "GET") {
+  if (!isStreamingPath(path, request) || request.method !== "GET") {
     return false;
   }
   if (mode === "direct") {
@@ -1526,22 +1578,37 @@ function shouldUseDirectStream(node, request, path) {
   return Boolean(node.directExternal);
 }
 
-function isStreamingPath(path) {
-  return isPlaybackPath(path);
+function isStreamingPath(path, request) {
+  return isPlaybackStreamPath(path, request);
 }
 
 function isPlaybackPath(path) {
+  return isPlaybackControlPath(path) || isPlaybackMetaPath(path) || isPlaybackStreamPath(path);
+}
+
+function isPlaybackControlPath(path) {
   const value = normalizedEmbyAPIPath(path);
+  return value.includes("/sessions/playing");
+}
+
+function isPlaybackMetaPath(path) {
+  const value = normalizedEmbyAPIPath(path);
+  return value.includes("/playbackinfo") || value.includes("/additionalparts");
+}
+
+function isPlaybackStreamPath(path, request) {
+  const value = normalizedEmbyAPIPath(path);
+  if (isPlaybackControlPath(value) || isPlaybackMetaPath(value)) {
+    return false;
+  }
   return value.includes("/smartstrm") ||
-    value.includes("/videos/") ||
     value.includes("/playback/") ||
-    value.includes("/playbackinfo") ||
-    value.includes("/sessions/playing") ||
     (value.includes("/items/") && (value.includes("/download") || value.includes("/stream") || value.includes("/file"))) ||
     value.includes("/audio/") ||
     value.includes("/hls/") ||
     value.includes("/hls1/") ||
     value.includes("/dash/") ||
+    (value.includes("/videos/") && (!request || request.headers.get("Range") !== null || value.includes("/stream") || value.includes("/original"))) ||
     /\.(mp4|m4v|m4s|m4a|ogv|webm|mkv|mov|avi|wmv|flv|ts|m3u8|mpd)$/i.test(value) ||
     /\.(flac|mp3|aac)(\?|$)/i.test(value);
 }
@@ -1550,26 +1617,11 @@ function isPlaybackStreamRequest(request, targetURL) {
   if (!request || !targetURL || !["GET", "HEAD"].includes(request.method)) {
     return false;
   }
-  const path = normalizedEmbyAPIPath(targetURL.pathname);
-  if (path.includes("/sessions/playing") || path.includes("/playbackinfo") || path.includes("/additionalparts")) {
-    return false;
-  }
-  if (/\.(mp4|m4v|m4s|m4a|ogv|webm|mkv|mov|avi|wmv|flv|ts|m3u8|mpd)$/i.test(path) || /\.(m3u8|mpd|mkv|mp4|ts|m4s)$/i.test(path)) {
-    return true;
-  }
-  if (path.includes("/smartstrm") || path.includes("/hls/") || path.includes("/hls1/") || path.includes("/dash/")) {
-    return true;
-  }
-  if (path.includes("/items/") && (path.includes("/download") || path.includes("/stream") || path.includes("/file"))) {
-    return true;
-  }
-  if (path.includes("/videos/")) {
-    return request.headers.get("Range") !== null || path.includes("/stream") || path.includes("/original");
-  }
-  if (path.includes("/audio/")) {
-    return request.headers.get("Range") !== null || path.includes("/stream") || path.includes("/universal") || path.includes("/original");
-  }
-  return false;
+  return isPlaybackStreamPath(targetURL.pathname, request);
+}
+
+function isManifestRequestPath(path) {
+  return /\.(m3u8|mpd)$/i.test(String(path || "").toLowerCase());
 }
 
 function isResourceIdentityRequest(request, targetURL) {
@@ -1600,8 +1652,8 @@ function isImageRequest(path) {
     /\.(jpg|jpeg|png|webp|gif|svg|ico)(\?|$)/i.test(value);
 }
 
-function requestKind(path, response) {
-  if (isStreamingPath(path)) {
+function requestKind(path, response, request) {
+  if (isPlaybackStreamPath(path, request)) {
     return "playback";
   }
   const type = response.headers.get("content-type") || "";
@@ -1805,6 +1857,24 @@ async function getStats(env) {
   return { day, today: rows.results || [], recent: recent.results || [] };
 }
 
+function recordProxyResponse(ctx, env, request, nodeName, path, response, kind) {
+  const bytes = kind === "playback" ? streamByteEstimate(response) : contentLength(response);
+  ctx.waitUntil(recordRequest(env, request, nodeName, path, response.status, bytes, kind));
+  return response;
+}
+
+function streamByteEstimate(response) {
+  const match = String(response.headers.get("content-range") || "").match(/bytes\s+(\d+)-(\d+)\/(\d+|\*)/i);
+  if (match) {
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    if (Number.isFinite(start) && Number.isFinite(end) && end >= start) {
+      return end - start + 1;
+    }
+  }
+  return contentLength(response);
+}
+
 async function recordRequest(env, request, nodeName, path, status, bytes, kind) {
   const now = Date.now();
   const day = beijingDay(now);
@@ -1835,7 +1905,7 @@ function isKeepalivePlaybackPath(path) {
   if (value.includes("/playbackinfo") || value.includes("/sessions/playing") || value.includes("/additionalparts")) {
     return false;
   }
-  return isPlaybackPath(value);
+  return isPlaybackStreamPath(value);
 }
 
 async function ensureKeepaliveTable(env) {
@@ -3167,6 +3237,10 @@ function trimSlash(path) {
 
 function isRetryableStatus(status) {
   return status >= 500 || status === 403 || status === 404 || status === 416;
+}
+
+function isRedirectStatus(status) {
+  return [301, 302, 303, 307, 308].includes(Number(status));
 }
 
 function stripResponseHeaders(headers) {
