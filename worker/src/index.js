@@ -424,6 +424,11 @@ async function handleProxy(request, env, ctx) {
         lastResponseURL = targetURL;
         continue;
       }
+      const directFallback = directFallbackForBlockedUpstream(request, upstream, targetURL, node);
+      if (directFallback) {
+        ctx.waitUntil(recordRequest(env, request, node.name, route.path, directFallback.status, 0, requestKind(route.path, directFallback, request), bodyBuffer));
+        return directFallback;
+      }
 
       const streamRedirect = await followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env);
       if (streamRedirect) {
@@ -431,6 +436,11 @@ async function handleProxy(request, env, ctx) {
           lastResponse = streamRedirect.upstream;
           lastResponseURL = streamRedirect.targetURL;
           continue;
+        }
+        const redirectedFallback = directFallbackForBlockedUpstream(request, streamRedirect.upstream, streamRedirect.targetURL, node);
+        if (redirectedFallback) {
+          ctx.waitUntil(recordRequest(env, request, node.name, route.path, redirectedFallback.status, 0, requestKind(route.path, redirectedFallback, request), bodyBuffer));
+          return redirectedFallback;
         }
         const response = await finishProxyResponse(streamRedirect.upstream, request, node, streamRedirect.targetURL, inboundURL, env);
         return recordProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request), bodyBuffer);
@@ -573,6 +583,32 @@ async function followProxyStreamRedirect(request, upstream, targetURL, node, bod
     }
   }
   return { upstream: currentResponse, targetURL: currentURL };
+}
+
+function directFallbackForBlockedUpstream(request, upstream, targetURL, node) {
+  if (!node.directExternal || !upstream || upstream.status !== 403 || !targetURL) {
+    return null;
+  }
+  if (!["GET", "HEAD", "POST"].includes(request.method)) {
+    return null;
+  }
+  if (!isCloudflareHTMLBlock(upstream)) {
+    return null;
+  }
+  try {
+    upstream.body?.cancel?.();
+  } catch {
+    // Ignore cleanup errors before direct fallback.
+  }
+  const status = request.method === "POST" ? 307 : 302;
+  return Response.redirect(targetURL.toString(), status);
+}
+
+function isCloudflareHTMLBlock(response) {
+  const server = (response.headers.get("server") || "").toLowerCase();
+  const type = (response.headers.get("content-type") || "").toLowerCase();
+  const ray = response.headers.get("cf-ray") || "";
+  return server.includes("cloudflare") && type.includes("text/html") && ray;
 }
 
 function bodyCanRetry(bodyBuffer) {
