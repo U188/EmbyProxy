@@ -1,9 +1,15 @@
-const BUILD_VERSION = "0.1.0";
+const BUILD_VERSION = "0.1.2";
 const DEFAULT_MAX_REWRITE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_RETRY_BODY_BYTES = 16 * 1024 * 1024;
+const DEFAULT_NODE_CACHE_TTL_SECONDS = 30;
+const NODE_NOT_FOUND_CACHE_TTL_MS = 5000;
+const TARGET_HEALTH_TTL_MS = 10 * 60 * 1000;
+const TARGET_FAILURE_COOLDOWN_MS = 30000;
+const TARGET_MAX_FAILURE_COOLDOWN_MS = 2 * 60 * 1000;
 const DEFAULT_CLIENT_PROFILE = "yamby";
 const DEFAULT_NODE_ICON = "🎬";
 const IDENTITY_KEY = "system:upstream_identity";
+const RAW_PROXY_SIGNING_KEY = "system:raw_proxy_signing_key";
 const LEGACY_DEFAULT_DEVICE_NAME = "OnePlus-PKG110";
 const EMBY_TICKS_PER_SECOND = 10000000;
 const DEFAULT_SIMULATED_WATCH_SECONDS = 300;
@@ -20,18 +26,22 @@ const CLIENT_PROFILES = [
   { id: "hills_windows", label: "Hills Windows", ua: "Hills Windows/1.3.1 (windows; 19041.vb_release.191206-1406)", client: "Hills Windows", version: "1.3.1", device: "", authStyle: "hills", idLength: 32, devicePrefix: "DESKTOP-" }
 ];
 
-let schemaReady;
+const schemaReadyByDatabase = new WeakMap();
+const nodeCacheByDatabase = new WeakMap();
+const targetHealthCache = new Map();
 let identityStatePromise;
+let rawProxySigningKeyPromise;
+let rawProxyCryptoKeyCache = { raw: "", promise: null };
 let traceEgressCache = { expires: 0, data: null };
 let traceEgressPromise;
-let nodeHostMapCache = { expires: 0, map: null };
 
 export default {
   async fetch(request, env, ctx) {
+    const timing = createRequestTiming();
     try {
-      return await handleFetch(request, env, ctx);
+      return withServerTiming(await handleFetch(request, env, ctx, timing), timing);
     } catch (err) {
-      return json({ ok: false, error: errMessage(err) }, 500);
+      return withServerTiming(json({ ok: false, error: errMessage(err) }, 500), timing);
     }
   },
 
@@ -51,7 +61,7 @@ async function handleScheduled(env) {
   ]);
 }
 
-async function handleFetch(request, env, ctx) {
+async function handleFetch(request, env, ctx, timing) {
   const url = new URL(request.url);
 
   if (url.pathname === "/favicon.ico") {
@@ -67,26 +77,28 @@ async function handleFetch(request, env, ctx) {
     return html(adminHTML(env));
   }
   if (url.pathname === "/api/tg-webhook" && request.method === "POST") {
-    await ensureSchema(env);
     return handleTelegramWebhook(request, env);
   }
   if (url.pathname.startsWith("/api/")) {
-    await ensureSchema(env);
-    return handleAPI(request, env, ctx);
+    return handleAPI(request, env, ctx, timing);
   }
 
-  await ensureSchema(env);
-  return handleProxy(request, env, ctx);
+  return handleProxy(request, env, ctx, timing);
 }
 
 async function ensureSchema(env) {
-  if (!env.DB) {
+  if (!env?.DB || (typeof env.DB !== "object" && typeof env.DB !== "function")) {
     throw new Error("D1 binding DB is not configured");
   }
-  if (!schemaReady) {
-    schemaReady = initializeSchema(env);
+  let ready = schemaReadyByDatabase.get(env.DB);
+  if (!ready) {
+    ready = initializeSchema(env).catch((err) => {
+      schemaReadyByDatabase.delete(env.DB);
+      throw err;
+    });
+    schemaReadyByDatabase.set(env.DB, ready);
   }
-  return schemaReady;
+  return ready;
 }
 
 async function initializeSchema(env) {
@@ -259,7 +271,7 @@ async function ensureColumns(env, table, columns) {
   }
 }
 
-async function handleAPI(request, env, ctx) {
+async function handleAPI(request, env, ctx, timing) {
   const url = new URL(request.url);
   if (url.pathname === "/api/health") {
     return json({ ok: true, version: BUILD_VERSION });
@@ -269,6 +281,10 @@ async function handleAPI(request, env, ctx) {
   if (!auth.ok) {
     return json({ ok: false, error: auth.error }, auth.status);
   }
+
+  const schemaStarted = timingNow();
+  await ensureSchema(env);
+  addRequestTiming(timing, "schema", timingNow() - schemaStarted);
 
   if (url.pathname === "/api/trace" && request.method === "GET") {
     return json(await getTraceInfo(request, env, ctx));
@@ -369,14 +385,14 @@ async function handleAPI(request, env, ctx) {
   return json({ ok: false, error: "API not found" }, 404);
 }
 
-async function handleProxy(request, env, ctx) {
+async function handleProxy(request, env, ctx, timing) {
   const inboundURL = new URL(request.url);
   const parsed = parseProxyRoute(inboundURL);
   if (!parsed.name) {
     return text("Missing node name", 400);
   }
 
-  const node = await getNode(env, parsed.name);
+  const node = await getNode(env, parsed.name, timing);
   if (!node || !node.enabled) {
     return text("Node not found", 404);
   }
@@ -388,10 +404,11 @@ async function handleProxy(request, env, ctx) {
 
   const bodyBuffer = await retryableBody(request);
   if (route.path.startsWith("/__raw__/")) {
-    return handleRawProxy(request, env, ctx, node, route.path, bodyBuffer, inboundURL);
+    return handleRawProxy(request, env, ctx, node, route.path, bodyBuffer, inboundURL, timing);
   }
 
-  const targets = selectTargets(node, route.path);
+  const streamingRequest = isStreamingPath(route.path, request);
+  const targets = selectTargets(node, route.path, request);
   if (targets.length === 0) {
     return text("Node has no target", 502);
   }
@@ -409,16 +426,23 @@ async function handleProxy(request, env, ctx) {
       }
 
       const outbound = await buildOutboundRequest(request, targetURL, node, bodyBuffer, env);
-      const cacheableImage = node.cacheImage && request.method === "GET" && isImageRequest(route.path);
+      const cacheableImage = node.cacheImage &&
+        request.method === "GET" &&
+        isImageRequest(route.path) &&
+        !requestHasCredentials(request);
+      const imageCacheKey = cacheableImage ? buildImageCacheKey(outbound, node) : null;
       if (cacheableImage) {
-        const cached = await caches.default.match(outbound);
+        const cached = await caches.default.match(imageCacheKey);
         if (cached) {
           ctx.waitUntil(recordRequest(env, request, node.name, route.path, cached.status, contentLength(cached), "image", bodyBuffer));
           return cached;
         }
       }
 
-      const upstream = await fetch(outbound);
+      const upstream = await fetchWithTiming(outbound, timing, {
+        nodeName: streamingRequest ? node.name : "",
+        target: streamingRequest ? target : ""
+      });
       if (isRetryableStatus(upstream.status) && targets.length > 1) {
         lastResponse = upstream;
         lastResponseURL = targetURL;
@@ -430,9 +454,10 @@ async function handleProxy(request, env, ctx) {
         return directFallback;
       }
 
-      const streamRedirect = await followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env);
+      const streamRedirect = await followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env, timing);
       if (streamRedirect) {
         if (isRetryableStatus(streamRedirect.upstream.status) && targets.length > 1) {
+          recordTargetHealth(node.name, target, 0, streamRedirect.upstream.status);
           lastResponse = streamRedirect.upstream;
           lastResponseURL = streamRedirect.targetURL;
           continue;
@@ -448,7 +473,7 @@ async function handleProxy(request, env, ctx) {
 
       const response = await finishProxyResponse(upstream, request, node, targetURL, inboundURL, env);
       if (cacheableImage && response.ok) {
-        ctx.waitUntil(caches.default.put(outbound, response.clone()));
+        ctx.waitUntil(caches.default.put(imageCacheKey, response.clone()));
       }
       return recordProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request), bodyBuffer);
     } catch (err) {
@@ -487,11 +512,83 @@ function applyNodeSecret(parsed, node) {
   return { ok: true, path: "/" + rest };
 }
 
-function selectTargets(node, path) {
-  const targets = path && isStreamingPath(path) && node.streamTarget
+function selectTargets(node, path, request) {
+  const streaming = path && isStreamingPath(path, request);
+  const targets = streaming && node.streamTarget
     ? splitTargets(node.streamTarget)
     : splitTargets(node.targets);
-  return targets.filter((target) => /^https?:\/\//i.test(target));
+  const valid = targets.filter((target) => /^https?:\/\//i.test(target));
+  return streaming ? orderTargetsByHealth(node.name, valid) : valid;
+}
+
+function orderTargetsByHealth(nodeName, targets, now = Date.now()) {
+  const entries = targets.map((target, index) => {
+    const health = targetHealthCache.get(targetHealthKey(nodeName, target));
+    if (health && now - health.updatedAt > TARGET_HEALTH_TTL_MS) {
+      targetHealthCache.delete(targetHealthKey(nodeName, target));
+      return { target, index, health: null };
+    }
+    return { target, index, health: health || null };
+  });
+  const allHaveLatency = entries.length > 1 && entries.every((entry) =>
+    Number.isFinite(entry.health?.latencyMS)
+  );
+  return entries.sort((a, b) => {
+    const aCooling = Number(a.health?.cooldownUntil || 0) > now;
+    const bCooling = Number(b.health?.cooldownUntil || 0) > now;
+    if (aCooling !== bCooling) {
+      return aCooling ? 1 : -1;
+    }
+    if (!aCooling && allHaveLatency && a.health.latencyMS !== b.health.latencyMS) {
+      return a.health.latencyMS - b.health.latencyMS;
+    }
+    return a.index - b.index;
+  }).map((entry) => entry.target);
+}
+
+function recordTargetHealth(nodeName, target, durationMS, status, failed = false, now = Date.now()) {
+  if (!nodeName || !target) {
+    return;
+  }
+  const key = targetHealthKey(nodeName, target);
+  const current = targetHealthCache.get(key) || {};
+  if (failed || isRetryableStatus(status)) {
+    const failures = Math.min(4, Number(current.failures || 0) + 1);
+    const cooldown = Math.min(
+      TARGET_MAX_FAILURE_COOLDOWN_MS,
+      TARGET_FAILURE_COOLDOWN_MS * (2 ** (failures - 1))
+    );
+    targetHealthCache.set(key, {
+      ...current,
+      failures,
+      cooldownUntil: now + cooldown,
+      updatedAt: now
+    });
+    return;
+  }
+  const measured = Math.max(0, Number(durationMS || 0));
+  const previous = Number(current.latencyMS);
+  targetHealthCache.set(key, {
+    latencyMS: Number.isFinite(previous)
+      ? (previous * 0.7) + (measured * 0.3)
+      : measured,
+    failures: 0,
+    cooldownUntil: 0,
+    updatedAt: now
+  });
+}
+
+function targetHealthKey(nodeName, target) {
+  return `${normalizeName(nodeName)}\n${String(target || "")}`;
+}
+
+function invalidateTargetHealth(nodeName) {
+  const prefix = normalizeName(nodeName) + "\n";
+  for (const key of targetHealthCache.keys()) {
+    if (key.startsWith(prefix)) {
+      targetHealthCache.delete(key);
+    }
+  }
 }
 
 function buildTargetURL(target, path, search) {
@@ -506,8 +603,37 @@ function buildTargetURL(target, path, search) {
   return base;
 }
 
-async function handleRawProxy(request, env, ctx, node, routePath, bodyBuffer, inboundURL) {
-  const encoded = routePath.slice("/__raw__/".length);
+async function fetchWithTiming(input, timing, healthTarget) {
+  const started = timingNow();
+  if (timing) {
+    timing.upstreamRequests++;
+  }
+  try {
+    const response = await fetch(input);
+    const duration = timingNow() - started;
+    addRequestTiming(timing, "upstream", duration);
+    if (healthTarget) {
+      recordTargetHealth(healthTarget.nodeName, healthTarget.target, duration, response.status);
+    }
+    return response;
+  } catch (err) {
+    const duration = timingNow() - started;
+    addRequestTiming(timing, "upstream", duration);
+    if (healthTarget) {
+      recordTargetHealth(healthTarget.nodeName, healthTarget.target, duration, 0, true);
+    }
+    throw err;
+  }
+}
+
+async function handleRawProxy(request, env, ctx, node, routePath, bodyBuffer, inboundURL, timing) {
+  const signedPath = routePath.slice("/__raw__/".length);
+  const separator = signedPath.indexOf("/");
+  if (separator <= 0) {
+    return text("Invalid raw URL signature", 403);
+  }
+  const signature = signedPath.slice(0, separator);
+  const encoded = signedPath.slice(separator + 1);
   let raw = "";
   try {
     raw = decodeURIComponent(encoded);
@@ -517,21 +643,30 @@ async function handleRawProxy(request, env, ctx, node, routePath, bodyBuffer, in
   if (!/^https?:\/\//i.test(raw)) {
     return text("Bad raw URL", 400);
   }
-  const targetURL = new URL(raw);
-  if (request.url.includes("?") && !targetURL.search) {
-    targetURL.search = new URL(request.url).search;
+  if (!await verifyRawProxyTarget(env, node, raw, signature)) {
+    return text("Invalid raw URL signature", 403);
   }
-  const upstream = await fetchRawWithRetries(request, targetURL, node, bodyBuffer, env);
-  const streamRedirect = await followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env);
+  const targetURL = new URL(raw);
+  if (!canForwardRawProxyRequest(request, node, targetURL)) {
+    return text("Method not allowed for external raw proxy", 405);
+  }
+  const upstream = await fetchRawWithRetries(request, targetURL, node, bodyBuffer, env, timing);
+  const streamRedirect = await followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env, timing);
   const finalUpstream = streamRedirect?.upstream || upstream;
   const finalURL = streamRedirect?.targetURL || targetURL;
   const response = await finishProxyResponse(finalUpstream, request, node, finalURL, inboundURL, env);
   return recordProxyResponse(ctx, env, request, node.name, finalURL.pathname, response, requestKind(finalURL.pathname, response, request), bodyBuffer);
 }
 
-async function fetchRawWithRetries(request, targetURL, node, bodyBuffer, env) {
+function canForwardRawProxyRequest(request, node, targetURL) {
+  return ["GET", "HEAD"].includes(request?.method) || isNodeTargetOrigin(node, targetURL);
+}
+
+async function fetchRawWithRetries(request, targetURL, node, bodyBuffer, env, timing) {
   let last;
-  for (const directMode of ["normal", "retry-no-origin", "retry-browserish"]) {
+  const modes = ["normal", "retry-no-origin", "retry-browserish"];
+  for (let index = 0; index < modes.length; index++) {
+    const directMode = modes[index];
     if (last) {
       try {
         last.body?.cancel?.();
@@ -540,15 +675,18 @@ async function fetchRawWithRetries(request, targetURL, node, bodyBuffer, env) {
       }
     }
     const outbound = await buildOutboundRequest(request, targetURL, node, bodyBuffer, env, { directMode });
-    last = await fetch(outbound);
+    last = await fetchWithTiming(outbound, timing);
     if (last.status !== 403 || !bodyCanRetry(bodyBuffer)) {
       return last;
+    }
+    if (index < modes.length - 1 && timing) {
+      timing.retries++;
     }
   }
   return last;
 }
 
-async function followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env) {
+async function followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env, timing) {
   if (!upstream || !isRedirectStatus(upstream.status) || !isPlaybackStreamRequest(request, targetURL)) {
     return null;
   }
@@ -577,7 +715,10 @@ async function followProxyStreamRedirect(request, upstream, targetURL, node, bod
       // Ignore body cleanup errors while following stream redirects.
     }
     currentURL = nextURL;
-    currentResponse = await fetchRawWithRetries(request, currentURL, node, bodyBuffer, env);
+    if (timing) {
+      timing.redirects++;
+    }
+    currentResponse = await fetchRawWithRetries(request, currentURL, node, bodyBuffer, env, timing);
     if (!isRedirectStatus(currentResponse.status)) {
       return { upstream: currentResponse, targetURL: currentURL };
     }
@@ -589,7 +730,7 @@ function directFallbackForBlockedUpstream(request, upstream, targetURL, node) {
   if (!node.directExternal || !upstream || upstream.status !== 403 || !targetURL) {
     return null;
   }
-  if (!["GET", "HEAD", "POST"].includes(request.method)) {
+  if (!isPlaybackStreamContext(request, targetURL)) {
     return null;
   }
   if (!isCloudflareHTMLBlock(upstream)) {
@@ -600,8 +741,21 @@ function directFallbackForBlockedUpstream(request, upstream, targetURL, node) {
   } catch {
     // Ignore cleanup errors before direct fallback.
   }
-  const status = request.method === "POST" ? 307 : 302;
-  return Response.redirect(targetURL.toString(), status);
+  return Response.redirect(targetURL.toString(), 302);
+}
+
+function isPlaybackStreamContext(request, targetURL) {
+  if (isPlaybackStreamRequest(request, targetURL)) {
+    return true;
+  }
+  if (!request || !["GET", "HEAD"].includes(request.method)) {
+    return false;
+  }
+  try {
+    return isPlaybackStreamPath(new URL(request.url).pathname, request);
+  } catch {
+    return false;
+  }
 }
 
 function isCloudflareHTMLBlock(response) {
@@ -631,6 +785,10 @@ async function buildOutboundRequest(request, targetURL, node, bodyBuffer, env, o
 async function buildHeaders(request, targetURL, node, env, options = {}) {
   const headers = new Headers(request.headers);
   stripHopByHop(headers);
+  const trustedOrigin = isNodeTargetOrigin(node, targetURL);
+  if (!trustedOrigin) {
+    stripSensitiveRequestHeaders(headers);
+  }
   const streaming = isPlaybackStreamRequest(request, targetURL);
   if (!streaming) {
     deleteHeaders(headers, ["Origin", "Referer", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Sec-Fetch-User"]);
@@ -641,7 +799,7 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
 
   const clientIP = request.headers.get("cf-connecting-ip") || "";
   const mode = node.headerMode || "dual";
-  if (mode === "realip_only" || mode === "dual" || mode === "strict") {
+  if (trustedOrigin && (mode === "realip_only" || mode === "dual" || mode === "strict")) {
     if (clientIP) {
       headers.set("X-Real-IP", clientIP);
       headers.set("X-Forwarded-For", clientIP);
@@ -649,7 +807,7 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
     headers.set("X-Forwarded-Proto", "https");
   }
 
-  if (node.impersonate !== false) {
+  if (trustedOrigin && node.impersonate !== false) {
     const identityState = await getIdentityState(env);
     const profile = node.clientProfile || DEFAULT_CLIENT_PROFILE;
     const resourceIdentity = isResourceIdentityRequest(request, targetURL);
@@ -660,7 +818,7 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
     }
     applyClientProfile(headers, profile, true, identityState, { hillsHeaders: resourceIdentity });
   }
-  if (mode === "strict") {
+  if (trustedOrigin && mode === "strict") {
     headers.set("Origin", targetURL.origin);
     headers.set("Referer", targetURL.origin + "/");
   }
@@ -668,6 +826,61 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
     applyDirectAdapterHeaders(headers, targetURL, options.directMode);
   }
   return headers;
+}
+
+function isNodeTargetOrigin(node, targetURL) {
+  if (!targetURL?.origin) {
+    return false;
+  }
+  const configured = [...splitTargets(node?.targets), ...splitTargets(node?.streamTarget)];
+  return configured.some((target) => {
+    try {
+      return new URL(target).origin === targetURL.origin;
+    } catch {
+      return false;
+    }
+  });
+}
+
+function stripSensitiveRequestHeaders(headers) {
+  for (const key of [...headers.keys()]) {
+    const lower = key.toLowerCase();
+    if (isCredentialHeaderName(lower) ||
+      lower === "origin" ||
+      lower === "referer" ||
+      lower === "forwarded" ||
+      lower === "x-forwarded-for" ||
+      lower === "x-real-ip" ||
+      lower.startsWith("sec-fetch-") ||
+      lower.startsWith("x-emby-") ||
+      lower.startsWith("x-mediabrowser-") ||
+      lower.startsWith("x-media-browser-")) {
+      headers.delete(key);
+    }
+  }
+}
+
+function isCredentialHeaderName(name) {
+  const lower = String(name || "").toLowerCase();
+  if ([
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "x-authorization",
+    "x-auth-token",
+    "x-api-key",
+    "api-key"
+  ].includes(lower)) {
+    return true;
+  }
+  if (lower.includes("token")) {
+    return true;
+  }
+  const normalized = normalizeIdentityKey(lower);
+  const embyCredential = normalized.startsWith("xemby") ||
+    normalized.startsWith("xmediabrowser");
+  return embyCredential &&
+    (normalized.includes("authorization") || normalized.includes("token") || normalized.includes("apikey"));
 }
 
 function applyClientProfile(headers, profile, overwrite, identityState, options = {}) {
@@ -1224,6 +1437,109 @@ function randomHex(length) {
   return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, length);
 }
 
+async function rawProxySigningKey(env) {
+  const configured = cleanString(env.RAW_PROXY_SIGNING_KEY);
+  if (configured) {
+    return configured;
+  }
+  if (!rawProxySigningKeyPromise) {
+    rawProxySigningKeyPromise = loadRawProxySigningKey(env).catch((err) => {
+      rawProxySigningKeyPromise = null;
+      throw err;
+    });
+  }
+  return rawProxySigningKeyPromise;
+}
+
+async function loadRawProxySigningKey(env) {
+  const saved = await env.DB.prepare(`SELECT v FROM system_config WHERE k = ?`).bind(RAW_PROXY_SIGNING_KEY).first();
+  if (cleanString(saved?.v)) {
+    return cleanString(saved.v);
+  }
+  const generated = randomHex(64);
+  await env.DB.prepare(`
+    INSERT INTO system_config (k, v, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(k) DO NOTHING
+  `).bind(RAW_PROXY_SIGNING_KEY, generated, Date.now()).run();
+  const persisted = await env.DB.prepare(`SELECT v FROM system_config WHERE k = ?`).bind(RAW_PROXY_SIGNING_KEY).first();
+  const key = cleanString(persisted?.v);
+  if (!key) {
+    throw new Error("raw proxy signing key could not be persisted");
+  }
+  return key;
+}
+
+async function signRawProxyTarget(env, node, raw) {
+  const key = await importRawProxySigningKey(env);
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(rawProxySignaturePayload(node, raw))
+  );
+  return bytesToBase64URL(new Uint8Array(signature));
+}
+
+async function verifyRawProxyTarget(env, node, raw, signature) {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(String(signature || ""))) {
+    return false;
+  }
+  try {
+    const key = await importRawProxySigningKey(env);
+    return crypto.subtle.verify(
+      "HMAC",
+      key,
+      base64URLToBytes(signature),
+      new TextEncoder().encode(rawProxySignaturePayload(node, raw))
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function importRawProxySigningKey(env) {
+  const raw = await rawProxySigningKey(env);
+  if (rawProxyCryptoKeyCache.raw !== raw || !rawProxyCryptoKeyCache.promise) {
+    rawProxyCryptoKeyCache = {
+      raw,
+      promise: crypto.subtle.importKey(
+        "raw",
+        new TextEncoder().encode(raw),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign", "verify"]
+      ).catch((err) => {
+        rawProxyCryptoKeyCache = { raw: "", promise: null };
+        throw err;
+      })
+    };
+  }
+  return rawProxyCryptoKeyCache.promise;
+}
+
+function rawProxySignaturePayload(node, raw) {
+  return `${cleanString(node?.name)}\n${String(raw || "")}`;
+}
+
+function bytesToBase64URL(bytes) {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64URLToBytes(value) {
+  const normalized = String(value || "").replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
+  return Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
+}
+
+async function rawProxyPath(env, node, raw) {
+  const target = String(raw || "");
+  const signature = await signRawProxyTarget(env, node, target);
+  return `/__raw__/${signature}/${encodeURIComponent(target)}`;
+}
+
 function stableDeviceID(profile) {
   const seed = fnv1a(`${profile.id}:${profile.client}:${profile.version}`);
   if (profile.idFormat === "uuid") {
@@ -1350,7 +1666,7 @@ function deleteHeaders(headers, keys) {
 async function finishProxyResponse(upstream, request, node, targetURL, inboundURL, env) {
   const headers = new Headers(upstream.headers);
   stripResponseHeaders(headers);
-  rewriteLocation(headers, targetURL, inboundURL, node);
+  await rewriteLocation(headers, targetURL, inboundURL, node, env);
   rewriteSetCookie(headers, node);
   applyResponsePolicy(headers, upstream, request, targetURL);
 
@@ -1414,7 +1730,7 @@ async function rewriteMediaSourceJSON(body, targetURL, inboundURL, node, env) {
       if (typeof source[key] !== "string") {
         continue;
       }
-      const rewritten = rewriteMediaSourceURL(source[key], inboundURL, node, currentHosts, hostMap);
+      const rewritten = await rewriteMediaSourceURL(source[key], inboundURL, node, currentHosts, hostMap, env);
       if (rewritten && rewritten !== source[key]) {
         source[key] = rewritten;
         changed = true;
@@ -1424,7 +1740,7 @@ async function rewriteMediaSourceJSON(body, targetURL, inboundURL, node, env) {
   return changed ? JSON.stringify(payload) : "";
 }
 
-function rewriteMediaSourceURL(raw, inboundURL, node, currentHosts, hostMap) {
+async function rewriteMediaSourceURL(raw, inboundURL, node, currentHosts, hostMap, env) {
   const value = String(raw || "").trim();
   if (!value || node.directExternal) {
     return "";
@@ -1450,10 +1766,7 @@ function rewriteMediaSourceURL(raw, inboundURL, node, currentHosts, hostMap) {
   if (currentHosts.has(host)) {
     return publicBasePath + url.pathname + url.search + url.hash;
   }
-  if (hostMap.has(host)) {
-    return new URL(publicRouteBase(inboundURL.origin, hostMap.get(host))).pathname + url.pathname + url.search + url.hash;
-  }
-  return publicBasePath + "/__raw__/" + encodeURIComponent(url.toString());
+  return publicBasePath + await rawProxyPath(env, node, url.toString());
 }
 
 async function rewriteBodyLinks(body, targetURL, inboundURL, node, env) {
@@ -1475,11 +1788,8 @@ async function rewriteBodyLinks(body, targetURL, inboundURL, node, env) {
     const host = url.host.toLowerCase();
     if (currentHosts.has(host)) {
       replacements.set(full, publicBase + url.pathname + url.search + url.hash);
-    } else if (hostMap.has(host)) {
-      const matched = hostMap.get(host);
-      replacements.set(full, publicRouteBase(inboundURL.origin, matched) + url.pathname + url.search + url.hash);
     } else if (!node.directExternal) {
-      replacements.set(full, publicBase + "/__raw__/" + encodeURIComponent(full));
+      replacements.set(full, publicBase + await rawProxyPath(env, node, url.toString()));
     }
   }
   let out = body;
@@ -1491,14 +1801,14 @@ async function rewriteBodyLinks(body, targetURL, inboundURL, node, env) {
 }
 
 function currentNodeHosts(node, targetURL) {
-  const hosts = new Set(splitTargets(node.targets).map((target) => {
+  const hosts = new Set([...splitTargets(node.targets), ...splitTargets(node.streamTarget)].map((target) => {
     try {
       return new URL(target).host.toLowerCase();
     } catch {
       return "";
     }
   }).filter(Boolean));
-  if (targetURL?.host) {
+  if (targetURL?.host && isNodeTargetOrigin(node, targetURL)) {
     hosts.add(targetURL.host.toLowerCase());
   }
   return hosts;
@@ -1528,33 +1838,28 @@ function rewriteRelativeMediaPaths(body, publicBasePath, publicBase) {
 }
 
 async function nodeHostMap(env) {
-  const now = Date.now();
-  if (nodeHostMapCache.map && nodeHostMapCache.expires > now) {
-    return nodeHostMapCache.map;
-  }
   const map = new Map();
-  try {
-    for (const item of await listNodes(env)) {
-      for (const target of item.targets || []) {
-        try {
-          const url = new URL(target);
-          if (url.host) {
-            map.set(url.host.toLowerCase(), item);
-          }
-        } catch {
-          // Ignore invalid target.
+  const now = Date.now();
+  for (const cached of nodeCache(env).values()) {
+    if (Number(cached?.expires || 0) <= now) {
+      continue;
+    }
+    const item = cached?.value;
+    if (!item) {
+      continue;
+    }
+    for (const target of item.targets || []) {
+      try {
+        const url = new URL(target);
+        if (url.host) {
+          map.set(url.host.toLowerCase(), item);
         }
+      } catch {
+        // Ignore invalid target.
       }
     }
-  } catch {
-    // Host index is best-effort on Workers.
   }
-  nodeHostMapCache = { expires: now + 30000, map };
   return map;
-}
-
-function invalidateNodeHostMapCache() {
-  nodeHostMapCache = { expires: 0, map: null };
 }
 
 function publicRouteBase(origin, node) {
@@ -1592,19 +1897,19 @@ function rewriteSystemInfo(body, publicBase) {
   }
 }
 
-function rewriteLocation(headers, targetURL, inboundURL, node) {
+async function rewriteLocation(headers, targetURL, inboundURL, node, env) {
   const location = headers.get("location");
   if (!location) {
     return;
   }
   try {
     const abs = new URL(location, targetURL);
-    if (abs.origin === targetURL.origin) {
+    if (abs.origin === targetURL.origin && isNodeTargetOrigin(node, abs)) {
       const publicBase = publicNodeBase(inboundURL, node);
       headers.set("location", publicBase + abs.pathname + abs.search + abs.hash);
     } else if (!node.directExternal) {
       const publicBase = publicNodeBase(inboundURL, node);
-      headers.set("location", publicBase + "/__raw__/" + encodeURIComponent(abs.toString()));
+      headers.set("location", publicBase + await rawProxyPath(env, node, abs.toString()));
     }
   } catch {
     // Ignore invalid upstream Location.
@@ -1640,7 +1945,12 @@ function applyResponsePolicy(headers, upstream, request, targetURL) {
   if (isImageRequest(targetURL.pathname)) {
     headers.delete("Set-Cookie");
     headers.delete("Vary");
-    headers.set("Cache-Control", "public, max-age=2592000, s-maxage=2592000, immutable");
+    headers.set(
+      "Cache-Control",
+      requestHasCredentials(request)
+        ? "private, no-store"
+        : "public, max-age=2592000, s-maxage=2592000, immutable"
+    );
   }
 }
 
@@ -1773,6 +2083,39 @@ function requestKind(path, response, request) {
   return "request";
 }
 
+function requestHasCredentials(request) {
+  const headers = request?.headers || new Headers();
+  for (const key of headers.keys()) {
+    if (isCredentialHeaderName(key)) {
+      return true;
+    }
+  }
+  let url;
+  try {
+    url = new URL(request.url);
+  } catch {
+    return false;
+  }
+  for (const key of url.searchParams.keys()) {
+    const normalized = normalizeIdentityKey(key);
+    if (normalized.includes("token") ||
+      normalized.includes("authorization") ||
+      ["apikey", "accesskey"].includes(normalized)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildImageCacheKey(outbound, node) {
+  const url = new URL(outbound.url);
+  url.searchParams.set("__embyproxy_cache_scope_v2", cleanString(node?.name));
+  const accept = (outbound.headers.get("accept") || "").toLowerCase();
+  const variants = ["avif", "webp"].filter((format) => accept.includes(`image/${format}`));
+  url.searchParams.set("__embyproxy_cache_image_formats_v1", variants.join(",") || "default");
+  return new Request(url.toString(), { method: "GET" });
+}
+
 async function retryableBody(request) {
   if (request.method === "GET" || request.method === "HEAD") {
     return undefined;
@@ -1788,7 +2131,9 @@ async function listNodes(env) {
   const { results } = await env.DB.prepare(`
     SELECT * FROM nodes ORDER BY sort_order ASC, name ASC
   `).all();
-  return (results || []).map(rowToNode);
+  const nodes = (results || []).map(rowToNode);
+  replaceNodeCache(env, nodes);
+  return nodes;
 }
 
 async function listNodesWithKeepalive(env) {
@@ -1797,9 +2142,103 @@ async function listNodesWithKeepalive(env) {
   return nodes.map((node) => publicNode({ ...node, keepalive: statuses.get(node.name) || null }));
 }
 
-async function getNode(env, name) {
-  const row = await env.DB.prepare(`SELECT * FROM nodes WHERE name = ?`).bind(normalizeName(name)).first();
-  return row ? rowToNode(row) : null;
+async function getNode(env, name, timing) {
+  const started = timingNow();
+  const nodeName = normalizeName(name);
+  const cache = nodeCache(env);
+  const now = Date.now();
+  const cached = cache.get(nodeName);
+  if (cached && cached.expires > now) {
+    try {
+      const node = cached.promise ? await cached.promise : cached.value;
+      addRequestTiming(timing, "node", timingNow() - started, cached.promise ? "coalesced" : "cache");
+      return node;
+    } catch (err) {
+      if (cache.get(nodeName) === cached) {
+        cache.delete(nodeName);
+      }
+      throw err;
+    }
+  }
+  if (cached) {
+    cache.delete(nodeName);
+  }
+
+  const pending = { expires: now + nodeCacheTTLMS(env), promise: null };
+  pending.promise = readNodeFromDatabase(env, nodeName, timing);
+  cache.set(nodeName, pending);
+  try {
+    const node = await pending.promise;
+    if (cache.get(nodeName) === pending) {
+      cache.set(nodeName, {
+        expires: Date.now() + (node ? nodeCacheTTLMS(env) : NODE_NOT_FOUND_CACHE_TTL_MS),
+        value: node
+      });
+    }
+    addRequestTiming(timing, "node", timingNow() - started, "d1");
+    return node;
+  } catch (err) {
+    if (cache.get(nodeName) === pending) {
+      cache.delete(nodeName);
+    }
+    throw err;
+  }
+}
+
+async function readNodeFromDatabase(env, nodeName, timing) {
+  try {
+    const row = await env.DB.prepare(`SELECT * FROM nodes WHERE name = ?`).bind(nodeName).first();
+    return row ? rowToNode(row) : null;
+  } catch (err) {
+    if (!isMissingSchemaError(err)) {
+      throw err;
+    }
+    const started = timingNow();
+    await ensureSchema(env);
+    addRequestTiming(timing, "schema", timingNow() - started);
+    const row = await env.DB.prepare(`SELECT * FROM nodes WHERE name = ?`).bind(nodeName).first();
+    return row ? rowToNode(row) : null;
+  }
+}
+
+function isMissingSchemaError(err) {
+  return /no such table:\s*nodes|table\s+nodes\s+does not exist/i.test(errMessage(err));
+}
+
+function nodeCache(env) {
+  if (!env?.DB || (typeof env.DB !== "object" && typeof env.DB !== "function")) {
+    throw new Error("D1 binding DB is not configured");
+  }
+  let cache = nodeCacheByDatabase.get(env.DB);
+  if (!cache) {
+    cache = new Map();
+    nodeCacheByDatabase.set(env.DB, cache);
+  }
+  return cache;
+}
+
+function nodeCacheTTLMS(env) {
+  return envInt(env, "NODE_CACHE_TTL_SECONDS", DEFAULT_NODE_CACHE_TTL_SECONDS, 5, 300) * 1000;
+}
+
+function replaceNodeCache(env, nodes) {
+  const cache = nodeCache(env);
+  cache.clear();
+  const expires = Date.now() + nodeCacheTTLMS(env);
+  for (const node of nodes) {
+    cache.set(node.name, { expires, value: node });
+  }
+}
+
+function cacheNode(env, node) {
+  nodeCache(env).set(node.name, {
+    expires: Date.now() + nodeCacheTTLMS(env),
+    value: node
+  });
+}
+
+function invalidateNodeCache(env, name) {
+  nodeCache(env).delete(normalizeName(name));
 }
 
 async function saveNode(env, input) {
@@ -1879,15 +2318,18 @@ async function saveNode(env, input) {
     current?.createdAt || now,
     now
   ).run();
+  cacheNode(env, node);
+  invalidateTargetHealth(node.name);
   if (oldName && oldName !== node.name) {
     await env.DB.batch([
       env.DB.prepare(`DELETE FROM nodes WHERE name = ?`).bind(oldName),
       env.DB.prepare(`DELETE FROM keepalive_state WHERE node = ?`).bind(node.name),
       env.DB.prepare(`UPDATE keepalive_state SET node = ? WHERE node = ?`).bind(node.name, oldName)
     ]);
+    invalidateNodeCache(env, oldName);
+    invalidateTargetHealth(oldName);
   }
   await ensureKeepaliveState(env, node);
-  invalidateNodeHostMapCache();
   return node;
 }
 
@@ -1897,7 +2339,8 @@ async function deleteNode(env, name) {
     env.DB.prepare(`DELETE FROM nodes WHERE name = ?`).bind(nodeName),
     env.DB.prepare(`DELETE FROM keepalive_state WHERE node = ?`).bind(nodeName)
   ]);
-  invalidateNodeHostMapCache();
+  invalidateNodeCache(env, nodeName);
+  invalidateTargetHealth(nodeName);
 }
 
 async function reorderNodes(env, names) {
@@ -1907,7 +2350,9 @@ async function reorderNodes(env, names) {
       .bind(index++, Date.now(), normalizeName(name))
       .run();
   }
-  invalidateNodeHostMapCache();
+  for (const name of names) {
+    invalidateNodeCache(env, name);
+  }
 }
 
 function rowToNode(row) {
@@ -2636,17 +3081,56 @@ async function embyJSON(target, path, options, snap, credentials) {
 }
 
 async function embyRaw(target, path, options = {}, snap, credentials) {
-  const url = embyTargetURL(target, path, options.params);
-  const headers = simulatedWatchHeaders(snap, credentials, options.headers);
-  const init = {
-    method: options.method || "GET",
-    headers,
-    redirect: "follow"
-  };
-  if (options.body !== undefined) {
-    init.body = typeof options.body === "string" ? options.body : JSON.stringify(options.body);
+  const trustedOrigin = new URL(target).origin;
+  let url = embyTargetURL(target, path, options.params);
+  let method = options.method || "GET";
+  let body = options.body === undefined
+    ? undefined
+    : (typeof options.body === "string" ? options.body : JSON.stringify(options.body));
+  let response;
+  for (let i = 0; i < 4; i++) {
+    const includeAuth = url.origin === trustedOrigin;
+    const headers = simulatedWatchHeaders(snap, credentials, options.headers, includeAuth);
+    const init = { method, headers, redirect: "manual" };
+    if (body !== undefined && method !== "GET" && method !== "HEAD") {
+      init.body = body;
+    }
+    response = await fetch(url.toString(), init);
+    if (!isRedirectStatus(response.status)) {
+      return response;
+    }
+    const location = response.headers.get("location");
+    if (!location) {
+      return response;
+    }
+    let nextURL;
+    try {
+      nextURL = new URL(location, url);
+    } catch {
+      return response;
+    }
+    if (!["http:", "https:"].includes(nextURL.protocol)) {
+      return response;
+    }
+    let nextMethod = method;
+    let nextBody = body;
+    if (response.status === 303 || ([301, 302].includes(response.status) && method === "POST")) {
+      nextMethod = "GET";
+      nextBody = undefined;
+    }
+    if (nextURL.origin !== trustedOrigin && !["GET", "HEAD"].includes(nextMethod)) {
+      return response;
+    }
+    try {
+      response.body?.cancel?.();
+    } catch {
+      // Ignore redirect body cleanup errors.
+    }
+    method = nextMethod;
+    body = nextBody;
+    url = nextURL;
   }
-  return fetch(url.toString(), init);
+  return response;
 }
 
 function embyTargetURL(target, path, params) {
@@ -2667,7 +3151,7 @@ function embyTargetURL(target, path, params) {
   return url;
 }
 
-function simulatedWatchHeaders(snap, credentials, extra = {}) {
+function simulatedWatchHeaders(snap, credentials, extra = {}, includeAuth = true) {
   const headers = new Headers(extra);
   if (!headers.get("User-Agent")) {
     headers.set("User-Agent", snap.ua);
@@ -2681,20 +3165,24 @@ function simulatedWatchHeaders(snap, credentials, extra = {}) {
   if (!headers.get("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  headers.set("X-Emby-Authorization", simulatedAuthorization(snap, credentials));
-  headers.set("X-MediaBrowser-Authorization", simulatedAuthorization(snap, credentials));
-  if (credentials?.token) {
-    headers.set("X-Emby-Token", sanitizeHeaderValue(credentials.token));
-    headers.set("X-MediaBrowser-Token", sanitizeHeaderValue(credentials.token));
+  if (includeAuth) {
+    headers.set("X-Emby-Authorization", simulatedAuthorization(snap, credentials));
+    headers.set("X-MediaBrowser-Authorization", simulatedAuthorization(snap, credentials));
+    if (credentials?.token) {
+      headers.set("X-Emby-Token", sanitizeHeaderValue(credentials.token));
+      headers.set("X-MediaBrowser-Token", sanitizeHeaderValue(credentials.token));
+    }
+    headers.set("X-Emby-Client", snap.client);
+    headers.set("X-MediaBrowser-Client", snap.client);
+    headers.set("X-Emby-Client-Version", snap.version);
+    headers.set("X-MediaBrowser-Client-Version", snap.version);
+    headers.set("X-Emby-Device-Name", snap.device);
+    headers.set("X-MediaBrowser-Device-Name", snap.device);
+    headers.set("X-Emby-Device-Id", snap.deviceId);
+    headers.set("X-MediaBrowser-Device-Id", snap.deviceId);
+  } else {
+    stripSensitiveRequestHeaders(headers);
   }
-  headers.set("X-Emby-Client", snap.client);
-  headers.set("X-MediaBrowser-Client", snap.client);
-  headers.set("X-Emby-Client-Version", snap.version);
-  headers.set("X-MediaBrowser-Client-Version", snap.version);
-  headers.set("X-Emby-Device-Name", snap.device);
-  headers.set("X-MediaBrowser-Device-Name", snap.device);
-  headers.set("X-Emby-Device-Id", snap.deviceId);
-  headers.set("X-MediaBrowser-Device-Id", snap.deviceId);
   return headers;
 }
 
@@ -3089,7 +3577,9 @@ async function updateDNSRecords(env, body) {
   }
   const name = cleanString(body.name || dnsDomain(env));
   const type = cleanString(body.type || "A").toUpperCase();
-  const values = Array.isArray(body.values) ? body.values.map(cleanString).filter(Boolean) : [];
+  const values = Array.isArray(body.values)
+    ? [...new Set(body.values.map((value) => normalizeDNSRecordContent(type, value)).filter(Boolean))]
+    : [];
   if (!["A", "AAAA", "CNAME"].includes(type)) {
     return { ok: false, error: "record type must be A, AAAA or CNAME" };
   }
@@ -3099,29 +3589,35 @@ async function updateDNSRecords(env, body) {
   if (!name || values.length === 0) {
     return { ok: false, error: "missing DNS name or values" };
   }
+  const invalid = values.find((value) => !isValidDNSRecordContent(type, value));
+  if (invalid) {
+    return { ok: false, error: `invalid ${type} record value: ${invalid}` };
+  }
 
   const current = await getDNSRecords(env, name);
   if (!current.ok) {
     return current;
   }
   const sameType = current.records.filter((r) => r.type === type);
-  for (const record of sameType) {
-    await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records/${record.id}`, { method: "DELETE" });
-  }
-
-  const created = [];
-  for (const content of values) {
-    const data = await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records`, {
-      method: "POST",
-      body: JSON.stringify({ type, name, content, proxied: false, ttl: 1 })
-    });
-    if (!data.success) {
-      return { ok: false, error: cfErrors(data), created };
-    }
-    created.push(data.result);
+  const replaced = await reconcileDNSRecords(
+    env,
+    name,
+    current.records,
+    sameType,
+    values.map((content) => ({ type, content, proxied: false, ttl: 1 }))
+  );
+  if (!replaced.ok) {
+    return replaced;
   }
   await recordDNSHistory(env, name, type, sameType.map((r) => r.content).join(","), values.join(","));
-  return { ok: true, name, type, created };
+  return {
+    ok: true,
+    name,
+    type,
+    created: replaced.created,
+    updated: replaced.updated,
+    deleted: replaced.deleted
+  };
 }
 
 async function getDNSRecordsCompat(env) {
@@ -3134,7 +3630,12 @@ async function getDNSRecordsCompat(env) {
 }
 
 async function updateDNSRecordsCompat(env, body) {
-  const ips = Array.isArray(body.ips) ? body.ips.map(cleanDNSValue).filter(Boolean) : [];
+  const ips = Array.isArray(body.ips)
+    ? [...new Set(body.ips
+      .map(cleanDNSValue)
+      .map((value) => normalizeDNSRecordContent(dnsTypeFor(value), value))
+      .filter(Boolean))]
+    : [];
   const name = cleanString(body.name || dnsDomain(env));
   if (!name || ips.length === 0) {
     return { success: false, ok: false, error: "missing DNS domain or values" };
@@ -3156,23 +3657,31 @@ async function updateDNSRecordsCompat(env, body) {
   if (cnameValues.length && ips.length > 1) {
     return { success: false, ok: false, error: "CNAME 记录不能和 A/AAAA 或多个 CNAME 同名共存，请只提交一个 CNAME。" };
   }
-  for (const record of current.records.filter((r) => ["A", "AAAA", "CNAME"].includes(r.type))) {
-    await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records/${record.id}`, { method: "DELETE" });
+  const desired = ips.map((content) => ({
+    type: dnsTypeFor(content),
+    content,
+    proxied: false,
+    ttl: 60
+  }));
+  const invalid = desired.find((record) => !isValidDNSRecordContent(record.type, record.content));
+  if (invalid) {
+    return { success: false, ok: false, error: `invalid ${invalid.type} record value: ${invalid.content}` };
   }
-  const created = [];
-  for (const content of ips) {
-    const type = dnsTypeFor(content);
-    const data = await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records`, {
-      method: "POST",
-      body: JSON.stringify({ type, name, content, proxied: false, ttl: 60 })
-    });
-    if (!data.success) {
-      return { success: false, ok: false, error: cfErrors(data), created };
-    }
-    created.push(data.result);
+  const managed = current.records.filter((record) => ["A", "AAAA", "CNAME"].includes(record.type));
+  const replaced = await reconcileDNSRecords(env, name, current.records, managed, desired);
+  if (!replaced.ok) {
+    return { success: false, ...replaced };
   }
   await recordDNSHistory(env, name, "mixed", current.records.map((r) => r.content).join(","), ips.join(","));
-  return { success: true, ok: true, name, message: "DNS 更新成功", created };
+  return {
+    success: true,
+    ok: true,
+    name,
+    message: "DNS 更新成功",
+    created: replaced.created,
+    updated: replaced.updated,
+    deleted: replaced.deleted
+  };
 }
 
 function dnsDomain(env) {
@@ -3187,6 +3696,11 @@ function cleanDNSValue(value) {
   return cleanString(value).replace(/^\[/, "").replace(/\]$/, "");
 }
 
+function normalizeDNSRecordContent(type, value) {
+  const content = cleanDNSValue(value);
+  return type === "CNAME" ? content.replace(/\.$/, "") : content;
+}
+
 function dnsTypeFor(value) {
   if (String(value).includes(":")) {
     return "AAAA";
@@ -3195,6 +3709,205 @@ function dnsTypeFor(value) {
     return "CNAME";
   }
   return "A";
+}
+
+function isValidDNSRecordContent(type, value) {
+  const content = cleanDNSValue(value);
+  if (type === "A") {
+    const parts = content.split(".");
+    return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+  }
+  if (type === "AAAA") {
+    if (!content.includes(":") || !/^[a-f0-9:.]+$/i.test(content)) {
+      return false;
+    }
+    try {
+      new URL(`http://[${content}]/`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  if (type === "CNAME") {
+    const candidate = content.replace(/\.$/, "");
+    if (!candidate || candidate.length > 253 || candidate.includes("://") || /[\s/]/.test(candidate)) {
+      return false;
+    }
+    return candidate.split(".").every((label) =>
+      label.length > 0 &&
+      label.length <= 63 &&
+      /^[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?$/i.test(label)
+    );
+  }
+  return false;
+}
+
+async function reconcileDNSRecords(env, name, allCurrent, scopedCurrent, desired) {
+  const available = [...scopedCurrent];
+  const missing = [];
+  const pendingUpdates = [];
+  for (const record of desired) {
+    const index = available.findIndex((current) =>
+      current.type === record.type &&
+      normalizeDNSRecordContent(current.type, current.content).toLowerCase() ===
+        normalizeDNSRecordContent(record.type, record.content).toLowerCase()
+    );
+    if (index >= 0) {
+      const [current] = available.splice(index, 1);
+      if (!dnsRecordConfigMatches(current, record)) {
+        pendingUpdates.push({ current, desired: record });
+      }
+    } else {
+      missing.push(record);
+    }
+  }
+  const stale = available;
+  const created = [];
+  const deleted = [];
+  const updated = [];
+  const conflictingCNAME = missing.some((record) => record.type === "CNAME") &&
+    allCurrent.some((record) => ["A", "AAAA", "CNAME"].includes(record.type));
+  const removingCNAME = stale.some((record) => record.type === "CNAME");
+  const deleteFirst = conflictingCNAME || removingCNAME;
+
+  try {
+    for (const change of pendingUpdates) {
+      const result = await updateDNSRecord(env, name, change.current, change.desired);
+      updated.push({ before: change.current, after: result });
+    }
+    if (deleteFirst) {
+      await deleteDNSRecordList(env, stale, deleted);
+    }
+    for (const record of missing) {
+      created.push(await createDNSRecord(env, name, record));
+    }
+    if (!deleteFirst) {
+      await deleteDNSRecordList(env, stale, deleted);
+    }
+    return {
+      ok: true,
+      created,
+      updated: updated.map((change) => change.after),
+      deleted: deleted.map((record) => record.id)
+    };
+  } catch (err) {
+    const rollbackErrors = await rollbackDNSChanges(env, name, created, updated, deleted);
+    const changed = created.length || updated.length || deleted.length;
+    const suffix = rollbackErrors.length
+      ? `；回滚失败：${rollbackErrors.join("; ")}`
+      : (changed ? "；变更已回滚" : "");
+    return { ok: false, error: errMessage(err) + suffix, created: [], updated: [], deleted: [] };
+  }
+}
+
+function dnsRecordConfigMatches(current, desired) {
+  if (Boolean(current?.proxied) !== Boolean(desired?.proxied)) {
+    return false;
+  }
+  const currentTTL = Number(current?.ttl);
+  const desiredTTL = Number(desired?.ttl);
+  return Number.isFinite(currentTTL) &&
+    Number.isFinite(desiredTTL) &&
+    currentTTL === desiredTTL;
+}
+
+async function createDNSRecord(env, name, record) {
+  const payload = {
+    type: record.type,
+    name,
+    content: normalizeDNSRecordContent(record.type, record.content),
+    proxied: Boolean(record.proxied),
+    ttl: Number(record.ttl || 1)
+  };
+  if (typeof record.comment === "string") {
+    payload.comment = record.comment;
+  }
+  if (Array.isArray(record.tags)) {
+    payload.tags = record.tags;
+  }
+  if (record.settings && typeof record.settings === "object") {
+    payload.settings = record.settings;
+  }
+  const data = await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+  if (!data.success) {
+    throw new Error("DNS record creation failed: " + cfErrors(data));
+  }
+  return data.result;
+}
+
+async function updateDNSRecord(env, name, current, desired) {
+  const data = await cfJSON(
+    env,
+    `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records/${current.id}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({
+        type: desired.type,
+        name,
+        content: normalizeDNSRecordContent(desired.type, desired.content),
+        proxied: Boolean(desired.proxied),
+        ttl: Number(desired.ttl || 1)
+      })
+    }
+  );
+  if (!data.success) {
+    throw new Error("DNS record update failed: " + cfErrors(data));
+  }
+  return data.result || {
+    ...current,
+    ...desired,
+    content: normalizeDNSRecordContent(desired.type, desired.content)
+  };
+}
+
+async function deleteDNSRecordList(env, records, deleted) {
+  for (const record of records) {
+    const data = await cfJSON(
+      env,
+      `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records/${record.id}`,
+      { method: "DELETE" }
+    );
+    if (!data.success) {
+      throw new Error("DNS record deletion failed: " + cfErrors(data));
+    }
+    deleted.push(record);
+  }
+}
+
+async function rollbackDNSChanges(env, name, created, updated, deleted) {
+  const errors = [];
+  for (const record of [...created].reverse()) {
+    try {
+      const data = await cfJSON(
+        env,
+        `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records/${record.id}`,
+        { method: "DELETE" }
+      );
+      if (!data.success) {
+        errors.push(cfErrors(data));
+      }
+    } catch (err) {
+      errors.push(errMessage(err));
+    }
+  }
+  for (const change of [...updated].reverse()) {
+    try {
+      await updateDNSRecord(env, name, change.after, change.before);
+    } catch (err) {
+      errors.push(errMessage(err));
+    }
+  }
+  for (const record of deleted) {
+    try {
+      await createDNSRecord(env, name, record);
+    } catch (err) {
+      errors.push(errMessage(err));
+    }
+  }
+  return errors;
 }
 
 async function getCustomAPIIPs(apiURL) {
@@ -3332,15 +4045,24 @@ async function deployWorkerCode(env, body) {
     };
   }
   const service = await cfJSON(env, `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/services/${env.CF_WORKER_NAME}`);
-  let compatibilityDate = "2026-07-06";
-  let compatibilityFlags;
-  let placement;
-  const scriptInfo = service.result?.default_environment?.script || service.result?.script;
-  if (scriptInfo) {
-    compatibilityDate = scriptInfo.compatibility_date || compatibilityDate;
-    compatibilityFlags = scriptInfo.compatibility_flags;
-    placement = scriptInfo.placement;
+  if (!service.success) {
+    return {
+      success: false,
+      ok: false,
+      error: "无法读取当前 Worker 配置，已取消覆盖部署：" + cfErrors(service)
+    };
   }
+  const scriptInfo = service.result?.default_environment?.script || service.result?.script;
+  if (!scriptInfo?.compatibility_date) {
+    return {
+      success: false,
+      ok: false,
+      error: "当前 Worker compatibility_date 不可用，已取消覆盖部署"
+    };
+  }
+  const compatibilityDate = scriptInfo.compatibility_date;
+  const compatibilityFlags = scriptInfo.compatibility_flags;
+  const placement = scriptInfo.placement;
   const bindings = await workerBindings(env);
   const metadata = {
     main_module: "worker.js",
@@ -3383,27 +4105,67 @@ function looksObfuscated(code) {
 
 async function workerBindings(env) {
   const preserved = [];
-  for (const key of ["CF_ACCOUNT_ID", "CF_ZONE_ID", "CF_DOMAIN", "CF_DNS_DOMAIN", "CF_WORKER_NAME", "TG_REPORT_HOUR", "PREFERRED_IPS_URL"]) {
-    if (typeof env[key] === "string") {
+  const plainKeys = [
+    "CF_ACCOUNT_ID",
+    "CF_ZONE_ID",
+    "CF_DOMAIN",
+    "CF_DNS_DOMAIN",
+    "CF_WORKER_NAME",
+    "TG_REPORT_HOUR",
+    "TG_WEBHOOK_URL",
+    "PREFERRED_IPS_URL",
+    "STREAM_BYTE_ACCOUNTING",
+    "EXACT_STREAM_BYTES",
+    "WATCH_COUNT_MIN_SECONDS",
+    "WATCH_SESSION_RETENTION_DAYS",
+    "NODE_CACHE_TTL_SECONDS"
+  ];
+  const data = await cfJSON(env, `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${env.CF_WORKER_NAME}/bindings`);
+  if (!data.success || !Array.isArray(data.result)) {
+    throw new Error("无法读取当前 Worker bindings，已取消覆盖部署：" + cfErrors(data));
+  }
+
+  const seen = new Set();
+  for (const binding of data.result) {
+    if (!binding?.name || !binding?.type) {
+      throw new Error("当前 bindings 列表包含无效项目，已取消覆盖部署");
+    }
+    if (seen.has(binding.name)) {
+      throw new Error(`当前 bindings 列表包含重名项目 ${binding.name}，已取消覆盖部署`);
+    }
+    seen.add(binding.name);
+    if (binding.type === "d1" && !cleanString(binding.id)) {
+      throw new Error(`D1 binding ${binding.name} 缺少数据库 ID，已取消覆盖部署`);
+    }
+    if (binding.type === "secret_text" || binding.type === "plain_text") {
+      if (typeof env[binding.name] !== "string") {
+        throw new Error(`无法读取 ${binding.type} binding ${binding.name}，已取消覆盖部署`);
+      }
+      preserved.push({ ...binding, text: env[binding.name] });
+    } else {
+      preserved.push(binding);
+    }
+  }
+  for (const key of plainKeys) {
+    if (!seen.has(key) && typeof env[key] === "string") {
       preserved.push({ name: key, type: "plain_text", text: env[key] });
     }
   }
-  try {
-    const data = await cfJSON(env, `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${env.CF_WORKER_NAME}/bindings`);
-    if (data.success && Array.isArray(data.result)) {
-      for (const binding of data.result) {
-        if (preserved.some((item) => item.name === binding.name)) {
-          continue;
-        }
-        if (binding.type === "secret_text" && typeof env[binding.name] === "string") {
-          preserved.push({ ...binding, text: env[binding.name] });
-        } else {
-          preserved.push(binding);
-        }
-      }
+
+  const required = ["DB", "ADMIN_TOKEN", "CF_API_TOKEN"];
+  for (const key of ["TG_BOT_TOKEN", "TG_CHAT_ID", "TG_CHAT_ID_2", "TG_WEBHOOK_SECRET", "RAW_PROXY_SIGNING_KEY"]) {
+    if (cleanString(env[key])) {
+      required.push(key);
     }
-  } catch {
-    // Fall back to known plain text bindings.
+  }
+  const names = new Set(preserved.map((binding) => binding.name));
+  const missing = required.filter((name) => !names.has(name));
+  if (missing.length) {
+    throw new Error("当前 bindings 列表不完整，已取消覆盖部署：" + missing.join(", "));
+  }
+  const db = preserved.find((binding) => binding.name === "DB");
+  if (db?.type !== "d1" || !cleanString(db.id)) {
+    throw new Error("DB binding 不是有效的 D1 binding，已取消覆盖部署");
   }
   return preserved;
 }
@@ -3765,11 +4527,12 @@ async function sendKeepaliveReminders(env) {
 }
 
 async function handleTelegramWebhook(request, env) {
-  if (env.TG_WEBHOOK_SECRET) {
-    const got = request.headers.get("x-telegram-bot-api-secret-token") || "";
-    if (got !== env.TG_WEBHOOK_SECRET) {
-      return text("Forbidden", 403);
-    }
+  if (!env.TG_WEBHOOK_SECRET) {
+    return text("Webhook secret is not configured", 503);
+  }
+  const got = request.headers.get("x-telegram-bot-api-secret-token") || "";
+  if (got !== env.TG_WEBHOOK_SECRET) {
+    return text("Forbidden", 403);
   }
   if (!env.TG_BOT_TOKEN) {
     return text("OK");
@@ -3778,7 +4541,12 @@ async function handleTelegramWebhook(request, env) {
     const body = await request.json();
     const messageText = cleanTelegramCommand(body.message?.text);
     if (["/start", "/help", "/stats", "/report"].includes(messageText)) {
-      await sendTelegramReport(env, { chatId: body.message.chat.id, replaceLast: false });
+      const chatId = body.message?.chat?.id;
+      if (!isAuthorizedTelegramChat(env, chatId)) {
+        return text("OK");
+      }
+      await ensureSchema(env);
+      await sendTelegramReport(env, { chatId, replaceLast: false });
       return text("OK");
     }
     const query = body.callback_query;
@@ -3789,6 +4557,10 @@ async function handleTelegramWebhook(request, env) {
       if (!chatId || !messageId) {
         return text("OK");
       }
+      if (!isAuthorizedTelegramChat(env, chatId)) {
+        return text("OK");
+      }
+      await ensureSchema(env);
       await telegramAPI(env, "answerCallbackQuery", {
         callback_query_id: query.id,
         text: data === "refresh_stats" || data === "report:refresh" ? "🔄 正在刷新数据..." : "📊 正在切换报表..."
@@ -3815,6 +4587,12 @@ async function setupTelegramWebhook(env) {
   if (!env.TG_BOT_TOKEN) {
     return { ok: false, error: "missing TG_BOT_TOKEN" };
   }
+  if (!env.TG_WEBHOOK_SECRET) {
+    return { ok: false, error: "missing TG_WEBHOOK_SECRET" };
+  }
+  if (!isValidTelegramWebhookSecret(env.TG_WEBHOOK_SECRET)) {
+    return { ok: false, error: "TG_WEBHOOK_SECRET must use 1-256 characters from A-Z, a-z, 0-9, _ or -" };
+  }
   const webhookURL = cleanString(env.TG_WEBHOOK_URL) || (env.CF_DOMAIN ? `https://${env.CF_DOMAIN}/api/tg-webhook` : "");
   if (!webhookURL) {
     return { ok: false, error: "missing TG_WEBHOOK_URL or CF_DOMAIN" };
@@ -3824,16 +4602,28 @@ async function setupTelegramWebhook(env) {
     allowed_updates: ["message", "callback_query"],
     drop_pending_updates: false
   };
-  if (env.TG_WEBHOOK_SECRET) {
-    payload.secret_token = env.TG_WEBHOOK_SECRET;
-  }
+  payload.secret_token = env.TG_WEBHOOK_SECRET;
   const res = await telegramAPI(env, "setWebhook", payload);
   return { ok: res.ok, webhookURL, result: res.result };
 }
 
+function isValidTelegramWebhookSecret(value) {
+  return /^[A-Za-z0-9_-]{1,256}$/.test(String(value || ""));
+}
+
 function telegramChatIds(env, explicit) {
-  const ids = explicit ? [explicit] : [env.TG_CHAT_ID, env.TG_CHAT_ID_2];
+  const ids = explicit && isAuthorizedTelegramChat(env, explicit)
+    ? [explicit]
+    : (explicit ? [] : [env.TG_CHAT_ID, env.TG_CHAT_ID_2]);
   return [...new Set(ids.map((id) => cleanString(id)).filter(Boolean))];
+}
+
+function isAuthorizedTelegramChat(env, chatId) {
+  const id = cleanString(chatId);
+  if (!id) {
+    return false;
+  }
+  return [env.TG_CHAT_ID, env.TG_CHAT_ID_2].map(cleanString).filter(Boolean).includes(id);
 }
 
 async function sendTelegramReportText(env, textBody) {
@@ -4196,12 +4986,82 @@ function stripResponseHeaders(headers) {
     headers.delete(key);
   }
   headers.set("Access-Control-Allow-Origin", "*");
-  headers.set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Range, Content-Length, Content-Type, Location");
+  headers.set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Range, Content-Length, Content-Type, Location, Server-Timing");
 }
 
 function contentLength(response) {
   const n = Number(response.headers.get("content-length") || "0");
   return Number.isFinite(n) ? n : 0;
+}
+
+function createRequestTiming() {
+  return {
+    startedAt: timingNow(),
+    metrics: new Map(),
+    upstreamRequests: 0,
+    redirects: 0,
+    retries: 0
+  };
+}
+
+function timingNow() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+
+function addRequestTiming(timing, name, duration, description = "") {
+  if (!timing || !Number.isFinite(duration)) {
+    return;
+  }
+  const current = timing.metrics.get(name) || { duration: 0, description: "" };
+  current.duration += Math.max(0, duration);
+  if (description) {
+    current.description = description;
+  }
+  timing.metrics.set(name, current);
+}
+
+function withServerTiming(response, timing) {
+  if (!response || !timing) {
+    return response;
+  }
+  const values = [];
+  for (const name of ["schema", "node", "upstream"]) {
+    const metric = timing.metrics.get(name);
+    if (!metric) {
+      continue;
+    }
+    let description = metric.description;
+    if (name === "upstream" && timing.upstreamRequests > 0) {
+      description = `${timing.upstreamRequests} request${timing.upstreamRequests === 1 ? "" : "s"}`;
+    }
+    values.push(formatServerTiming(`ep-${name}`, metric.duration, description));
+  }
+  if (timing.redirects > 0) {
+    values.push(`ep-redirects;desc="${timing.redirects}"`);
+  }
+  if (timing.retries > 0) {
+    values.push(`ep-retries;desc="${timing.retries}"`);
+  }
+  values.push(formatServerTiming("ep-total", timingNow() - timing.startedAt));
+
+  const headers = new Headers(response.headers);
+  headers.set("Server-Timing", values.join(", "));
+  try {
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers
+    });
+  } catch {
+    return response;
+  }
+}
+
+function formatServerTiming(name, duration, description = "") {
+  const desc = description
+    ? `;desc="${String(description).replace(/["\\]/g, "")}"`
+    : "";
+  return `${name};dur=${Math.max(0, duration).toFixed(1)}${desc}`;
 }
 
 function beijingDay(ts = Date.now()) {
@@ -5366,3 +6226,22 @@ setInterval(measureRTT, 30000);
 </body>
 </html>`;
 }
+
+export {
+  buildImageCacheKey,
+  canForwardRawProxyRequest,
+  directFallbackForBlockedUpstream,
+  embyRaw,
+  isAuthorizedTelegramChat,
+  isValidTelegramWebhookSecret,
+  isValidDNSRecordContent,
+  invalidateTargetHealth,
+  orderTargetsByHealth,
+  reconcileDNSRecords,
+  recordTargetHealth,
+  requestHasCredentials,
+  signRawProxyTarget,
+  stripSensitiveRequestHeaders,
+  verifyRawProxyTarget,
+  workerBindings
+};

@@ -29,6 +29,15 @@ worker/
 - 后台手动模拟观看：使用节点保存的模拟客户端 profile 发起 Emby 播放状态上报
 - 部署前自动混淆，只上传 `worker/dist/index.js`
 
+## 安全边界
+
+- 外部媒体中转地址使用节点绑定的 HMAC 签名，不能手工构造任意 `__raw__` 目标；跨源 `__raw__` 仅允许 `GET` / `HEAD`。
+- 跨源媒体请求不会转发 Emby Token、Authorization、Cookie、真实 IP、Origin 或 Referer Header。
+- 图片缓存仅用于无认证请求，并按节点和协商图片格式隔离缓存键；认证图片返回 `private, no-store`。
+- Telegram Webhook 必须配置 Secret，并且只响应 `TG_CHAT_ID` / `TG_CHAT_ID_2` 白名单。
+- DNS 记录在写入前校验格式，部分变更失败时会回滚已完成的创建、更新和删除。
+- 后台覆盖代码前必须完整读取并验证当前 Worker 配置与 bindings；无法保留 D1、Secret 或兼容日期时会取消部署。
+
 ## 模拟观看实现路径
 
 模拟观看集中在 `worker/src/index.js`，有两种入口：
@@ -72,6 +81,13 @@ watch_seconds    模拟观看秒数，默认 300，最低 180
 
 模拟观看会随机生成进度上报计划，每个进度点之间真实等待至少 65 秒；`watch_seconds = 300` 通常会运行数分钟。Cloudflare Worker 长时间等待存在平台超时风险，真实用户播放仍由代理链路记录。
 
+## 播放性能
+
+- 代理播放不再在正常请求中执行 D1 建表和字段迁移；新数据库仍需先执行 `schema.sql`，未初始化时首次节点查询会自动兜底迁移。
+- 节点配置在 Worker isolate 内缓存 30 秒，连续 Range、HLS 分片和播放元数据重写不再重复查询 D1；节点保存、删除和排序后会立即清理当前 isolate 的缓存。
+- 多个视频线路使用被动健康度排序：首次保持配置顺序，真实视频请求失败后暂时冷却故障线路；所有线路都有成功样本后按平滑首字节耗时排序，不并发请求视频或额外消耗上游流量。
+- 代理响应包含 `Server-Timing`，可查看 `ep-node`、`ep-upstream`、`ep-redirects`、`ep-retries` 和 `ep-total`。
+
 ## 统计口径
 
 统计分成几类，避免把 HTTP 请求数误认为观看次数：
@@ -88,6 +104,7 @@ watch_seconds    模拟观看秒数，默认 300，最低 180
 ```text
 WATCH_COUNT_MIN_SECONDS       有效观看阈值，默认 60 秒
 WATCH_SESSION_RETENTION_DAYS  观看会话保留天数，默认 180 天
+NODE_CACHE_TTL_SECONDS        节点配置缓存秒数，默认 30，可设 5-300
 ```
 
 ## 准备环境
@@ -235,7 +252,7 @@ cd worker
 npx wrangler secret put ADMIN_TOKEN
 ```
 
-Telegram 可选，不用 Telegram 可以跳过：
+Telegram 可选，不用 Telegram 可以跳过全部 `TG_*` 配置。启用 Telegram 时，`TG_WEBHOOK_SECRET` 是必需项：
 
 ```bash
 npx wrangler secret put TG_BOT_TOKEN
@@ -247,8 +264,16 @@ npx wrangler secret put TG_WEBHOOK_SECRET
 `TG_WEBHOOK_SECRET` 可以自己生成一串随机字符：
 
 ```bash
-openssl rand -base64 24
+openssl rand -hex 24
 ```
+
+外部媒体代理签名密钥可选：
+
+```bash
+npx wrangler secret put RAW_PROXY_SIGNING_KEY
+```
+
+未设置时，Worker 会自动生成随机密钥并保存到 D1 `system_config`。
 
 部署后设置 Telegram Webhook：
 
@@ -262,6 +287,7 @@ curl "https://api.telegram.org/bot<TG_BOT_TOKEN>/setWebhook" \
 
 ```bash
 cd worker
+npm test
 node --check src/index.js
 npm run build:obfuscate
 node --check dist/index.js
