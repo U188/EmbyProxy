@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import worker, {
+  directStreamDecision,
   invalidateTargetHealth,
   orderTargetsByHealth,
-  recordTargetHealth
+  recordTargetHealth,
+  stripInternalProxyCookies
 } from "../src/index.js";
 
-function nodeRow(name = "fast-node") {
+function nodeRow(name = "fast-node", overrides = {}) {
   return {
     name,
     display_name: "Fast Node",
@@ -23,7 +25,8 @@ function nodeRow(name = "fast-node") {
     sort_order: 0,
     enabled: 1,
     created_at: 1,
-    updated_at: 1
+    updated_at: 1,
+    ...overrides
   };
 }
 
@@ -178,4 +181,108 @@ test("retryable stream target failures enter cooldown", () => {
   );
 
   invalidateTargetHealth(node);
+});
+
+test("auto mode proxies a repeated direct attempt within the retry window", () => {
+  const node = {
+    name: "auto-retry-node",
+    streamMode: "auto",
+    directExternal: true
+  };
+  const url = "https://proxy.example.test/auto-retry-node/Videos/1/stream.mkv";
+  const firstRequest = new Request(url, {
+    headers: {
+      "cf-connecting-ip": "203.0.113.10",
+      "user-agent": "Yamby/Test",
+      range: "bytes=0-"
+    }
+  });
+  const first = directStreamDecision(node, firstRequest, "/Videos/1/stream.mkv", 1000);
+  assert.equal(first.redirect, true);
+  assert.match(first.retryCookie, /^__ep_direct_[a-z0-9]+=1;/);
+
+  const cookieRetry = new Request(url, {
+    headers: {
+      cookie: first.retryCookie.split(";")[0],
+      "cf-connecting-ip": "203.0.113.11",
+      "user-agent": "Yamby/Test",
+      range: "bytes=0-"
+    }
+  });
+  assert.equal(
+    directStreamDecision(node, cookieRetry, "/Videos/1/stream.mkv", 1001).redirect,
+    false
+  );
+  assert.equal(
+    directStreamDecision(node, firstRequest, "/Videos/1/stream.mkv", 1002).redirect,
+    false
+  );
+  assert.equal(
+    directStreamDecision(node, firstRequest, "/Videos/1/stream.mkv", 1000 + 45001).redirect,
+    true
+  );
+});
+
+test("auto mode returns an uncached redirect before proxying a retry", async () => {
+  const originalFetch = globalThis.fetch;
+  const db = mockDatabase(nodeRow("auto-integration", {
+    stream_mode: "auto",
+    direct_external: 1
+  }));
+  const env = { DB: db };
+  const request = () => new Request("https://proxy.example.test/auto-integration/Videos/2/stream.mkv", {
+    headers: {
+      "cf-connecting-ip": "203.0.113.20",
+      "user-agent": "Yamby/Integration",
+      range: "bytes=0-3"
+    }
+  });
+  let upstreamCalls = 0;
+
+  try {
+    globalThis.fetch = async () => {
+      upstreamCalls++;
+      return new Response(new Uint8Array([1, 2, 3, 4]), {
+        status: 206,
+        headers: {
+          "content-type": "video/x-matroska",
+          "content-length": "4",
+          "content-range": "bytes 0-3/100"
+        }
+      });
+    };
+
+    const direct = await worker.fetch(request(), env, executionContext());
+    assert.equal(direct.status, 302);
+    assert.equal(direct.headers.get("cache-control"), "no-store");
+    assert.match(direct.headers.get("set-cookie") || "", /^__ep_direct_/);
+    assert.equal(upstreamCalls, 0);
+
+    const proxied = await worker.fetch(request(), env, executionContext());
+    assert.equal(proxied.status, 206);
+    assert.equal(upstreamCalls, 1);
+    await proxied.arrayBuffer();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("explicit direct and proxy modes keep their configured behavior", () => {
+  const request = new Request("https://proxy.example.test/node/Videos/1/stream.mkv");
+  assert.equal(
+    directStreamDecision({ name: "node", streamMode: "direct" }, request, "/Videos/1/stream.mkv").redirect,
+    true
+  );
+  assert.equal(
+    directStreamDecision({ name: "node", streamMode: "proxy", directExternal: true }, request, "/Videos/1/stream.mkv").redirect,
+    false
+  );
+});
+
+test("auto direct markers are not forwarded to upstream servers", () => {
+  const headers = new Headers({
+    Cookie: "session=allowed; __ep_direct_abc=1; preference=dark"
+  });
+  stripInternalProxyCookies(headers);
+  assert.equal(headers.get("cookie"), "session=allowed; preference=dark");
 });

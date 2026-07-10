@@ -1,8 +1,10 @@
-const BUILD_VERSION = "0.1.2";
+const BUILD_VERSION = "0.1.3";
 const DEFAULT_MAX_REWRITE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_RETRY_BODY_BYTES = 16 * 1024 * 1024;
 const DEFAULT_NODE_CACHE_TTL_SECONDS = 30;
 const NODE_NOT_FOUND_CACHE_TTL_MS = 5000;
+const AUTO_DIRECT_RETRY_WINDOW_MS = 45 * 1000;
+const AUTO_DIRECT_ATTEMPT_MAX_ENTRIES = 2048;
 const TARGET_HEALTH_TTL_MS = 10 * 60 * 1000;
 const TARGET_FAILURE_COOLDOWN_MS = 30000;
 const TARGET_MAX_FAILURE_COOLDOWN_MS = 2 * 60 * 1000;
@@ -29,6 +31,7 @@ const CLIENT_PROFILES = [
 const schemaReadyByDatabase = new WeakMap();
 const nodeCacheByDatabase = new WeakMap();
 const targetHealthCache = new Map();
+const autoDirectAttempts = new Map();
 let identityStatePromise;
 let rawProxySigningKeyPromise;
 let rawProxyCryptoKeyCache = { raw: "", promise: null };
@@ -419,10 +422,10 @@ async function handleProxy(request, env, ctx, timing) {
   for (const target of targets) {
     try {
       const targetURL = buildTargetURL(target, route.path, inboundURL.search);
-      const shouldRedirect = shouldUseDirectStream(node, request, route.path);
-      if (shouldRedirect) {
+      const directDecision = directStreamDecision(node, request, route.path);
+      if (directDecision.redirect) {
         ctx.waitUntil(recordRequest(env, request, node.name, route.path, 302, 0, "stream_direct", bodyBuffer));
-        return Response.redirect(targetURL.toString(), 302);
+        return directStreamRedirect(targetURL, directDecision.retryCookie);
       }
 
       const outbound = await buildOutboundRequest(request, targetURL, node, bodyBuffer, env);
@@ -785,6 +788,7 @@ async function buildOutboundRequest(request, targetURL, node, bodyBuffer, env, o
 async function buildHeaders(request, targetURL, node, env, options = {}) {
   const headers = new Headers(request.headers);
   stripHopByHop(headers);
+  stripInternalProxyCookies(headers);
   const trustedOrigin = isNodeTargetOrigin(node, targetURL);
   if (!trustedOrigin) {
     stripSensitiveRequestHeaders(headers);
@@ -857,6 +861,21 @@ function stripSensitiveRequestHeaders(headers) {
       lower.startsWith("x-media-browser-")) {
       headers.delete(key);
     }
+  }
+}
+
+function stripInternalProxyCookies(headers) {
+  const cookie = headers.get("cookie");
+  if (!cookie) {
+    return;
+  }
+  const kept = cookie.split(";").map((part) => part.trim()).filter((part) =>
+    part && !part.startsWith("__ep_direct_")
+  );
+  if (kept.length) {
+    headers.set("Cookie", kept.join("; "));
+  } else {
+    headers.delete("Cookie");
   }
 }
 
@@ -1977,19 +1996,75 @@ function publicNodeBase(inboundURL, node) {
   return inboundURL.origin + "/" + parts.join("/");
 }
 
-function shouldUseDirectStream(node, request, path) {
+function directStreamDecision(node, request, path, now = Date.now()) {
   const mode = node.streamMode || "proxy";
   if (mode === "proxy") {
-    return false;
+    return { redirect: false, retryCookie: "" };
   }
   if (!isStreamingPath(path, request) || request.method !== "GET") {
-    return false;
+    return { redirect: false, retryCookie: "" };
   }
   if (mode === "direct") {
-    return true;
+    return { redirect: true, retryCookie: "" };
   }
-  // Auto mode is intentionally conservative in this first version.
-  return Boolean(node.directExternal);
+  if (!node.directExternal) {
+    return { redirect: false, retryCookie: "" };
+  }
+
+  const marker = autoDirectMarker(node, request, path);
+  const previous = autoDirectAttempts.get(marker.memoryKey);
+  const cookieRetry = requestHasCookie(request, marker.cookieName);
+  if (cookieRetry || Number(previous?.expires || 0) > now) {
+    return { redirect: false, retryCookie: "" };
+  }
+
+  autoDirectAttempts.set(marker.memoryKey, { expires: now + AUTO_DIRECT_RETRY_WINDOW_MS });
+  pruneAutoDirectAttempts(now);
+  return {
+    redirect: true,
+    retryCookie: `${marker.cookieName}=1; Max-Age=${Math.ceil(AUTO_DIRECT_RETRY_WINDOW_MS / 1000)}; Path=/; Secure; HttpOnly; SameSite=Lax`
+  };
+}
+
+function autoDirectMarker(node, request, path) {
+  const range = request.headers.get("range") || "";
+  const routeKey = simpleHash(`${normalizeName(node?.name)}\n${path}\n${range}`);
+  const clientKey = [
+    request.headers.get("cf-connecting-ip") || "",
+    request.headers.get("user-agent") || "",
+    routeKey
+  ].join("\n");
+  return {
+    cookieName: `__ep_direct_${routeKey}`,
+    memoryKey: simpleHash(clientKey)
+  };
+}
+
+function requestHasCookie(request, name) {
+  const cookie = request.headers.get("cookie") || "";
+  return cookie.split(";").some((part) => part.trim().startsWith(name + "="));
+}
+
+function pruneAutoDirectAttempts(now) {
+  if (autoDirectAttempts.size <= AUTO_DIRECT_ATTEMPT_MAX_ENTRIES) {
+    return;
+  }
+  for (const [key, value] of autoDirectAttempts) {
+    if (Number(value?.expires || 0) <= now || autoDirectAttempts.size > AUTO_DIRECT_ATTEMPT_MAX_ENTRIES) {
+      autoDirectAttempts.delete(key);
+    }
+  }
+}
+
+function directStreamRedirect(targetURL, retryCookie) {
+  const headers = new Headers({
+    Location: targetURL.toString(),
+    "Cache-Control": "no-store"
+  });
+  if (retryCookie) {
+    headers.set("Set-Cookie", retryCookie);
+  }
+  return new Response(null, { status: 302, headers });
 }
 
 function isStreamingPath(path, request) {
@@ -5311,7 +5386,7 @@ body.dark .x{background:rgba(44,44,46,.72)}
         <div class="option-row">
           <label class="check"><input id="impersonate" type="checkbox" checked>启用模拟客户端</label>
           <label class="check"><input id="autoWatch" type="checkbox">到期自动模拟观看</label>
-          <label class="check"><input id="directExternal" type="checkbox">自动模式允许直链</label>
+          <label class="check"><input id="directExternal" type="checkbox">自动模式优先直连</label>
           <label class="check"><input id="cacheImage" type="checkbox" checked>海报及图片缓存</label>
           <label class="check"><input id="enabled" type="checkbox" checked>启用节点</label>
         </div>
@@ -6231,6 +6306,7 @@ export {
   buildImageCacheKey,
   canForwardRawProxyRequest,
   directFallbackForBlockedUpstream,
+  directStreamDecision,
   embyRaw,
   isAuthorizedTelegramChat,
   isValidTelegramWebhookSecret,
@@ -6241,6 +6317,7 @@ export {
   recordTargetHealth,
   requestHasCredentials,
   signRawProxyTarget,
+  stripInternalProxyCookies,
   stripSensitiveRequestHeaders,
   verifyRawProxyTarget,
   workerBindings
