@@ -78,6 +78,9 @@ test("authenticated image requests are not cacheable under a shared key", () => 
   const identityOnly = new Request("https://proxy.example.test/node/Items/1/Images/Primary", {
     headers: { "X-Emby-Client": "Yamby" }
   });
+  const routeStateOnly = new Request("https://proxy.example.test/node/Items/1/Images/Primary", {
+    headers: { Cookie: "__ep_direct_abc=1; __ep_proxy_xyz=proxy" }
+  });
   const outbound = new Request("https://upstream.example.test/Items/1/Images/Primary");
   const webpOutbound = new Request(outbound.url, { headers: { Accept: "image/webp,image/*" } });
 
@@ -85,6 +88,7 @@ test("authenticated image requests are not cacheable under a shared key", () => 
   assert.equal(requestHasCredentials(headerAuthenticated), true);
   assert.equal(requestHasCredentials(anonymous), false);
   assert.equal(requestHasCredentials(identityOnly), false);
+  assert.equal(requestHasCredentials(routeStateOnly), false);
   assert.notEqual(
     buildImageCacheKey(outbound, { name: "node-a" }).url,
     buildImageCacheKey(outbound, { name: "node-b" }).url

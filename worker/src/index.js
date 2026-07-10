@@ -1,10 +1,11 @@
-const BUILD_VERSION = "0.1.3";
+const BUILD_VERSION = "0.1.4";
 const DEFAULT_MAX_REWRITE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_RETRY_BODY_BYTES = 16 * 1024 * 1024;
 const DEFAULT_NODE_CACHE_TTL_SECONDS = 30;
 const NODE_NOT_FOUND_CACHE_TTL_MS = 5000;
 const AUTO_DIRECT_RETRY_WINDOW_MS = 45 * 1000;
-const AUTO_DIRECT_ATTEMPT_MAX_ENTRIES = 2048;
+const AUTO_PROXY_PREFERENCE_MS = 15 * 60 * 1000;
+const AUTO_ROUTE_STATE_MAX_ENTRIES = 2048;
 const TARGET_HEALTH_TTL_MS = 10 * 60 * 1000;
 const TARGET_FAILURE_COOLDOWN_MS = 30000;
 const TARGET_MAX_FAILURE_COOLDOWN_MS = 2 * 60 * 1000;
@@ -32,6 +33,7 @@ const schemaReadyByDatabase = new WeakMap();
 const nodeCacheByDatabase = new WeakMap();
 const targetHealthCache = new Map();
 const autoDirectAttempts = new Map();
+const autoProxyPreferences = new Map();
 let identityStatePromise;
 let rawProxySigningKeyPromise;
 let rawProxyCryptoKeyCache = { raw: "", promise: null };
@@ -416,18 +418,21 @@ async function handleProxy(request, env, ctx, timing) {
     return text("Node has no target", 502);
   }
 
+  const routeStarted = timingNow();
+  const directDecision = await directStreamDecision(node, request, route.path, Date.now(), ctx);
+  addRequestTiming(timing, "route", timingNow() - routeStarted);
+  if (directDecision.redirect) {
+    const targetURL = buildTargetURL(targets[0], route.path, inboundURL.search);
+    ctx.waitUntil(recordRequest(env, request, node.name, route.path, 302, 0, "stream_direct", bodyBuffer));
+    return directStreamRedirect(targetURL, directDecision.retryCookie);
+  }
+
   let lastError = "";
   let lastResponse;
   let lastResponseURL;
   for (const target of targets) {
     try {
       const targetURL = buildTargetURL(target, route.path, inboundURL.search);
-      const directDecision = directStreamDecision(node, request, route.path);
-      if (directDecision.redirect) {
-        ctx.waitUntil(recordRequest(env, request, node.name, route.path, 302, 0, "stream_direct", bodyBuffer));
-        return directStreamRedirect(targetURL, directDecision.retryCookie);
-      }
-
       const outbound = await buildOutboundRequest(request, targetURL, node, bodyBuffer, env);
       const cacheableImage = node.cacheImage &&
         request.method === "GET" &&
@@ -471,21 +476,24 @@ async function handleProxy(request, env, ctx, timing) {
           return redirectedFallback;
         }
         const response = await finishProxyResponse(streamRedirect.upstream, request, node, streamRedirect.targetURL, inboundURL, env);
-        return recordProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request), bodyBuffer);
+        const routedResponse = applyAutoProxyPreference(response, directDecision, request, ctx);
+        return recordProxyResponse(ctx, env, request, node.name, route.path, routedResponse, requestKind(route.path, routedResponse, request), bodyBuffer);
       }
 
       const response = await finishProxyResponse(upstream, request, node, targetURL, inboundURL, env);
       if (cacheableImage && response.ok) {
         ctx.waitUntil(caches.default.put(imageCacheKey, response.clone()));
       }
-      return recordProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request), bodyBuffer);
+      const routedResponse = applyAutoProxyPreference(response, directDecision, request, ctx);
+      return recordProxyResponse(ctx, env, request, node.name, route.path, routedResponse, requestKind(route.path, routedResponse, request), bodyBuffer);
     } catch (err) {
       lastError = errMessage(err);
     }
   }
 
   if (lastResponse) {
-    return finishProxyResponse(lastResponse, request, node, lastResponseURL || buildTargetURL(targets[0], route.path, inboundURL.search), inboundURL, env);
+    const response = await finishProxyResponse(lastResponse, request, node, lastResponseURL || buildTargetURL(targets[0], route.path, inboundURL.search), inboundURL, env);
+    return applyAutoProxyPreference(response, directDecision, request, ctx);
   }
   return text("Line failover exhausted. Last Error: " + lastError, 502);
 }
@@ -870,13 +878,18 @@ function stripInternalProxyCookies(headers) {
     return;
   }
   const kept = cookie.split(";").map((part) => part.trim()).filter((part) =>
-    part && !part.startsWith("__ep_direct_")
+    part && !isInternalProxyCookie(part)
   );
   if (kept.length) {
     headers.set("Cookie", kept.join("; "));
   } else {
     headers.delete("Cookie");
   }
+}
+
+function isInternalProxyCookie(part) {
+  const value = String(part || "").trim();
+  return value.startsWith("__ep_direct_") || value.startsWith("__ep_proxy_");
 }
 
 function isCredentialHeaderName(name) {
@@ -1996,48 +2009,104 @@ function publicNodeBase(inboundURL, node) {
   return inboundURL.origin + "/" + parts.join("/");
 }
 
-function directStreamDecision(node, request, path, now = Date.now()) {
+async function directStreamDecision(node, request, path, now = Date.now(), ctx) {
   const mode = node.streamMode || "proxy";
   if (mode === "proxy") {
-    return { redirect: false, retryCookie: "" };
+    return autoRouteDecision(false);
   }
   if (!isStreamingPath(path, request) || request.method !== "GET") {
-    return { redirect: false, retryCookie: "" };
+    return autoRouteDecision(false);
   }
   if (mode === "direct") {
-    return { redirect: true, retryCookie: "" };
+    return autoRouteDecision(true);
   }
   if (!node.directExternal) {
-    return { redirect: false, retryCookie: "" };
+    return autoRouteDecision(false);
   }
 
   const marker = autoDirectMarker(node, request, path);
-  const previous = autoDirectAttempts.get(marker.memoryKey);
-  const cookieRetry = requestHasCookie(request, marker.cookieName);
-  if (cookieRetry || Number(previous?.expires || 0) > now) {
-    return { redirect: false, retryCookie: "" };
+  const proxyPreferred = requestHasCookie(request, marker.preferenceCookieName) ||
+    Number(autoProxyPreferences.get(marker.preferenceMemoryKey)?.expires || 0) > now;
+  const directRetried = requestHasCookie(request, marker.attemptCookieName) ||
+    Number(autoDirectAttempts.get(marker.attemptMemoryKey)?.expires || 0) > now;
+  if (proxyPreferred) {
+    return autoRouteDecision(false, { proxyPreferred: true, marker });
+  }
+  if (directRetried) {
+    return autoRouteDecision(false, { learnProxy: true, marker });
   }
 
-  autoDirectAttempts.set(marker.memoryKey, { expires: now + AUTO_DIRECT_RETRY_WINDOW_MS });
-  pruneAutoDirectAttempts(now);
+  const edgeState = await readAutoRouteEdgeState(request, marker);
+  if (edgeState.proxyPreferred) {
+    autoProxyPreferences.set(marker.preferenceMemoryKey, {
+      expires: edgeState.preferenceExpires > now
+        ? edgeState.preferenceExpires
+        : now + AUTO_PROXY_PREFERENCE_MS
+    });
+    pruneAutoRouteState(autoProxyPreferences, now);
+    return autoRouteDecision(false, { proxyPreferred: true, marker });
+  }
+  if (edgeState.directRetried) {
+    return autoRouteDecision(false, { learnProxy: true, marker });
+  }
+
+  autoDirectAttempts.set(marker.attemptMemoryKey, { expires: now + AUTO_DIRECT_RETRY_WINDOW_MS });
+  pruneAutoRouteState(autoDirectAttempts, now);
+  storeAutoRouteEdgeState(request, marker.attemptEdgeKey, AUTO_DIRECT_RETRY_WINDOW_MS, ctx);
+  return autoRouteDecision(true, {
+    marker,
+    retryCookie: cookieValue(marker.attemptCookieName, "1", AUTO_DIRECT_RETRY_WINDOW_MS)
+  });
+}
+
+function autoRouteDecision(redirect, values = {}) {
   return {
-    redirect: true,
-    retryCookie: `${marker.cookieName}=1; Max-Age=${Math.ceil(AUTO_DIRECT_RETRY_WINDOW_MS / 1000)}; Path=/; Secure; HttpOnly; SameSite=Lax`
+    redirect,
+    retryCookie: "",
+    learnProxy: false,
+    proxyPreferred: false,
+    marker: null,
+    ...values
   };
 }
 
 function autoDirectMarker(node, request, path) {
   const range = request.headers.get("range") || "";
-  const routeKey = simpleHash(`${normalizeName(node?.name)}\n${path}\n${range}`);
-  const clientKey = [
-    request.headers.get("cf-connecting-ip") || "",
-    request.headers.get("user-agent") || "",
-    routeKey
-  ].join("\n");
+  const nodeName = normalizeName(node?.name);
+  const routeKey = routeStateHash(`${nodeName}\n${path}\n${range}`);
+  const clientNodeKey = `${autoRouteClientIdentity(request)}\n${nodeName}`;
+  const clientNodeHash = routeStateHash(clientNodeKey);
   return {
-    cookieName: `__ep_direct_${routeKey}`,
-    memoryKey: simpleHash(clientKey)
+    attemptCookieName: `__ep_direct_${routeKey}`,
+    preferenceCookieName: `__ep_proxy_${routeStateHash(nodeName)}`,
+    attemptMemoryKey: routeStateHash(`${clientNodeKey}\n${routeKey}`),
+    preferenceMemoryKey: clientNodeHash,
+    attemptEdgeKey: `attempt-${routeStateHash(`${clientNodeKey}\n${routeKey}`)}`,
+    preferenceEdgeKey: `proxy-${clientNodeHash}`
   };
+}
+
+function autoRouteClientIdentity(request) {
+  const url = new URL(request.url);
+  const deviceId = firstNonEmpty(
+    request.headers.get("X-Emby-Device-Id"),
+    request.headers.get("X-Emby-DeviceId"),
+    request.headers.get("X-MediaBrowser-Device-Id"),
+    request.headers.get("X-MediaBrowser-DeviceId"),
+    firstQueryValueByNormalizedKey(url, "deviceid")
+  );
+  if (deviceId) {
+    return `device:${deviceId}`;
+  }
+  return [
+    "network",
+    request.headers.get("cf-connecting-ip") || "",
+    request.headers.get("user-agent") || ""
+  ].join("\n");
+}
+
+function routeStateHash(value) {
+  return simpleHash(value) + simpleHash("route:" + value);
 }
 
 function requestHasCookie(request, name) {
@@ -2045,15 +2114,94 @@ function requestHasCookie(request, name) {
   return cookie.split(";").some((part) => part.trim().startsWith(name + "="));
 }
 
-function pruneAutoDirectAttempts(now) {
-  if (autoDirectAttempts.size <= AUTO_DIRECT_ATTEMPT_MAX_ENTRIES) {
+function pruneAutoRouteState(cache, now) {
+  if (cache.size <= AUTO_ROUTE_STATE_MAX_ENTRIES) {
     return;
   }
-  for (const [key, value] of autoDirectAttempts) {
-    if (Number(value?.expires || 0) <= now || autoDirectAttempts.size > AUTO_DIRECT_ATTEMPT_MAX_ENTRIES) {
-      autoDirectAttempts.delete(key);
+  for (const [key, value] of cache) {
+    if (Number(value?.expires || 0) <= now || cache.size > AUTO_ROUTE_STATE_MAX_ENTRIES) {
+      cache.delete(key);
     }
   }
+}
+
+function resetAutoRouteMemory() {
+  autoDirectAttempts.clear();
+  autoProxyPreferences.clear();
+}
+
+async function readAutoRouteEdgeState(request, marker) {
+  const cache = globalThis.caches?.default;
+  if (!cache) {
+    return { proxyPreferred: false, directRetried: false };
+  }
+  try {
+    const [preference, attempt] = await Promise.all([
+      cache.match(autoRouteStateRequest(request, marker.preferenceEdgeKey)),
+      cache.match(autoRouteStateRequest(request, marker.attemptEdgeKey))
+    ]);
+    return {
+      proxyPreferred: Boolean(preference),
+      directRetried: Boolean(attempt),
+      preferenceExpires: Number(preference?.headers.get("x-ep-expires") || 0)
+    };
+  } catch {
+    return { proxyPreferred: false, directRetried: false };
+  }
+}
+
+function storeAutoRouteEdgeState(request, key, ttlMS, ctx) {
+  const cache = globalThis.caches?.default;
+  if (!cache) {
+    return;
+  }
+  const operation = cache.put(
+    autoRouteStateRequest(request, key),
+    new Response("1", {
+      headers: {
+        "Cache-Control": `public, max-age=${Math.ceil(ttlMS / 1000)}`,
+        "X-EP-Expires": String(Date.now() + ttlMS)
+      }
+    })
+  ).catch(() => {});
+  if (ctx?.waitUntil) {
+    ctx.waitUntil(operation);
+  }
+}
+
+function autoRouteStateRequest(request, key) {
+  const url = new URL(request.url);
+  url.pathname = `/__ep_auto_route_state__/${key}`;
+  url.search = "";
+  url.hash = "";
+  return new Request(url.toString(), { method: "GET" });
+}
+
+function applyAutoProxyPreference(response, decision, request, ctx, now = Date.now()) {
+  if (!decision?.learnProxy || !decision.marker || !response?.ok) {
+    return response;
+  }
+  const marker = decision.marker;
+  autoProxyPreferences.set(marker.preferenceMemoryKey, {
+    expires: now + AUTO_PROXY_PREFERENCE_MS
+  });
+  pruneAutoRouteState(autoProxyPreferences, now);
+  storeAutoRouteEdgeState(request, marker.preferenceEdgeKey, AUTO_PROXY_PREFERENCE_MS, ctx);
+
+  const headers = new Headers(response.headers);
+  headers.append(
+    "Set-Cookie",
+    cookieValue(marker.preferenceCookieName, "proxy", AUTO_PROXY_PREFERENCE_MS)
+  );
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+function cookieValue(name, value, ttlMS) {
+  return `${name}=${value}; Max-Age=${Math.ceil(ttlMS / 1000)}; Path=/; Secure; HttpOnly; SameSite=Lax`;
 }
 
 function directStreamRedirect(targetURL, retryCookie) {
@@ -2161,6 +2309,14 @@ function requestKind(path, response, request) {
 function requestHasCredentials(request) {
   const headers = request?.headers || new Headers();
   for (const key of headers.keys()) {
+    if (key.toLowerCase() === "cookie") {
+      const hasExternalCookie = (headers.get(key) || "").split(";").some((part) =>
+        part.trim() && !isInternalProxyCookie(part)
+      );
+      if (!hasExternalCookie) {
+        continue;
+      }
+    }
     if (isCredentialHeaderName(key)) {
       return true;
     }
@@ -5100,7 +5256,7 @@ function withServerTiming(response, timing) {
     return response;
   }
   const values = [];
-  for (const name of ["schema", "node", "upstream"]) {
+  for (const name of ["schema", "node", "route", "upstream"]) {
     const metric = timing.metrics.get(name);
     if (!metric) {
       continue;
@@ -6315,6 +6471,7 @@ export {
   orderTargetsByHealth,
   reconcileDNSRecords,
   recordTargetHealth,
+  resetAutoRouteMemory,
   requestHasCredentials,
   signRawProxyTarget,
   stripInternalProxyCookies,

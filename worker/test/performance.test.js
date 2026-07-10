@@ -6,6 +6,7 @@ import worker, {
   invalidateTargetHealth,
   orderTargetsByHealth,
   recordTargetHealth,
+  resetAutoRouteMemory,
   stripInternalProxyCookies
 } from "../src/index.js";
 
@@ -183,7 +184,7 @@ test("retryable stream target failures enter cooldown", () => {
   invalidateTargetHealth(node);
 });
 
-test("auto mode proxies a repeated direct attempt within the retry window", () => {
+test("auto mode proxies a repeated direct attempt within the retry window", async () => {
   const node = {
     name: "auto-retry-node",
     streamMode: "auto",
@@ -197,7 +198,7 @@ test("auto mode proxies a repeated direct attempt within the retry window", () =
       range: "bytes=0-"
     }
   });
-  const first = directStreamDecision(node, firstRequest, "/Videos/1/stream.mkv", 1000);
+  const first = await directStreamDecision(node, firstRequest, "/Videos/1/stream.mkv", 1000);
   assert.equal(first.redirect, true);
   assert.match(first.retryCookie, /^__ep_direct_[a-z0-9]+=1;/);
 
@@ -210,15 +211,15 @@ test("auto mode proxies a repeated direct attempt within the retry window", () =
     }
   });
   assert.equal(
-    directStreamDecision(node, cookieRetry, "/Videos/1/stream.mkv", 1001).redirect,
+    (await directStreamDecision(node, cookieRetry, "/Videos/1/stream.mkv", 1001)).redirect,
     false
   );
   assert.equal(
-    directStreamDecision(node, firstRequest, "/Videos/1/stream.mkv", 1002).redirect,
+    (await directStreamDecision(node, firstRequest, "/Videos/1/stream.mkv", 1002)).redirect,
     false
   );
   assert.equal(
-    directStreamDecision(node, firstRequest, "/Videos/1/stream.mkv", 1000 + 45001).redirect,
+    (await directStreamDecision(node, firstRequest, "/Videos/1/stream.mkv", 1000 + 45001)).redirect,
     true
   );
 });
@@ -256,32 +257,123 @@ test("auto mode returns an uncached redirect before proxying a retry", async () 
     assert.equal(direct.status, 302);
     assert.equal(direct.headers.get("cache-control"), "no-store");
     assert.match(direct.headers.get("set-cookie") || "", /^__ep_direct_/);
+    assert.match(direct.headers.get("server-timing") || "", /ep-route;dur=/);
     assert.equal(upstreamCalls, 0);
 
     const proxied = await worker.fetch(request(), env, executionContext());
     assert.equal(proxied.status, 206);
     assert.equal(upstreamCalls, 1);
+    assert.match(proxied.headers.get("set-cookie") || "", /^__ep_proxy_/);
+    assert.match(proxied.headers.get("server-timing") || "", /ep-route;dur=/);
     await proxied.arrayBuffer();
+
+    const preferenceCookie = (proxied.headers.get("set-cookie") || "").split(";")[0];
+    const nextVideo = await worker.fetch(
+      new Request("https://proxy.example.test/auto-integration/Videos/3/stream.mkv", {
+        headers: {
+          cookie: preferenceCookie,
+          "cf-connecting-ip": "203.0.113.21",
+          "user-agent": "Yamby/Integration",
+          range: "bytes=0-3"
+        }
+      }),
+      env,
+      executionContext()
+    );
+    assert.equal(nextVideo.status, 206);
+    assert.equal(upstreamCalls, 2);
+    await nextVideo.arrayBuffer();
   } finally {
     globalThis.fetch = originalFetch;
+    resetAutoRouteMemory();
   }
 });
 
-test("explicit direct and proxy modes keep their configured behavior", () => {
+test("edge route state survives isolate memory loss", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+  const edge = new Map();
+  const db = mockDatabase(nodeRow("edge-auto-node", {
+    stream_mode: "auto",
+    direct_external: 1
+  }));
+  const env = { DB: db };
+  const makeRequest = (video) => new Request(
+    `https://proxy.example.test/edge-auto-node/Videos/${video}/stream.mkv`,
+    {
+      headers: {
+        "cf-connecting-ip": "203.0.113.30",
+        "user-agent": "Yamby/EdgeState",
+        range: "bytes=0-3"
+      }
+    }
+  );
+  let upstreamCalls = 0;
+
+  try {
+    globalThis.caches = {
+      default: {
+        async match(request) {
+          return edge.get(request.url)?.clone();
+        },
+        async put(request, response) {
+          edge.set(request.url, response.clone());
+        }
+      }
+    };
+    globalThis.fetch = async () => {
+      upstreamCalls++;
+      return new Response(new Uint8Array([1, 2, 3, 4]), {
+        status: 206,
+        headers: {
+          "content-type": "video/x-matroska",
+          "content-length": "4",
+          "content-range": "bytes 0-3/100"
+        }
+      });
+    };
+
+    const direct = await worker.fetch(makeRequest("10"), env, executionContext());
+    assert.equal(direct.status, 302);
+    assert.equal(upstreamCalls, 0);
+
+    resetAutoRouteMemory();
+    const retry = await worker.fetch(makeRequest("10"), env, executionContext());
+    assert.equal(retry.status, 206);
+    assert.equal(upstreamCalls, 1);
+    await retry.arrayBuffer();
+
+    resetAutoRouteMemory();
+    const nextVideo = await worker.fetch(makeRequest("11"), env, executionContext());
+    assert.equal(nextVideo.status, 206);
+    assert.equal(upstreamCalls, 2);
+    await nextVideo.arrayBuffer();
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalCaches === undefined) {
+      delete globalThis.caches;
+    } else {
+      globalThis.caches = originalCaches;
+    }
+    resetAutoRouteMemory();
+  }
+});
+
+test("explicit direct and proxy modes keep their configured behavior", async () => {
   const request = new Request("https://proxy.example.test/node/Videos/1/stream.mkv");
   assert.equal(
-    directStreamDecision({ name: "node", streamMode: "direct" }, request, "/Videos/1/stream.mkv").redirect,
+    (await directStreamDecision({ name: "node", streamMode: "direct" }, request, "/Videos/1/stream.mkv")).redirect,
     true
   );
   assert.equal(
-    directStreamDecision({ name: "node", streamMode: "proxy", directExternal: true }, request, "/Videos/1/stream.mkv").redirect,
+    (await directStreamDecision({ name: "node", streamMode: "proxy", directExternal: true }, request, "/Videos/1/stream.mkv")).redirect,
     false
   );
 });
 
 test("auto direct markers are not forwarded to upstream servers", () => {
   const headers = new Headers({
-    Cookie: "session=allowed; __ep_direct_abc=1; preference=dark"
+    Cookie: "session=allowed; __ep_direct_abc=1; __ep_proxy_xyz=proxy; preference=dark"
   });
   stripInternalProxyCookies(headers);
   assert.equal(headers.get("cookie"), "session=allowed; preference=dark");
