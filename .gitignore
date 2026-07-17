@@ -5,6 +5,7 @@ worker/node_modules/
 # Wrangler local state
 .wrangler/
 worker/.wrangler/
+worker/wrangler.local.toml
 
 # Generated deployment bundle
 worker/dist/

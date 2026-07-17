@@ -2,7 +2,7 @@
 
 基于 Cloudflare Workers 和 D1 的 Emby 多线路代理。项目包含代理入口、节点管理后台、真实模拟观看、测速与动态 DNS、流量统计和 Telegram 通知。
 
-当前版本：`0.4.7`
+当前版本：`0.4.9`
 
 ## 功能
 
@@ -11,7 +11,7 @@
 - Yamby、Hills Android、Hills Windows 客户端模拟
 - 后台管理节点、测速、排序、导入导出、优选 IP 和 Cloudflare DNS
 - D1 保存节点、访问统计、观看状态和最近 3 天模拟观看记录
-- 使用节点保存的 Emby 账号真实开播，持续约 5-7.5 分钟并按分钟上报进度
+- 节点可选择到期自动观看；仅在开关启用且用户名、密码完整时真实开播，否则只提醒
 - 模拟观看完成或失败后发送 Telegram 通知，支持定时日报和 Bot 菜单
 - 源码本地维护，部署前自动生成混淆后的 Worker 文件
 
@@ -22,10 +22,14 @@ worker/
   src/index.js              # Worker 和管理后台明文源码
   dist/index.js             # 混淆部署产物，不提交 Git
   schema.sql                # D1 完整表结构
-  wrangler.toml             # Worker、D1、域名、Cron 和普通变量
+  wrangler.toml             # 可提交的通用配置模板
+  wrangler.local.toml       # 本机真实配置，Git 忽略
   obfuscator.config.json    # JavaScript 混淆配置
   scripts/check-admin.mjs   # 管理后台静态回归检查
+  scripts/check-security.mjs # 代理、缓存、Webhook 和配置安全检查
+  scripts/check-watch-client.mjs # 模拟观看身份与状态机检查
   scripts/export-admin.mjs  # 生成本地后台预览
+  scripts/run-wrangler.mjs  # 自动选择本机或模板 Wrangler 配置
 ```
 
 ## 部署准备
@@ -44,6 +48,7 @@ worker/
 git clone https://github.com/U188/EmbyProxy.git
 cd EmbyProxy/worker
 npm install
+cp wrangler.toml wrangler.local.toml
 ```
 
 ## 1. 创建 Cloudflare API Token
@@ -92,7 +97,7 @@ cd worker
 npx wrangler d1 create media_gateway
 ```
 
-命令会返回 `database_id`。把数据库名和 ID 写入 `worker/wrangler.toml`：
+命令会返回 `database_id`。把数据库名和 ID 写入 Git 忽略的 `worker/wrangler.local.toml`：
 
 ```toml
 [[d1_databases]]
@@ -104,14 +109,20 @@ database_id = "你的 database_id"
 初始化远程数据库：
 
 ```bash
-npx wrangler d1 execute media_gateway --remote --file=./schema.sql
+npx wrangler d1 execute media_gateway --remote --file=./schema.sql --config wrangler.local.toml
 ```
 
 更新已有部署时也可以重复执行该命令，SQL 使用 `IF NOT EXISTS`，不会删除现有节点和记录。Worker 启动时还会自动补齐缺失的表和列。
 
 ## 3. 配置 Worker、域名和 Cron
 
-编辑 `worker/wrangler.toml`。下面是可用模板：
+复制并编辑本机配置；不要把真实域名和 Cloudflare ID 写回提交版 `wrangler.toml`：
+
+```bash
+cp wrangler.toml wrangler.local.toml
+```
+
+下面是可用模板：
 
 ```toml
 name = "你的-worker-name"
@@ -158,22 +169,22 @@ Account ID 可在 Workers & Pages 概览查看；Zone ID 可在对应域名 Over
 管理后台密码：
 
 ```bash
-npx wrangler secret put ADMIN_TOKEN
+npx wrangler secret put ADMIN_TOKEN --config wrangler.local.toml
 ```
 
 后台需要操作 Cloudflare DNS、流量 API 或网页紧急更新时设置：
 
 ```bash
-npx wrangler secret put CF_API_TOKEN
+npx wrangler secret put CF_API_TOKEN --config wrangler.local.toml
 ```
 
 Telegram 为可选功能：
 
 ```bash
-npx wrangler secret put TG_BOT_TOKEN
-npx wrangler secret put TG_CHAT_ID
-npx wrangler secret put TG_CHAT_ID_2       # 可选，第二个接收者
-npx wrangler secret put TG_WEBHOOK_SECRET  # 推荐
+npx wrangler secret put TG_BOT_TOKEN --config wrangler.local.toml
+npx wrangler secret put TG_CHAT_ID --config wrangler.local.toml
+npx wrangler secret put TG_CHAT_ID_2 --config wrangler.local.toml       # 可选，第二个接收者
+npx wrangler secret put TG_WEBHOOK_SECRET --config wrangler.local.toml  # 使用 Webhook 时必需
 ```
 
 `TG_WEBHOOK_SECRET` 可这样生成：
@@ -219,7 +230,7 @@ npm test
 ```bash
 npm run build:obfuscate
 node --check dist/index.js
-npx wrangler deploy --dry-run
+npx wrangler deploy --dry-run --config wrangler.local.toml
 ```
 
 `dist/index.js` 是生成文件并已被 Git 忽略。不要直接修改它。
@@ -268,7 +279,7 @@ curl https://media.example.com/api/health
 预期返回：
 
 ```json
-{"ok":true,"version":"0.4.7"}
+{"ok":true,"version":"0.4.9"}
 ```
 
 后台地址：
@@ -297,10 +308,13 @@ https://media.example.com/节点名/节点密钥/
 
 每个需要模拟观看的节点必须配置：
 
+- 勾选“到期自动模拟观看”
 - Emby 用户名
-- Emby 密码，或数据库中已有可复用 Access Token
+- Emby 密码
 - 可选：指定条目 ID；为空时自动选择可播放内容
 - 自动任务还需要周期天数和提前提醒天数
+
+未勾选自动观看，或用户名、密码任一为空时，不会尝试登录 Emby，只发送到期提醒。提醒按节点每天最多发送一次。
 
 流程如下：
 
@@ -311,7 +325,7 @@ https://media.example.com/节点名/节点密钥/
 5. 实际达到目标时长后发送 `Stopped` 和 PlayedItems。
 6. 写入最近 3 天观看记录并发送 TG 完成通知。
 
-同一节点已有运行中会话时不会重复启动。失败也会写入失败记录并发送 TG 失败通知。
+同一节点已有运行中会话时不会重复启动。自动观看失败会写入失败记录并发送 TG 失败通知；仅提醒模式不会记录为观看失败。
 
 ## 更新已有部署
 
@@ -320,11 +334,11 @@ git pull
 cd worker
 npm install
 npm test
-npx wrangler d1 execute 你的数据库名 --remote --file=./schema.sql
+npx wrangler d1 execute 你的数据库名 --remote --file=./schema.sql --config wrangler.local.toml
 npm run deploy
 ```
 
-更新代码不会覆盖 `wrangler secret`、D1 数据或已有节点。部署前仍应检查自己的 `wrangler.toml`，避免上游仓库配置覆盖域名、数据库 ID 或 Worker 名称。
+更新代码不会覆盖 `wrangler secret`、D1 数据、已有节点或 Git 忽略的 `wrangler.local.toml`。提交版 `wrangler.toml` 只作为通用模板。
 
 ## 常见问题
 
@@ -348,7 +362,7 @@ export CLOUDFLARE_API_TOKEN="你的部署 Token"
 
 ### 模拟观看不执行
 
-检查节点是否保存了有效 Emby 账号、Cron 是否为每分钟、Worker 能否访问上游，以及 D1 中是否已有该节点的运行中会话。
+检查节点是否勾选“到期自动模拟观看”、是否保存了有效 Emby 用户名和密码、Cron 是否为每分钟、Worker 能否访问上游，以及 D1 中是否已有该节点的运行中会话。未勾选或账号密码不完整时只会发送到期提醒。
 
 ### 没有 Telegram 通知
 
@@ -356,7 +370,8 @@ export CLOUDFLARE_API_TOKEN="你的部署 Token"
 
 ## 安全说明
 
-- 不要提交 `.env`、`.dev.vars`、API Token、管理密码或 Telegram Token。
+- 不要提交 `.env`、`.dev.vars`、`wrangler.local.toml`、API Token、管理密码或 Telegram Token。
+- Telegram Webhook 强制校验 `TG_WEBHOOK_SECRET` 和允许的 `TG_CHAT_ID`。
 - Emby 密码和 Access Token 保存在 D1；应限制 `ADMIN_TOKEN` 的传播范围。
 - 导出的节点 JSON 可能包含敏感配置，应按凭据文件保管。
 - 生产部署建议使用本地 `npm run deploy`，网页代码覆盖仅用于紧急处理。

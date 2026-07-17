@@ -32,6 +32,20 @@ for (const id of ["nodeGrid", "watchLogRows", "traceEntry", "traceEgress", "dial
 assert.match(html, /id="nodeEditorPanel" hidden/, "node editor must start hidden");
 assert.match(html, /id="deployBody" hidden/, "deploy editor must start hidden");
 assert.doesNotMatch(html, /id="nodeGrid"[^>]*\shidden(?:\s|>)/, "node cards must not be hidden");
+assert.doesNotMatch(html, /边缘延迟见侧栏|<p>管理\s/, "header must not expose configured domains");
+assert.match(
+  html,
+  /@media\(max-width:980px\)\{[\s\S]*?\.hero-bar>div:first-child\{display:none\}/,
+  "mobile header content must stay collapsed"
+);
+assert.match(html, /\.hero-bar\{[\s\S]*?z-index:1000;[\s\S]*?overflow:visible/, "more menu parent must stay above page panels");
+assert.match(html, /\.icon-menu\[open\]\{z-index:1100\}/, "open more menu must create a top layer");
+assert.match(html, /class="network-workspace"/, "network results and DNS must use the dedicated workspace layout");
+assert.match(html, /class="panel network-results"/, "speed test results must have a dedicated panel");
+assert.match(html, /class="panel network-dns"/, "DNS controls must have a dedicated panel");
+assert.match(html, /<details class="dns-details">[\s\S]*?id="dnsOut"/, "raw DNS response must be collapsed by default");
+assert.match(html, /<tr class="ip-empty-row">/, "speed test empty state must have a dedicated mobile layout");
+assert.match(scripts[0], /querySelector\("\.ip-empty-row"\)\?\.remove\(\)/, "speed test data must replace the empty state");
 
 const functions = [...scripts[0].matchAll(/^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm)]
   .map((match) => match[1]);

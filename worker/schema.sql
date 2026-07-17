@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   icon TEXT DEFAULT '',
   sort_order INTEGER DEFAULT 0,
   enabled INTEGER DEFAULT 1,
+  auto_watch INTEGER DEFAULT 0,
   renew_days INTEGER DEFAULT 0,
   remind_before_days INTEGER DEFAULT 0,
   keepalive_at TEXT DEFAULT '',
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   emby_password TEXT DEFAULT '',
   emby_user_id TEXT DEFAULT '',
   emby_access_token TEXT DEFAULT '',
+  emby_auth_profile TEXT DEFAULT '',
   emby_play_id TEXT DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -117,7 +119,19 @@ CREATE TABLE IF NOT EXISTS sim_watch_sessions (
   tick_count INTEGER DEFAULT 0,
   status TEXT DEFAULT 'running',
   error TEXT DEFAULT '',
+  notify_attempts INTEGER DEFAULT 0,
   remain_days INTEGER DEFAULT 0,
   renew_days INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sim_watch_sessions_status_next ON sim_watch_sessions(status, next_tick_at);
+UPDATE sim_watch_sessions
+SET status = 'failed', error = 'duplicate active session removed during migration'
+WHERE status IN ('starting', 'running')
+  AND id NOT IN (
+    SELECT MAX(id) FROM sim_watch_sessions
+    WHERE status IN ('starting', 'running')
+    GROUP BY node
+  );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sim_watch_sessions_one_active_node
+ON sim_watch_sessions(node)
+WHERE status IN ('starting', 'running');

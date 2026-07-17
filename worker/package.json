@@ -6,11 +6,13 @@
   "scripts": {
     "build:obfuscate": "mkdir -p dist && javascript-obfuscator src/index.js --output dist/index.js --config obfuscator.config.json",
     "preview:admin": "node scripts/export-admin.mjs",
-    "test": "node --check src/index.js && node scripts/check-admin.mjs",
+    "test": "node --check src/index.js && node scripts/check-admin.mjs && node scripts/check-watch-client.mjs && node scripts/check-security.mjs",
     "test:admin": "node scripts/check-admin.mjs",
+    "test:watch-client": "node scripts/check-watch-client.mjs",
+    "test:security": "node scripts/check-security.mjs",
     "dev": "wrangler dev",
-    "deploy": "npm run build:obfuscate && wrangler deploy",
-    "d1:init": "wrangler d1 execute media_c8af70 --remote --file=./schema.sql"
+    "deploy": "npm run build:obfuscate && node scripts/run-wrangler.mjs deploy",
+    "d1:init": "node scripts/run-wrangler.mjs d1 execute DB --remote --file=./schema.sql"
   },
   "devDependencies": {
     "javascript-obfuscator": "^5.4.3",

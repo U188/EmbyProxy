@@ -1,4 +1,4 @@
-const BUILD_VERSION = "0.4.7";
+const BUILD_VERSION = "0.4.9";
 const DEFAULT_MAX_REWRITE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_RETRY_BODY_BYTES = 16 * 1024 * 1024;
 const DEFAULT_CLIENT_PROFILE = "yamby";
@@ -8,6 +8,7 @@ const LEGACY_DEFAULT_DEVICE_NAME = "OnePlus-PKG110";
 const SIMULATED_WATCH_DURATION_MIN_SEC = 300;
 // The minute cron can add almost 60 seconds before the stop event is sent.
 const SIMULATED_WATCH_DURATION_MAX_SEC = 390;
+const AUTO_WATCH_FAILURE_BACKOFF_MS = 6 * 60 * 60 * 1000;
 const CLIENT_PROFILES = [
   { id: "yamby", label: "Yamby Android", ua: "Yamby/2.0.4.6(Android", client: "Yamby", version: "2.0.4.6", device: "Android", authStyle: "yamby", idFormat: "uuid" },
   { id: "hills_android", label: "Hills Android", ua: "Hills/1.7.2 (android; 15)", client: "Hills", version: "1.7.2", device: "diting", authStyle: "hills", idLength: 16 },
@@ -104,6 +105,7 @@ async function initializeSchema(env) {
       icon TEXT DEFAULT '',
       sort_order INTEGER DEFAULT 0,
       enabled INTEGER DEFAULT 1,
+      auto_watch INTEGER DEFAULT 0,
       renew_days INTEGER DEFAULT 0,
       remind_before_days INTEGER DEFAULT 0,
       keepalive_at TEXT DEFAULT '',
@@ -111,6 +113,7 @@ async function initializeSchema(env) {
       emby_password TEXT DEFAULT '',
       emby_user_id TEXT DEFAULT '',
       emby_access_token TEXT DEFAULT '',
+      emby_auth_profile TEXT DEFAULT '',
       emby_play_id TEXT DEFAULT '',
       created_at INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL DEFAULT 0
@@ -183,6 +186,7 @@ async function initializeSchema(env) {
       tick_count INTEGER DEFAULT 0,
       status TEXT DEFAULT 'running',
       error TEXT DEFAULT '',
+      notify_attempts INTEGER DEFAULT 0,
       remain_days INTEGER DEFAULT 0,
       renew_days INTEGER DEFAULT 0
     )`,
@@ -225,6 +229,7 @@ async function initializeSchema(env) {
     icon: "TEXT DEFAULT ''",
     sort_order: "INTEGER DEFAULT 0",
     enabled: "INTEGER DEFAULT 1",
+    auto_watch: "INTEGER DEFAULT 0",
     renew_days: "INTEGER DEFAULT 0",
     remind_before_days: "INTEGER DEFAULT 0",
     keepalive_at: "TEXT DEFAULT ''",
@@ -232,6 +237,7 @@ async function initializeSchema(env) {
     emby_password: "TEXT DEFAULT ''",
     emby_user_id: "TEXT DEFAULT ''",
     emby_access_token: "TEXT DEFAULT ''",
+    emby_auth_profile: "TEXT DEFAULT ''",
     emby_play_id: "TEXT DEFAULT ''",
     created_at: "INTEGER NOT NULL DEFAULT 0",
     updated_at: "INTEGER NOT NULL DEFAULT 0"
@@ -422,9 +428,10 @@ async function handleProxy(request, env, ctx) {
       }
 
       const outbound = await buildOutboundRequest(request, targetURL, node, bodyBuffer, env);
-      const cacheableImage = node.cacheImage && request.method === "GET" && isImageRequest(route.path);
+      const cacheableImage = node.cacheImage && request.method === "GET" && isImageRequest(route.path) && !hasSensitiveRequestAuth(request);
+      const imageCacheKey = cacheableImage ? new Request(inboundURL.toString(), { method: "GET" }) : null;
       if (cacheableImage) {
-        const cached = await caches.default.match(outbound);
+        const cached = await caches.default.match(imageCacheKey);
         if (cached) {
           ctx.waitUntil(recordRequest(env, request, node.name, route.path, cached.status, contentLength(cached), "image"));
           return cached;
@@ -451,7 +458,7 @@ async function handleProxy(request, env, ctx) {
 
       const response = await finishProxyResponse(upstream, request, node, targetURL, inboundURL, env);
       if (cacheableImage && response.ok) {
-        ctx.waitUntil(caches.default.put(outbound, response.clone()));
+        ctx.waitUntil(caches.default.put(imageCacheKey, response.clone()));
       }
       return recordProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request));
     } catch (err) {
@@ -520,10 +527,11 @@ async function handleRawProxy(request, env, ctx, node, routePath, bodyBuffer, in
   if (!/^https?:\/\//i.test(raw)) {
     return text("Bad raw URL", 400);
   }
-  const targetURL = new URL(raw);
-  if (request.url.includes("?") && !targetURL.search) {
-    targetURL.search = new URL(request.url).search;
+  const signature = inboundURL.searchParams.get("__ep_sig") || "";
+  if (!await verifyRawProxySignature(env, node, raw, signature)) {
+    return text("Invalid raw URL signature", 403);
   }
+  const targetURL = new URL(raw);
   const upstream = await fetchRawWithRetries(request, targetURL, node, bodyBuffer, env);
   const streamRedirect = await followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env);
   const finalUpstream = streamRedirect?.upstream || upstream;
@@ -542,7 +550,7 @@ async function fetchRawWithRetries(request, targetURL, node, bodyBuffer, env) {
         // Ignore body cleanup errors on retry.
       }
     }
-    const outbound = await buildOutboundRequest(request, targetURL, node, bodyBuffer, env, { directMode });
+    const outbound = await buildOutboundRequest(request, targetURL, node, bodyBuffer, env, { directMode, rawExternal: true });
     last = await fetch(outbound);
     if (last.status !== 403 || !bodyCanRetry(bodyBuffer)) {
       return last;
@@ -608,6 +616,12 @@ async function buildOutboundRequest(request, targetURL, node, bodyBuffer, env, o
 async function buildHeaders(request, targetURL, node, env, options = {}) {
   const headers = new Headers(request.headers);
   stripHopByHop(headers);
+  if (options.rawExternal && !isConfiguredNodeOrigin(node, targetURL)) {
+    deleteHeaders(headers, [
+      "Authorization", "Cookie", "X-Emby-Token", "X-MediaBrowser-Token",
+      "X-Emby-Authorization", "X-MediaBrowser-Authorization", "X-Authorization"
+    ]);
+  }
   const streaming = isPlaybackStreamRequest(request, targetURL);
   if (!streaming) {
     deleteHeaders(headers, ["Origin", "Referer", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Sec-Fetch-User"]);
@@ -645,6 +659,59 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
     applyDirectAdapterHeaders(headers, targetURL, options.directMode);
   }
   return headers;
+}
+
+function hasSensitiveRequestAuth(request) {
+  const url = new URL(request.url);
+  const sensitiveQueryKeys = new Set(["api_key", "apikey", "token", "access_token", "x-emby-token"]);
+  return Boolean(
+    request.headers.get("authorization") ||
+    request.headers.get("cookie") ||
+    request.headers.get("x-emby-token") ||
+    [...url.searchParams.keys()].some((key) => sensitiveQueryKeys.has(key.toLowerCase()))
+  );
+}
+
+function isConfiguredNodeOrigin(node, targetURL) {
+  return [...splitTargets(node.targets), ...splitTargets(node.streamTarget)].some((target) => {
+    try {
+      return new URL(target).origin === targetURL.origin;
+    } catch {
+      return false;
+    }
+  });
+}
+
+async function rawProxySignature(env, node, raw) {
+  const secret = cleanString(env.ADMIN_TOKEN || "");
+  if (!secret || !globalThis.crypto?.subtle) return "";
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const payload = `${normalizeName(node.name)}\n${String(raw)}`;
+  const signed = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(payload)));
+  let binary = "";
+  for (const byte of signed) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function verifyRawProxySignature(env, node, raw, received) {
+  const expected = await rawProxySignature(env, node, raw);
+  if (!expected || expected.length !== received.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < expected.length; i++) mismatch |= expected.charCodeAt(i) ^ received.charCodeAt(i);
+  return mismatch === 0;
+}
+
+async function signedRawProxyURL(publicBase, raw, env, node) {
+  const signature = await rawProxySignature(env, node, raw);
+  if (!signature) return "";
+  return publicBase + "/__raw__/" + encodeURIComponent(raw) + "?__ep_sig=" + encodeURIComponent(signature);
 }
 
 function applyClientProfile(headers, profile, overwrite, identityState, options = {}) {
@@ -1327,7 +1394,7 @@ function deleteHeaders(headers, keys) {
 async function finishProxyResponse(upstream, request, node, targetURL, inboundURL, env) {
   const headers = new Headers(upstream.headers);
   stripResponseHeaders(headers);
-  rewriteLocation(headers, targetURL, inboundURL, node);
+  await rewriteLocation(headers, targetURL, inboundURL, node, env);
   rewriteSetCookie(headers, node);
   applyResponsePolicy(headers, upstream, request, targetURL);
 
@@ -1391,7 +1458,7 @@ async function rewriteMediaSourceJSON(body, targetURL, inboundURL, node, env) {
       if (typeof source[key] !== "string") {
         continue;
       }
-      const rewritten = rewriteMediaSourceURL(source[key], inboundURL, node, currentHosts, hostMap);
+      const rewritten = await rewriteMediaSourceURL(source[key], inboundURL, node, currentHosts, hostMap, env);
       if (rewritten && rewritten !== source[key]) {
         source[key] = rewritten;
         changed = true;
@@ -1401,7 +1468,7 @@ async function rewriteMediaSourceJSON(body, targetURL, inboundURL, node, env) {
   return changed ? JSON.stringify(payload) : "";
 }
 
-function rewriteMediaSourceURL(raw, inboundURL, node, currentHosts, hostMap) {
+async function rewriteMediaSourceURL(raw, inboundURL, node, currentHosts, hostMap, env) {
   const value = String(raw || "").trim();
   if (!value || node.directExternal) {
     return "";
@@ -1430,7 +1497,7 @@ function rewriteMediaSourceURL(raw, inboundURL, node, currentHosts, hostMap) {
   if (hostMap.has(host)) {
     return new URL(publicRouteBase(inboundURL.origin, hostMap.get(host))).pathname + url.pathname + url.search + url.hash;
   }
-  return publicBasePath + "/__raw__/" + encodeURIComponent(url.toString());
+  return signedRawProxyURL(publicBasePath, url.toString(), env, node);
 }
 
 async function rewriteBodyLinks(body, targetURL, inboundURL, node, env) {
@@ -1456,7 +1523,8 @@ async function rewriteBodyLinks(body, targetURL, inboundURL, node, env) {
       const matched = hostMap.get(host);
       replacements.set(full, publicRouteBase(inboundURL.origin, matched) + url.pathname + url.search + url.hash);
     } else if (!node.directExternal) {
-      replacements.set(full, publicBase + "/__raw__/" + encodeURIComponent(full));
+      const signed = await signedRawProxyURL(publicBase, full, env, node);
+      if (signed) replacements.set(full, signed);
     }
   }
   let out = body;
@@ -1569,7 +1637,7 @@ function rewriteSystemInfo(body, publicBase) {
   }
 }
 
-function rewriteLocation(headers, targetURL, inboundURL, node) {
+async function rewriteLocation(headers, targetURL, inboundURL, node, env) {
   const location = headers.get("location");
   if (!location) {
     return;
@@ -1581,7 +1649,8 @@ function rewriteLocation(headers, targetURL, inboundURL, node) {
       headers.set("location", publicBase + abs.pathname + abs.search + abs.hash);
     } else if (!node.directExternal) {
       const publicBase = publicNodeBase(inboundURL, node);
-      headers.set("location", publicBase + "/__raw__/" + encodeURIComponent(abs.toString()));
+      const signed = await signedRawProxyURL(publicBase, abs.toString(), env, node);
+      if (signed) headers.set("location", signed);
     }
   } catch {
     // Ignore invalid upstream Location.
@@ -1616,8 +1685,11 @@ function applyResponsePolicy(headers, upstream, request, targetURL) {
   }
   if (isImageRequest(targetURL.pathname)) {
     headers.delete("Set-Cookie");
-    headers.delete("Vary");
-    headers.set("Cache-Control", "public, max-age=2592000, s-maxage=2592000, immutable");
+    if (hasSensitiveRequestAuth(request)) {
+      headers.set("Cache-Control", "private, no-store");
+    } else {
+      headers.set("Cache-Control", "public, max-age=2592000, s-maxage=2592000, immutable");
+    }
   }
 }
 
@@ -1785,14 +1857,29 @@ async function saveNode(env, input) {
   }
   const current = await getNode(env, oldName || nextName);
   const node = normalizeNode({ ...input, name: nextName }, current, now);
+  if (current) {
+    const credentialScopeChanged = current.clientProfile !== node.clientProfile ||
+      current.embyUser !== node.embyUser ||
+      current.name !== node.name ||
+      nodeCredentialScope(current) !== nodeCredentialScope(node);
+    const suppliedToken = cleanString(input.embyAccessToken ?? input.emby_access_token ?? "");
+    const suppliedUserId = cleanString(input.embyUserId ?? input.emby_user_id ?? "");
+    const suppliedProfile = cleanString(input.embyAuthProfile ?? input.emby_auth_profile ?? "");
+    const hasMatchingImportedCredential = suppliedToken && suppliedUserId && suppliedProfile === node.clientProfile;
+    if (credentialScopeChanged && !hasMatchingImportedCredential) {
+      node.embyUserId = "";
+      node.embyAccessToken = "";
+      node.embyAuthProfile = "";
+    }
+  }
   await env.DB.prepare(`
     INSERT INTO nodes (
       name, display_name, targets, stream_target, secret, client_profile, impersonate,
       header_mode, stream_mode, direct_external, cache_image, tag, remark,
-      icon, sort_order, enabled, renew_days, remind_before_days, keepalive_at,
-      emby_user, emby_password, emby_user_id, emby_access_token, emby_play_id,
+      icon, sort_order, enabled, auto_watch, renew_days, remind_before_days, keepalive_at,
+      emby_user, emby_password, emby_user_id, emby_access_token, emby_auth_profile, emby_play_id,
       created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(name) DO UPDATE SET
       display_name = excluded.display_name,
       targets = excluded.targets,
@@ -1809,6 +1896,7 @@ async function saveNode(env, input) {
       icon = excluded.icon,
       sort_order = excluded.sort_order,
       enabled = excluded.enabled,
+      auto_watch = excluded.auto_watch,
       renew_days = excluded.renew_days,
       remind_before_days = excluded.remind_before_days,
       keepalive_at = excluded.keepalive_at,
@@ -1816,6 +1904,7 @@ async function saveNode(env, input) {
       emby_password = excluded.emby_password,
       emby_user_id = excluded.emby_user_id,
       emby_access_token = excluded.emby_access_token,
+      emby_auth_profile = excluded.emby_auth_profile,
       emby_play_id = excluded.emby_play_id,
       updated_at = excluded.updated_at
   `).bind(
@@ -1835,6 +1924,7 @@ async function saveNode(env, input) {
     node.icon,
     node.sortOrder,
     node.enabled ? 1 : 0,
+    node.autoWatch ? 1 : 0,
     node.renewDays,
     node.remindBeforeDays,
     node.keepaliveAt,
@@ -1842,6 +1932,7 @@ async function saveNode(env, input) {
     node.embyPassword,
     node.embyUserId,
     node.embyAccessToken,
+    node.embyAuthProfile,
     node.embyPlayId,
     current?.createdAt || now,
     now
@@ -1850,12 +1941,29 @@ async function saveNode(env, input) {
     await env.DB.batch([
       env.DB.prepare(`DELETE FROM nodes WHERE name = ?`).bind(oldName),
       env.DB.prepare(`DELETE FROM keepalive_state WHERE node = ?`).bind(node.name),
-      env.DB.prepare(`UPDATE keepalive_state SET node = ? WHERE node = ?`).bind(node.name, oldName)
+      env.DB.prepare(`UPDATE keepalive_state SET node = ? WHERE node = ?`).bind(node.name, oldName),
+      env.DB.prepare(`
+        UPDATE sim_watch_sessions SET node = ?, display_name = ?
+        WHERE node = ? AND status IN ('starting', 'running', 'notify_pending')
+      `).bind(node.name, node.displayName || node.name, oldName)
     ]);
   }
   await ensureKeepaliveState(env, node);
   invalidateNodeHostMapCache();
   return node;
+}
+
+function nodeCredentialScope(node) {
+  const target = cleanString((node?.targets || [])[0] || node?.streamTarget || "");
+  if (!target) return "";
+  try {
+    const url = new URL(target.includes("://") ? target : `https://${target}`);
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/, "");
+  } catch {
+    return target.replace(/\/+$/, "");
+  }
 }
 
 async function deleteNode(env, name) {
@@ -1895,6 +2003,7 @@ function rowToNode(row) {
     icon: row.icon || "",
     sortOrder: Number(row.sort_order || 0),
     enabled: row.enabled !== 0,
+    autoWatch: Boolean(row.auto_watch),
     renewDays: Number(row.renew_days || 0),
     remindBeforeDays: Number(row.remind_before_days || 0),
     keepaliveAt: row.keepalive_at || "",
@@ -1902,6 +2011,7 @@ function rowToNode(row) {
     embyPassword: row.emby_password || "",
     embyUserId: row.emby_user_id || "",
     embyAccessToken: row.emby_access_token || "",
+    embyAuthProfile: row.emby_auth_profile ? normalizeClientProfile(row.emby_auth_profile) : "",
     embyPlayId: row.emby_play_id || "",
     createdAt: Number(row.created_at || 0),
     updatedAt: Number(row.updated_at || 0)
@@ -1934,6 +2044,7 @@ function normalizeNode(input, current, now) {
     icon: cleanString(input.icon ?? current?.icon ?? "") || DEFAULT_NODE_ICON,
     sortOrder: intValue(input.sortOrder ?? input.sort_order ?? current?.sortOrder ?? 0),
     enabled: boolValue(input.enabled ?? current?.enabled ?? true),
+    autoWatch: boolValue(input.autoWatch ?? input.auto_watch ?? current?.autoWatch ?? false),
     renewDays: intValue(input.renewDays ?? input.renew_days ?? current?.renewDays ?? 0),
     remindBeforeDays: intValue(input.remindBeforeDays ?? input.remind_before_days ?? current?.remindBeforeDays ?? 0),
     keepaliveAt: cleanString(input.keepaliveAt ?? input.keepalive_at ?? current?.keepaliveAt ?? ""),
@@ -1941,6 +2052,7 @@ function normalizeNode(input, current, now) {
     embyPassword: cleanString(input.embyPassword ?? input.emby_password ?? current?.embyPassword ?? ""),
     embyUserId: cleanString(input.embyUserId ?? input.emby_user_id ?? current?.embyUserId ?? ""),
     embyAccessToken: cleanString(input.embyAccessToken ?? input.emby_access_token ?? current?.embyAccessToken ?? ""),
+    embyAuthProfile: cleanString(input.embyAuthProfile ?? input.emby_auth_profile ?? current?.embyAuthProfile ?? ""),
     embyPlayId: cleanString(input.embyPlayId ?? input.emby_play_id ?? current?.embyPlayId ?? ""),
     createdAt: current?.createdAt || now,
     updatedAt: now
@@ -2093,7 +2205,8 @@ async function keepaliveStatusMap(env, nodes) {
       remainDays,
       status,
       lastNotifyDay: current.last_notify_day || "",
-      notifyCount: Number(current.notify_count || 0)
+      notifyCount: Number(current.notify_count || 0),
+      enabled: node.enabled !== false
     });
   }
   return map;
@@ -2205,7 +2318,9 @@ function nodeUpstreamBase(node) {
     throw new Error("节点未配置上游地址");
   }
   const url = new URL(target.includes("://") ? target : `https://${target}`);
-  return url.origin;
+  url.search = "";
+  url.hash = "";
+  return url.toString().replace(/\/+$/, "");
 }
 
 function buildEmbyAuthHeader(profile, device, deviceId, token = "", userId = "") {
@@ -2309,7 +2424,7 @@ async function embyLogin(node) {
     "x-emby-authorization": buildEmbyAuthHeader(profile, device, deviceId)
   };
 
-  if (node.embyAccessToken && node.embyUserId) {
+  if (node.embyAccessToken && node.embyUserId && node.embyAuthProfile === profile.id) {
     return {
       base,
       token: node.embyAccessToken,
@@ -2357,9 +2472,9 @@ async function persistEmbyCredentials(env, nodeName, auth) {
   }
   await env.DB.prepare(`
     UPDATE nodes
-    SET emby_user_id = ?, emby_access_token = ?, updated_at = ?
+    SET emby_user_id = ?, emby_access_token = ?, emby_auth_profile = ?, updated_at = ?
     WHERE name = ?
-  `).bind(auth.userId, auth.token, Date.now(), normalizeName(nodeName)).run();
+  `).bind(auth.userId, auth.token, auth.profile?.id || "", Date.now(), normalizeName(nodeName)).run();
 }
 
 
@@ -2487,18 +2602,23 @@ async function embyPullStreamSample(auth, session, itemId) {
   // 轻量拉一点流，证明真有播放行为；失败不阻断会话上报
   try {
     const url = session.directStreamUrl
-      ? (session.directStreamUrl.startsWith("http") ? session.directStreamUrl : (auth.base.replace(/\/+$/, "") + session.directStreamUrl))
+      ? new URL(session.directStreamUrl, auth.base.replace(/\/+$/, "") + "/").toString()
       : `${auth.base.replace(/\/+$/, "")}/Videos/${encodeURIComponent(itemId)}/stream?Static=true&MediaSourceId=${encodeURIComponent(session.mediaSourceId)}&PlaySessionId=${encodeURIComponent(session.playSessionId)}`;
+    const streamURL = new URL(url);
+    const authOrigin = new URL(auth.base).origin;
+    const requestHeaders = {
+      range: "bytes=0-65535",
+      "user-agent": auth.profile?.ua || "Emby/4.8.0"
+    };
+    if (streamURL.origin === authOrigin) {
+      Object.assign(requestHeaders, embyAuthHeaders(auth));
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort("stream-timeout"), 12000);
     try {
       const res = await fetch(url, {
         method: "GET",
-        headers: {
-          ...embyAuthHeaders(auth),
-          range: "bytes=0-65535",
-          "user-agent": "VLC/3.0.18 LibVLC/3.0.18"
-        },
+        headers: requestHeaders,
         signal: controller.signal,
         cf: { cacheTtl: 0, cacheEverything: false }
       });
@@ -2563,6 +2683,7 @@ async function ensureWatchSessionsTable(env) {
       tick_count INTEGER DEFAULT 0,
       status TEXT DEFAULT 'running',
       error TEXT DEFAULT '',
+      notify_attempts INTEGER DEFAULT 0,
       remain_days INTEGER DEFAULT 0,
       renew_days INTEGER DEFAULT 0
     )
@@ -2588,9 +2709,25 @@ async function ensureWatchSessionsTable(env) {
     tick_count: "INTEGER DEFAULT 0",
     status: "TEXT DEFAULT 'running'",
     error: "TEXT DEFAULT ''",
+    notify_attempts: "INTEGER DEFAULT 0",
     remain_days: "INTEGER DEFAULT 0",
     renew_days: "INTEGER DEFAULT 0"
   });
+  await env.DB.prepare(`
+    UPDATE sim_watch_sessions
+    SET status = 'failed', error = 'duplicate active session removed during migration'
+    WHERE status IN ('starting', 'running')
+      AND id NOT IN (
+        SELECT MAX(id) FROM sim_watch_sessions
+        WHERE status IN ('starting', 'running')
+        GROUP BY node
+      )
+  `).run();
+  await env.DB.prepare(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_sim_watch_sessions_one_active_node
+    ON sim_watch_sessions(node)
+    WHERE status IN ('starting', 'running')
+  `).run();
 }
 
 async function cleanOldWatchSessions(env) {
@@ -2615,7 +2752,7 @@ function authFromSession(row) {
 async function hasRunningWatchSession(env, nodeName) {
   await ensureWatchSessionsTable(env);
   const row = await env.DB.prepare(
-    `SELECT id FROM sim_watch_sessions WHERE node = ? AND status = 'running' LIMIT 1`
+    `SELECT id FROM sim_watch_sessions WHERE node = ? AND status IN ('starting', 'running') LIMIT 1`
   ).bind(normalizeName(nodeName)).first();
   return Boolean(row?.id);
 }
@@ -2625,69 +2762,100 @@ async function startWatchSession(env, { node, source = "manual", note = "", rema
   if (!node.embyUser || !(node.embyPassword || node.embyAccessToken)) {
     throw new Error("节点未配置 Emby 账号密码，无法真实模拟观看");
   }
-  if (await hasRunningWatchSession(env, node.name)) {
-    throw new Error("该节点已有进行中的模拟观看，请等待完成后再试");
-  }
   const targetDurationSec = randomSimulatedWatchDurationSec();
-
-  let auth = await embyLogin(node);
-  try {
-    if (auth.reused) {
-      await embyFetchJSON(auth.base, `/Users/${auth.userId}`, { headers: embyAuthHeaders(auth), timeoutMs: 12000 });
-    }
-  } catch {
-    node.embyAccessToken = "";
-    node.embyUserId = "";
-    auth = await embyLogin(node);
-  }
-  await persistEmbyCredentials(env, node.name, auth);
-  const item = await embyPickPlayItem(auth, node);
-  const sessionMeta = await embyPlaybackInfo(auth, item.Id);
-  const streamInfo = await embyPullStreamSample(auth, sessionMeta, item.Id);
-  await sleepMs(200 + Math.floor(Math.random() * 300));
-  const startedAt = Date.now();
-  await embyPostSession(auth, "/Sessions/Playing", buildPlayingPayload(auth, item, sessionMeta, 0));
-
-  const title = itemDisplayTitle(item);
   await ensureWatchSessionsTable(env);
-  const nextTickAt = startedAt + 60 * 1000;
-  const result = await env.DB.prepare(`
-    INSERT INTO sim_watch_sessions (
-      node, display_name, source, note, title, item_id, media_source_id, play_session_id,
-      base_url, access_token, user_id, device_id, device_name, client_profile,
-      target_duration_sec, started_at, last_tick_at, next_tick_at, tick_count, status, error, remain_days, renew_days
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'running', '', ?, ?)
-  `).bind(
-    node.name,
-    node.displayName || node.name,
-    source,
-    note || "",
-    title,
-    item.Id || "",
-    sessionMeta.mediaSourceId || "",
-    sessionMeta.playSessionId || "",
-    auth.base || "",
-    auth.token || "",
-    auth.userId || "",
-    auth.deviceId || "",
-    auth.device || "",
-    auth.profile?.id || node.clientProfile || "",
-    targetDurationSec,
-    startedAt,
-    startedAt,
-    nextTickAt,
-    Number.isFinite(Number(remainDays)) ? Number(remainDays) : 0,
-    Number.isFinite(Number(renewDays)) ? Number(renewDays) : Number(node.renewDays || 0)
-  ).run();
+  const reservedAt = Date.now();
+  let reservation;
+  try {
+    reservation = await env.DB.prepare(`
+      INSERT INTO sim_watch_sessions (
+        node, display_name, source, note, target_duration_sec, started_at,
+        last_tick_at, next_tick_at, status, error, remain_days, renew_days
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'starting', '', ?, ?)
+    `).bind(
+      node.name,
+      node.displayName || node.name,
+      source,
+      note || "",
+      targetDurationSec,
+      reservedAt,
+      reservedAt,
+      reservedAt + 10 * 60 * 1000,
+      Number.isFinite(Number(remainDays)) ? Number(remainDays) : 0,
+      Number.isFinite(Number(renewDays)) ? Number(renewDays) : Number(node.renewDays || 0)
+    ).run();
+  } catch (err) {
+    if (/unique|constraint/i.test(errMessage(err))) {
+      throw new Error("该节点已有进行中的模拟观看，请等待完成后再试");
+    }
+    throw err;
+  }
 
-  return {
-    sessionId: Number(result?.meta?.last_row_id || 0),
-    title,
-    itemId: item.Id,
-    targetDurationSec,
-    startedAt,
-    stream: streamInfo
-  };
+  const sessionId = Number(reservation?.meta?.last_row_id || 0);
+  let auth = null;
+  let item = null;
+  let sessionMeta = null;
+  let playingStarted = false;
+  try {
+    auth = await embyLogin(node);
+    if (auth.reused) {
+      try {
+        await embyFetchJSON(auth.base, `/Users/${auth.userId}`, { headers: embyAuthHeaders(auth), timeoutMs: 12000 });
+      } catch {
+        node.embyAccessToken = "";
+        node.embyUserId = "";
+        node.embyAuthProfile = "";
+        auth = await embyLogin(node);
+      }
+    }
+    await persistEmbyCredentials(env, node.name, auth);
+    item = await embyPickPlayItem(auth, node);
+    sessionMeta = await embyPlaybackInfo(auth, item.Id);
+    const streamInfo = await embyPullStreamSample(auth, sessionMeta, item.Id);
+    await sleepMs(200 + Math.floor(Math.random() * 300));
+    const startedAt = Date.now();
+    await embyPostSession(auth, "/Sessions/Playing", buildPlayingPayload(auth, item, sessionMeta, 0));
+    playingStarted = true;
+
+    const title = itemDisplayTitle(item);
+    const nextTickAt = startedAt + 60 * 1000;
+    const activated = await env.DB.prepare(`
+      UPDATE sim_watch_sessions SET
+        title = ?, item_id = ?, media_source_id = ?, play_session_id = ?,
+        base_url = ?, access_token = ?, user_id = ?, device_id = ?, device_name = ?, client_profile = ?,
+        started_at = ?, last_tick_at = ?, next_tick_at = ?, tick_count = 0, status = 'running', error = ''
+      WHERE id = ? AND status = 'starting'
+    `).bind(
+      title,
+      item.Id || "",
+      sessionMeta.mediaSourceId || "",
+      sessionMeta.playSessionId || "",
+      auth.base || "",
+      auth.token || "",
+      auth.userId || "",
+      auth.deviceId || "",
+      auth.device || "",
+      auth.profile?.id || node.clientProfile || "",
+      startedAt,
+      startedAt,
+      nextTickAt,
+      sessionId
+    ).run();
+    if (Number(activated?.meta?.changes || 0) !== 1) {
+      throw new Error("模拟观看会话占位已失效");
+    }
+
+    return { sessionId, title, itemId: item.Id, targetDurationSec, startedAt, stream: streamInfo };
+  } catch (err) {
+    if (playingStarted && auth && item && sessionMeta) {
+      try {
+        await embyPostSession(auth, "/Sessions/Playing/Stopped", buildPlayingPayload(auth, item, sessionMeta, 0, { stop: true }));
+      } catch {}
+    }
+    await env.DB.prepare(`UPDATE sim_watch_sessions SET status = 'failed', error = ?, last_tick_at = ? WHERE id = ?`)
+      .bind(errMessage(err).slice(0, 500), Date.now(), sessionId).run();
+    throw err;
+  }
 }
 
 async function processWatchSessions(env) {
@@ -2696,7 +2864,7 @@ async function processWatchSessions(env) {
   const now = Date.now();
   const rows = await env.DB.prepare(`
     SELECT * FROM sim_watch_sessions
-    WHERE status = 'running' AND next_tick_at <= ?
+    WHERE status IN ('running', 'notify_pending') AND next_tick_at <= ?
     ORDER BY next_tick_at ASC
     LIMIT 5
   `).bind(now).all();
@@ -2704,6 +2872,10 @@ async function processWatchSessions(env) {
   if (!list.length) return { ok: true, count: 0 };
   const results = [];
   for (const row of list) {
+    if (row.status === "notify_pending") {
+      results.push(await retryWatchCompletionNotification(env, row, now));
+      continue;
+    }
     try {
       results.push(await tickWatchSession(env, row, now));
     } catch (err) {
@@ -2771,9 +2943,7 @@ async function tickWatchSession(env, row, now = Date.now()) {
         EventName: "timeupdate"
       });
     } catch {}
-    try {
-      await embyPostSession(auth, "/Sessions/Playing/Stopped", buildPlayingPayload(auth, item, sessionMeta, stopPos, { stop: true }));
-    } catch {}
+    await embyPostSession(auth, "/Sessions/Playing/Stopped", buildPlayingPayload(auth, item, sessionMeta, stopPos, { stop: true }));
     try {
       await embyFetchJSON(auth.base, `/Users/${auth.userId}/PlayedItems/${encodeURIComponent(item.Id)}`, {
         method: "POST",
@@ -2798,33 +2968,18 @@ async function tickWatchSession(env, row, now = Date.now()) {
     });
     await env.DB.prepare(`
       UPDATE sim_watch_sessions
-      SET status = 'done', last_tick_at = ?, next_tick_at = ?, tick_count = tick_count + 1, error = ''
+      SET status = 'notify_pending', last_tick_at = ?, next_tick_at = ?, tick_count = tick_count + 1,
+          notify_attempts = 0, error = ''
       WHERE id = ?
     `).bind(endedAt, endedAt, row.id).run();
-
-    const watch = {
-      ok: true,
-      node: row.node,
-      displayName: row.display_name || row.node,
-      source: row.source || "manual",
-      note: log.note,
-      durationSec: actualDurationSec,
-      startedAt,
-      endedAt,
-      title: row.title || "",
-      itemId: row.item_id || "",
-      ts: endedAt,
-      log
-    };
-    try {
-      await notifySimulatedWatch(env, watch, {
-        remainDays: row.remain_days,
-        renewDays: row.renew_days
-      });
-    } catch (err) {
-      console.log("notify complete failed", errMessage(err));
-    }
-    return { ok: true, id: row.id, done: true, title: row.title };
+    return retryWatchCompletionNotification(env, {
+      ...row,
+      status: "notify_pending",
+      last_tick_at: endedAt,
+      next_tick_at: endedAt,
+      notify_attempts: 0,
+      note: log.note
+    }, endedAt);
   }
 
   const ratio = Math.min(0.95, elapsedSec / target);
@@ -2843,6 +2998,53 @@ async function tickWatchSession(env, row, now = Date.now()) {
     WHERE id = ?
   `).bind(now, nextTickAt, row.id).run();
   return { ok: true, id: row.id, done: false, elapsedSec, target };
+}
+
+function telegramDeliverySucceeded(result) {
+  return Boolean(result?.ok || result?.skipped);
+}
+
+async function retryWatchCompletionNotification(env, row, now = Date.now()) {
+  const endedAt = Number(row.last_tick_at || now);
+  const durationSec = Math.max(0, Math.round((endedAt - Number(row.started_at || endedAt)) / 1000));
+  let delivery;
+  try {
+    delivery = await notifySimulatedWatch(env, {
+      ok: true,
+      node: row.node,
+      displayName: row.display_name || row.node,
+      source: row.source || "manual",
+      note: row.note || "真实模拟观看完成",
+      durationSec,
+      startedAt: Number(row.started_at || endedAt),
+      endedAt,
+      title: row.title || "",
+      itemId: row.item_id || "",
+      ts: endedAt
+    }, {
+      remainDays: row.remain_days,
+      renewDays: row.renew_days
+    });
+  } catch (err) {
+    delivery = { ok: false, error: errMessage(err) };
+  }
+
+  if (telegramDeliverySucceeded(delivery)) {
+    await env.DB.prepare(`
+      UPDATE sim_watch_sessions SET status = 'done', next_tick_at = ?, error = '' WHERE id = ?
+    `).bind(now, row.id).run();
+    return { ok: true, id: row.id, done: true, notified: !delivery?.skipped, title: row.title };
+  }
+
+  const attempts = Number(row.notify_attempts || 0) + 1;
+  const exhausted = attempts >= 5;
+  const error = cleanString(delivery?.error || delivery?.result?.description || "Telegram notification failed").slice(0, 500);
+  await env.DB.prepare(`
+    UPDATE sim_watch_sessions
+    SET status = ?, notify_attempts = ?, next_tick_at = ?, error = ?
+    WHERE id = ?
+  `).bind(exhausted ? "done" : "notify_pending", attempts, now + Math.min(attempts, 5) * 60 * 1000, error, row.id).run();
+  return { ok: false, id: row.id, done: exhausted, notifyPending: !exhausted, error };
 }
 
 async function performSimulatedWatch(env, options = {}) {
@@ -2944,21 +3146,22 @@ async function notifySimulatedWatchFailure(env, watch, options = {}) {
 async function runAutoSimulatedWatches(env) {
   if (!env.DB) return { ok: false, skipped: true, reason: "missing DB" };
   const statuses = await getKeepaliveStatuses(env);
-  const targets = statuses.filter((item) => item.status === "due" || item.status === "warn");
+  const targets = statuses.filter((item) => item.enabled !== false && (item.status === "due" || item.status === "warn"));
   if (!targets.length) return { ok: true, skipped: true, reason: "no due nodes", count: 0 };
   const results = [];
   for (const item of targets) {
     try {
       const node = await getNode(env, item.node);
-      if (!node?.embyUser || !(node.embyPassword || node.embyAccessToken)) {
-        await notifySimulatedWatchFailure(env, {
-          node: item.node,
-          displayName: item.displayName || item.node,
-          source: "auto",
-          error: "节点未配置 Emby 用户名/密码，无法真实模拟观看",
-          endedAt: Date.now()
-        }, {});
-        results.push({ ok: false, node: item.node, error: "missing emby credentials" });
+      if (!node) {
+        results.push({ ok: false, node: item.node, error: "node not found" });
+        continue;
+      }
+      if (!canNodeAutoWatch(node)) {
+        results.push(await notifyKeepaliveDue(env, item, node));
+        continue;
+      }
+      if (await hasRecentAutoWatchFailure(env, item.node)) {
+        results.push({ ok: true, node: item.node, skipped: true, reason: "failure backoff" });
         continue;
       }
       if (await hasRunningWatchSession(env, item.node)) {
@@ -2977,10 +3180,88 @@ async function runAutoSimulatedWatches(env) {
       });
       results.push({ ok: true, node: item.node, ...started });
     } catch (err) {
-      results.push({ ok: false, node: item.node, error: errMessage(err) });
+      const error = errMessage(err);
+      await recordAutoWatchFailure(env, item, error);
+      results.push({ ok: false, node: item.node, error });
     }
   }
   return { ok: results.every((item) => item.ok), count: results.length, results };
+}
+
+function canNodeAutoWatch(node) {
+  return Boolean(node?.autoWatch && node.embyUser && node.embyPassword);
+}
+
+async function notifyKeepaliveDue(env, item, node) {
+  const day = beijingDay();
+  if (item.lastNotifyDay === day) {
+    return { ok: true, node: item.node, skipped: true, reason: "reminder already sent today" };
+  }
+  const state = item.status === "due"
+    ? `已超期 ${Math.abs(item.remainDays)} 天`
+    : `剩余 ${item.remainDays} 天`;
+  const reason = node.autoWatch ? "账号密码不完整" : "未启用自动模拟观看";
+  let delivery;
+  try {
+    delivery = await sendTelegramReportText(env, [
+      "⏰ 观看到期提醒",
+      `站点：${item.displayName || item.node}`,
+      `节点：${item.node}`,
+      `状态：${state}`,
+      `周期：${item.renewDays} 天`,
+      `处理：仅提醒（${reason}）`
+    ].join("\n"));
+  } catch (err) {
+    delivery = { ok: false, error: errMessage(err) };
+  }
+  if (!telegramDeliverySucceeded(delivery)) {
+    return { ok: false, node: item.node, error: delivery?.error || "keepalive reminder failed" };
+  }
+  await env.DB.prepare(`
+    UPDATE keepalive_state
+    SET last_notify_day = ?, notify_count = notify_count + 1
+    WHERE node = ?
+  `).bind(day, item.node).run();
+  return { ok: true, node: item.node, reminded: !delivery?.skipped, skipped: Boolean(delivery?.skipped) };
+}
+
+async function hasRecentAutoWatchFailure(env, nodeName) {
+  await ensureWatchLogsTable(env);
+  const row = await env.DB.prepare(`
+    SELECT id FROM watch_logs
+    WHERE node = ? AND source = 'auto'
+      AND (note LIKE '自动启动失败：%' OR note LIKE '进行中失败：%')
+      AND ts >= ?
+    ORDER BY ts DESC LIMIT 1
+  `).bind(normalizeName(nodeName), Date.now() - AUTO_WATCH_FAILURE_BACKOFF_MS).first();
+  return Boolean(row?.id);
+}
+
+async function recordAutoWatchFailure(env, item, error) {
+  const endedAt = Date.now();
+  try {
+    await insertWatchLog(env, {
+      node: item.node,
+      displayName: item.displayName || item.node,
+      ts: endedAt,
+      source: "auto",
+      note: `自动启动失败：${error}`.slice(0, 300),
+      durationSec: 0,
+      startedAt: endedAt,
+      endedAt,
+      title: "（失败）",
+      itemId: ""
+    });
+  } catch {}
+  try {
+    await notifySimulatedWatchFailure(env, {
+      node: item.node,
+      displayName: item.displayName || item.node,
+      source: "auto",
+      error,
+      endedAt
+    }, { remainDays: item.remainDays, renewDays: item.renewDays });
+  } catch {}
 }
 
 async function ensureWatchLogsTable(env) {
@@ -3946,22 +4227,28 @@ function aggregateNodeRows(rows) {
 }
 
 async function sendKeepaliveReminders(env) {
-  // 兼容旧调用：到期/提醒窗口改为自动模拟观看，并实时推送 TG
+  // 兼容旧调用：按节点配置选择自动观看或每日到期提醒
   return runAutoSimulatedWatches(env);
 }
 
 async function handleTelegramWebhook(request, env) {
-  if (env.TG_WEBHOOK_SECRET) {
-    const got = request.headers.get("x-telegram-bot-api-secret-token") || "";
-    if (got !== env.TG_WEBHOOK_SECRET) {
-      return text("Forbidden", 403);
-    }
+  if (!env.TG_WEBHOOK_SECRET) {
+    return text("Telegram webhook secret is not configured", 503);
+  }
+  const got = request.headers.get("x-telegram-bot-api-secret-token") || "";
+  if (got !== env.TG_WEBHOOK_SECRET) {
+    return text("Forbidden", 403);
   }
   if (!env.TG_BOT_TOKEN) {
     return text("OK");
   }
   try {
     const body = await request.json();
+    const incomingChatId = body.message?.chat?.id ?? body.callback_query?.message?.chat?.id;
+    const allowedChats = new Set(telegramChatIds(env));
+    if (!incomingChatId || !allowedChats.has(cleanString(incomingChatId))) {
+      return text("Forbidden", 403);
+    }
     const messageText = cleanTelegramCommand(body.message?.text);
     if (["/start", "/help", "/stats", "/report"].includes(messageText)) {
       await sendTelegramReport(env, { chatId: body.message.chat.id, replaceLast: false });
@@ -4005,14 +4292,15 @@ async function setupTelegramWebhook(env) {
   if (!webhookURL) {
     return { ok: false, error: "missing TG_WEBHOOK_URL or CF_DOMAIN" };
   }
+  if (!env.TG_WEBHOOK_SECRET) {
+    return { ok: false, error: "missing TG_WEBHOOK_SECRET" };
+  }
   const payload = {
     url: webhookURL,
     allowed_updates: ["message", "callback_query"],
     drop_pending_updates: false
   };
-  if (env.TG_WEBHOOK_SECRET) {
-    payload.secret_token = env.TG_WEBHOOK_SECRET;
-  }
+  payload.secret_token = env.TG_WEBHOOK_SECRET;
   const res = await telegramAPI(env, "setWebhook", payload);
   return { ok: res.ok, webhookURL, result: res.result };
 }
@@ -4389,7 +4677,6 @@ function escapeHTML(value) {
 
 function adminHTML(env = {}) {
   const labels = JSON.stringify(Object.fromEntries(CLIENT_PROFILES.map((item) => [item.id, item.label]))).replace(/</g, "\\u003c");
-  const managementDomain = cleanString(env.CF_DOMAIN || "");
   const dispatchDomain = dnsDomain(env);
   return `<!doctype html>
 <html lang="zh-CN">
@@ -4641,8 +4928,9 @@ body.theme-cyber .side-link.active{
 .side-stat b{color:var(--ink);font-variant-numeric:tabular-nums}
 .side-stat b.compact-value{max-width:148px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}
 
-.main-panel{display:grid;gap:14px;min-width:0}
+.main-panel{position:relative;z-index:2;display:grid;gap:14px;min-width:0}
 .hero-bar{
+  position:relative;z-index:1000;overflow:visible;
   display:flex;justify-content:space-between;align-items:center;gap:14px;
   padding:18px;border-radius:24px;
   animation:rise .5s var(--ease) both;
@@ -4839,6 +5127,21 @@ body.theme-cyber .emby-card:hover{
 .info-value{min-width:0;text-align:left;word-break:break-all;color:var(--ink)}
 .masked{letter-spacing:1px;color:var(--muted)}
 .split-2{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(300px,.85fr);gap:14px}
+.network-source-grid{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.1fr);gap:0}
+.network-source-block{display:grid;align-content:start;gap:10px;min-width:0;padding-right:16px}
+.network-source-block+.network-source-block{padding:0 0 0 16px;border-left:1px solid var(--line)}
+.network-block-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.network-block-head b{font-size:13px;color:var(--ink)}
+.network-block-head span{font-size:11px;color:var(--muted)}
+.network-workspace{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(320px,.75fr);gap:14px;align-items:start}
+.network-results,.network-dns{min-width:0}
+.network-dns{position:sticky;top:14px}
+.network-dns .panel-head{display:grid}
+.network-dns .dns-status{margin-top:8px}
+.dns-details{margin-top:14px;border-top:1px solid var(--line);padding-top:10px}
+.dns-details summary{cursor:pointer;color:var(--muted);font-size:12px;font-weight:720;list-style-position:inside}
+.dns-details[open] summary{margin-bottom:10px;color:var(--ink)}
+.dns-details .output{min-height:120px;max-height:280px}
 .table-wrapper{
   width:100%;border:1px solid var(--line);border-radius:16px;overflow:auto;
   background:var(--glass-soft);box-shadow:inset 0 1px 0 var(--highlight)
@@ -4952,6 +5255,8 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
   .mobile-nav{display:flex}
   .stat-strip,.metrics,.chart-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
   .split-2{grid-template-columns:1fr}
+  .network-workspace{grid-template-columns:1fr}
+  .network-dns{position:static}
   .form-grid{grid-template-columns:1fr 1fr}
   .node-form{grid-template-columns:repeat(2,minmax(0,1fr))}
   .node-form .field,.node-form .field.w2,.node-form .field.w3,.node-form .field.w4,.node-form .field.w6{grid-column:span 1}
@@ -4959,6 +5264,8 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
 }
 @media(max-width:560px){
   .hero-bar{flex-direction:column;align-items:flex-start}
+  .panel-head{flex-direction:column;align-items:stretch}
+  .panel-head>.toolbar-inline{width:100%}
   .hero-actions,.toolbar-inline{width:100%}
   .hero-actions .btn,.toolbar-inline .btn{flex:1}
   .theme-switch{width:100%;justify-content:space-between}
@@ -4967,6 +5274,10 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
   .chart-grid{grid-template-columns:1fr}
   .node-grid{grid-template-columns:1fr}
   .form-grid,.node-form,.option-row{grid-template-columns:1fr}
+  .network-source-grid{grid-template-columns:1fr}
+  .network-source-block{padding:0 0 14px}
+  .network-source-block+.network-source-block{padding:14px 0 0;border-left:0;border-top:1px solid var(--line)}
+  .network-block-head{align-items:flex-start;flex-direction:column;gap:2px}
   .node-form .field,.node-form .field.w2,.node-form .field.w3,.node-form .field.w4,.node-form .field.w6,.node-form .field.full,.node-form .field.w12{grid-column:1/-1}
   .ip-table table,.ip-table thead,.ip-table tbody,.ip-table tr,.ip-table td{display:block;width:100%;min-width:0}
   .ip-table thead{display:none}
@@ -4979,11 +5290,14 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
   .ip-table .ip-text{display:block;max-width:calc(100% - 42px);font-size:13px;word-break:break-all}
   .ip-table td:last-child{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
   .ip-table td:last-child .btn{flex:1}
+  .ip-table tr.ip-empty-row{margin:0;padding:22px 12px;border:0;background:transparent;box-shadow:none}
+  .ip-table tr.ip-empty-row td{position:static;display:block;width:100%;max-width:none;padding:0;text-align:center}
 }
 
 /* compact top actions */
 .hero-actions{gap:6px}
-.icon-menu{position:relative}
+.icon-menu{position:relative;z-index:1}
+.icon-menu[open]{z-index:1100}
 .icon-menu summary{
   list-style:none;min-height:34px;min-width:34px;border:1px solid var(--line);border-radius:11px;
   background:var(--glass-strong);color:var(--ink);display:inline-flex;align-items:center;justify-content:center;
@@ -4992,10 +5306,10 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
 .icon-menu summary::-webkit-details-marker{display:none}
 .icon-menu[open] summary{border-color:color-mix(in srgb, var(--accent) 40%, var(--line))}
 .icon-menu .menu-pop{
-  position:absolute;right:0;top:calc(100% + 6px);z-index:40;min-width:168px;
+  position:absolute;right:0;top:calc(100% + 6px);z-index:1101;min-width:168px;
   padding:6px;border-radius:14px;border:1px solid var(--line);background:var(--glass-strong);
   box-shadow:var(--shadow-lg), inset 0 1px 0 var(--highlight);
-  backdrop-filter:blur(18px);display:grid;gap:4px
+  backdrop-filter:blur(18px);display:grid;gap:4px;pointer-events:auto
 }
 .icon-menu .menu-pop button,.icon-menu .menu-pop .menu-item{
   width:100%;min-height:34px;border:0;border-radius:10px;background:transparent;color:var(--ink);
@@ -5029,6 +5343,15 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
 .chart-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 @media(max-width:900px){.pie-wrap{grid-template-columns:120px 1fr}.pie-svg{width:120px;height:120px}}
 @media(max-width:560px){.chart-grid{grid-template-columns:1fr}.pie-wrap{grid-template-columns:1fr;justify-items:center}.pie-legend{width:100%}}
+@media(max-width:980px){
+  .hero-bar{
+    position:fixed;top:10px;right:10px;z-index:1200;width:auto;padding:0;
+    display:block;border:0;background:transparent;box-shadow:none;
+    backdrop-filter:none;-webkit-backdrop-filter:none;animation:none
+  }
+  .hero-bar>div:first-child{display:none}
+  .hero-bar .hero-actions{width:auto;display:block}
+}
 </style>
 </head>
 <body class="theme-cyber">
@@ -5079,7 +5402,7 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
         <div class="side-stat"><span>今日流量</span><b id="metricBytes">0 B</b></div>
         <div class="side-stat"><span>访客入口</span><b id="traceEntry" class="compact-value mono">--</b></div>
         <div class="side-stat"><span>Worker 出口</span><b id="traceEgress" class="compact-value mono">--</b></div>
-        <div class="side-stat"><span>RTT</span><b id="rttValue" class="mono">--</b></div>
+        <div class="side-stat"><span><i id="rttDot" class="dot" style="display:inline-block;vertical-align:middle;margin-right:5px"></i>RTT</span><b id="rttValue" class="mono">--</b></div>
       </div>
     </aside>
 
@@ -5088,7 +5411,6 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
         <div>
           <div class="section-kicker">控制台</div>
           <h1 id="pageTitle">线路配置</h1>
-          <p>管理 ${escapeHTML(managementDomain || "-")} · 调度 ${escapeHTML(dispatchDomain || "-")} · <span id="rttDot" class="dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);vertical-align:middle"></span> 边缘延迟见侧栏</p>
         </div>
         <div class="hero-actions">
           <details class="icon-menu" id="moreMenu">
@@ -5160,6 +5482,9 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
             <div class="form-section">
               <div class="form-section-title"><b>观看保活</b><span>周期提醒 + 真实模拟账号</span></div>
               <div class="form-grid node-form">
+                <div class="option-row" style="grid-column:1/-1">
+                  <label class="check"><input id="autoWatch" type="checkbox">到期自动模拟观看</label>
+                </div>
                 <div class="field w3" style="grid-column:span 3"><label>周期（天）</label><input id="renewDays" type="number" min="0" step="1" placeholder="21"></div>
                 <div class="field w3" style="grid-column:span 3"><label>提前提醒（天）</label><input id="remindBeforeDays" type="number" min="0" step="1" placeholder="3"></div>
                 <div class="field w3" style="grid-column:span 3"><label>起算日期</label><input id="keepaliveAt" placeholder="2026-07-07"></div>
@@ -5167,7 +5492,7 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
                 <div class="field w6"><label>Emby 用户名</label><input id="embyUser" placeholder="真实模拟观看账号"></div>
                 <div class="field w6"><label>Emby 密码</label><input id="embyPassword" type="password" placeholder="保存后用于登录上游"></div>
               </div>
-              <div class="hint" style="margin-top:8px">进入提醒窗口后会真实登录上游 Emby 开播，并在约 5-7.5 分钟内按分钟上报进度；完成后写记录并 TG 通知。</div>
+              <div class="hint" style="margin-top:8px">勾选并填写 Emby 用户名、密码时自动观看；未勾选或账号密码不完整时只发送到期提醒。</div>
             </div>
           </div>
         </section>
@@ -5231,31 +5556,62 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
             </div>
           </div>
           <div class="panel-body">
-            <div class="split-2">
-              <div>
-                <div class="toolbar-inline" style="margin-bottom:12px">
+            <div class="network-source-grid">
+              <div class="network-source-block">
+                <div class="network-block-head"><b>远程数据源</b><span>JSON 或纯文本节点列表</span></div>
+                <div class="toolbar-inline">
                   <input id="customApiUrl" class="search-input" style="flex:1" value="https://ip.v2too.top/api/nodes" placeholder="自定义 JSON 或文本 API 链接">
                   <button class="btn cyan" id="fetchCustomApiBtn">拉取 API 并测速</button>
                 </div>
+              </div>
+              <div class="network-source-block">
+                <div class="network-block-head"><b>手动输入</b><span>自动识别 IP、IPv6 与域名</span></div>
                 <div class="field full"><label>自定义 IP、IPv6 或 CNAME</label><textarea id="customIps" placeholder="每行一个，也支持粘贴混杂文本自动提取"></textarea></div>
-                <div class="toolbar-inline" style="margin:12px 0">
+                <div class="toolbar-inline">
                   <button class="btn" id="testCustomBtn">测试粘贴的节点</button>
                   <button class="btn" id="directCnameBtn">直推 CNAME</button>
-                  <button class="btn" id="topDnsBtn">TOP3 写入 DNS</button>
-                  <button class="btn primary" id="selectedDnsBtn">选中写入 DNS</button>
                 </div>
-                <div id="statusText" class="hint">优选 IP 是 Cloudflare 边缘入口候选。实际体验还会受运营商、TLS、Worker 调度影响。</div>
+              </div>
+            </div>
+            <div id="statusText" class="hint" style="margin-top:12px">优选 IP 是 Cloudflare 边缘入口候选。实际体验还会受运营商、TLS、Worker 调度影响。</div>
+          </div>
+        </section>
+
+        <div class="network-workspace">
+          <section class="panel network-results">
+            <div class="panel-head">
+              <div>
+                <div class="section-kicker">测速结果</div>
+                <h2>候选节点</h2>
+                <p>按延迟排序，勾选后可直接写入 DNS。</p>
+              </div>
+              <div class="toolbar-inline">
+                <button class="btn" id="topDnsBtn">TOP3 写入 DNS</button>
+                <button class="btn primary" id="selectedDnsBtn">选中写入 DNS</button>
+              </div>
+            </div>
+            <div class="panel-body tight">
                 <div class="table-wrapper ip-table" style="margin-top:14px">
                   <table>
                     <thead><tr><th style="width:44px"><input type="checkbox" id="selectAll" class="ip-checkbox"></th><th>专属节点</th><th>预估延迟</th><th>连通状态</th><th>记录/归属地</th><th>单节点操作</th></tr></thead>
-                    <tbody id="ipRows"><tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无数据，请拉取节点或输入自定义 IP/域名测试</td></tr></tbody>
+                    <tbody id="ipRows"><tr class="ip-empty-row"><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无数据，请拉取节点或输入自定义 IP/域名测试</td></tr></tbody>
                   </table>
                 </div>
-              </div>
+            </div>
+          </section>
+
+          <section class="panel network-dns">
+            <div class="panel-head">
               <div>
-                <div class="form-section-title" style="margin-bottom:10px"><b>调度域名 DNS</b><span id="dnsStatus" class="dns-status"><span class="badge">未查询</span></span></div>
+                <div class="section-kicker">DNS</div>
+                <h2>调度域名解析</h2>
+                <p>查询现有记录，确认后再更新。</p>
+              </div>
+              <div id="dnsStatus" class="dns-status"><span class="badge">未查询</span></div>
+            </div>
+            <div class="panel-body">
                 <div class="form-grid" style="grid-template-columns:1fr 110px">
-                  <div class="field"><label>调度域名</label><input id="dnsName" value="${escapeHTML(dispatchDomain)}" placeholder="md.8899.qzz.io"></div>
+                  <div class="field"><label>调度域名</label><input id="dnsName" value="${escapeHTML(dispatchDomain)}" placeholder="media.example.com"></div>
                   <div class="field"><label>类型</label><select id="dnsType"><option>A</option><option>AAAA</option><option>CNAME</option></select></div>
                   <div class="field full"><label>记录值</label><textarea id="dnsValues" placeholder="一行一个记录值"></textarea></div>
                 </div>
@@ -5263,11 +5619,13 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
                   <button class="btn" id="dnsLoadBtn">查询 DNS</button>
                   <button class="btn primary" id="dnsUpdateBtn">更新 DNS</button>
                 </div>
-                <pre id="dnsOut" class="output" style="margin-top:14px;min-height:180px"></pre>
-              </div>
+                <details class="dns-details">
+                  <summary>查看接口响应</summary>
+                  <pre id="dnsOut" class="output"></pre>
+                </details>
             </div>
-          </div>
-        </section>
+          </section>
+            </div>
       </section>
 
       <!-- DASHBOARD -->
@@ -5496,6 +5854,9 @@ function renderNodes(){
     const emby = n.embyUser
       ? '<span class="chip ok">' + esc(n.embyUser) + '</span>' + (n.embyPlayId ? '<span class="chip">ID ' + esc(n.embyPlayId) + '</span>' : '<span class="chip">自动选片</span>')
       : '<span class="chip warn">Emby 未配置</span>';
+    const autoWatch = n.autoWatch && n.embyUser && n.embyPassword
+      ? '<span class="chip ok">到期自动观看</span>'
+      : '<span class="chip">仅到期提醒</span>';
     const lat = latencyMap[n.name];
     let latChip = '<span class="chip latency-chip pending" data-latency-for="' + attr(n.name) + '">未测速</span>';
     if (lat && lat.ms >= 0) {
@@ -5514,6 +5875,7 @@ function renderNodes(){
           '<span class="chip primary">' + esc(n.headerMode || "dual") + '</span>' +
           '<span class="chip">' + esc(n.streamMode || "proxy") + '</span>' +
           '<span class="chip">' + (n.impersonate === false ? "模拟关" : esc(CLIENT_LABELS[n.clientProfile] || n.clientProfile || "client")) + '</span>' +
+          autoWatch +
           emby +
         '</div>' +
         infoRow("接入", '<span class="mono masked" data-secret="' + attr(url) + '">••••••••••••</span> <button class="btn small" data-act="reveal" data-name="' + attr(n.name) + '">显示</button>') +
@@ -5580,6 +5942,7 @@ async function saveNode(){
     directExternal: $("directExternal").checked,
     cacheImage: $("cacheImage").checked,
     enabled: $("enabled").checked,
+    autoWatch: $("autoWatch").checked,
     tag: $("tag").value,
     remark: $("remark").value,
     renewDays: Number($("renewDays").value || 0),
@@ -5681,6 +6044,7 @@ function editNode(name){
   $("directExternal").checked = !!n.directExternal;
   $("cacheImage").checked = n.cacheImage !== false;
   $("enabled").checked = n.enabled !== false;
+  $("autoWatch").checked = !!n.autoWatch;
   $("renewDays").value = n.renewDays || "";
   $("remindBeforeDays").value = n.remindBeforeDays || "";
   $("keepaliveAt").value = n.keepaliveAt || "";
@@ -5769,6 +6133,10 @@ async function markWatched(name){
         loadWatchLogs({ quiet: true });
         loadNodes({ quietAuth: true });
       }, 390000);
+      setTimeout(() => {
+        loadWatchLogs({ quiet: true });
+        loadNodes({ quietAuth: true });
+      }, 480000);
     } else {
       showToast("已记录模拟观看：" + (data.displayName || name) + (data.durationSec ? (" · " + formatDurationClient(data.durationSec)) : "") + (data.title ? (" · " + data.title) : ""));
       await Promise.all([
@@ -5974,6 +6342,7 @@ function resetForm(options = {}){
   if ($("directExternal")) $("directExternal").checked = false;
   if ($("cacheImage")) $("cacheImage").checked = true;
   if ($("enabled")) $("enabled").checked = true;
+  if ($("autoWatch")) $("autoWatch").checked = false;
   if (!options.keepOpen) hideNodeEditor();
 }
 async function importNodes(){
@@ -6090,6 +6459,7 @@ function recordType(value){
 }
 async function addAndTestRows(values, sourceLabel){
   const tbody = $("ipRows");
+  tbody.querySelector(".ip-empty-row")?.remove();
   if (tbody.innerHTML.includes("暂无数据")) tbody.innerHTML = "";
   const existing = new Set(Array.from(tbody.querySelectorAll(".ip-text")).map(el => el.textContent));
   const rows = [];
@@ -6342,7 +6712,7 @@ $("fetchCustomApiBtn").addEventListener("click", fetchCustomApiAndTest);
 $("directCnameBtn").addEventListener("click", directSubmitCname);
 $("deployBtn").addEventListener("click", deployWorker);
 $("copyItdogBtn").addEventListener("click", copyItdog);
-$("clearIPsBtn").addEventListener("click", () => { $("ipRows").innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无数据，请拉取节点或输入自定义 IP/域名测试</td></tr>'; $("selectAll").checked = false; });
+$("clearIPsBtn").addEventListener("click", () => { $("ipRows").innerHTML = '<tr class="ip-empty-row"><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无数据，请拉取节点或输入自定义 IP/域名测试</td></tr>'; $("selectAll").checked = false; });
 $("selectedDnsBtn").addEventListener("click", selectedToDNS);
 $("topDnsBtn").addEventListener("click", topToDNS);
 $("pingAllBtn").addEventListener("click", pingAllNodes);

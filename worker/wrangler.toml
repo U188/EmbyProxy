@@ -1,11 +1,11 @@
-name = "clear-bridge-d706"
+name = "embyproxy"
 main = "dist/index.js"
 compatibility_date = "2026-07-06"
 
 workers_dev = true
 routes = [
-  { pattern = "hu.fuck.8899.qzz.io", custom_domain = true },
-  { pattern = "md.8899.qzz.io/*", zone_name = "8899.qzz.io" }
+  { pattern = "admin.example.com", custom_domain = true },
+  { pattern = "media.example.com/*", zone_name = "example.com" }
 ]
 
 [triggers]
@@ -13,15 +13,15 @@ crons = ["* * * * *"]
 
 [[d1_databases]]
 binding = "DB"
-database_name = "media_c8af70"
-database_id = "92f92005-ab1e-4847-afec-296d7fc3cb00"
+database_name = "media_gateway"
+database_id = "replace-with-d1-database-id"
 
 [vars]
-CF_ACCOUNT_ID = "90ac42d7b69175ced6546f4f76669e43"
-CF_ZONE_ID = "aba5bb98b1a466e1e3af840d966e9713"
-CF_DOMAIN = "hu.fuck.8899.qzz.io"
-CF_DNS_DOMAIN = "md.8899.qzz.io"
-CF_WORKER_NAME = "clear-bridge-d706"
+CF_ACCOUNT_ID = "replace-with-account-id"
+CF_ZONE_ID = "replace-with-zone-id"
+CF_DOMAIN = "admin.example.com"
+CF_DNS_DOMAIN = "media.example.com"
+CF_WORKER_NAME = "embyproxy"
 TG_REPORT_HOUR = "9"
 PREFERRED_IPS_URL = "https://raw.githubusercontent.com/ZhiXuanWang/cf-speed-dns/refs/heads/main/ipTop10.html"
 
