@@ -18,6 +18,11 @@ CREATE TABLE IF NOT EXISTS nodes (
   renew_days INTEGER DEFAULT 0,
   remind_before_days INTEGER DEFAULT 0,
   keepalive_at TEXT DEFAULT '',
+  emby_user TEXT DEFAULT '',
+  emby_password TEXT DEFAULT '',
+  emby_user_id TEXT DEFAULT '',
+  emby_access_token TEXT DEFAULT '',
+  emby_play_id TEXT DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -58,6 +63,20 @@ CREATE TABLE IF NOT EXISTS keepalive_state (
   notify_count INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS watch_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node TEXT NOT NULL,
+  display_name TEXT DEFAULT '',
+  ts INTEGER NOT NULL,
+  source TEXT DEFAULT 'manual',
+  note TEXT DEFAULT '',
+  duration_sec INTEGER DEFAULT 0,
+  started_at INTEGER DEFAULT 0,
+  ended_at INTEGER DEFAULT 0,
+  title TEXT DEFAULT '',
+  item_id TEXT DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS dns_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts INTEGER NOT NULL,
@@ -71,3 +90,34 @@ CREATE TABLE IF NOT EXISTS dns_history (
 CREATE INDEX IF NOT EXISTS idx_nodes_sort ON nodes(sort_order, name);
 CREATE INDEX IF NOT EXISTS idx_visitor_logs_ts ON visitor_logs(ts);
 CREATE INDEX IF NOT EXISTS idx_request_stats_day ON request_stats(day);
+CREATE INDEX IF NOT EXISTS idx_watch_logs_ts ON watch_logs(ts);
+CREATE INDEX IF NOT EXISTS idx_watch_logs_node_ts ON watch_logs(node, ts);
+
+
+CREATE TABLE IF NOT EXISTS sim_watch_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node TEXT NOT NULL,
+  display_name TEXT DEFAULT '',
+  source TEXT DEFAULT 'manual',
+  note TEXT DEFAULT '',
+  title TEXT DEFAULT '',
+  item_id TEXT DEFAULT '',
+  media_source_id TEXT DEFAULT '',
+  play_session_id TEXT DEFAULT '',
+  base_url TEXT DEFAULT '',
+  access_token TEXT DEFAULT '',
+  user_id TEXT DEFAULT '',
+  device_id TEXT DEFAULT '',
+  device_name TEXT DEFAULT '',
+  client_profile TEXT DEFAULT '',
+  target_duration_sec INTEGER DEFAULT 300,
+  started_at INTEGER NOT NULL,
+  last_tick_at INTEGER DEFAULT 0,
+  next_tick_at INTEGER DEFAULT 0,
+  tick_count INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'running',
+  error TEXT DEFAULT '',
+  remain_days INTEGER DEFAULT 0,
+  renew_days INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sim_watch_sessions_status_next ON sim_watch_sessions(status, next_tick_at);

@@ -1,10 +1,13 @@
-const BUILD_VERSION = "0.1.0";
+const BUILD_VERSION = "0.4.7";
 const DEFAULT_MAX_REWRITE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_RETRY_BODY_BYTES = 16 * 1024 * 1024;
 const DEFAULT_CLIENT_PROFILE = "yamby";
 const DEFAULT_NODE_ICON = "🎬";
 const IDENTITY_KEY = "system:upstream_identity";
 const LEGACY_DEFAULT_DEVICE_NAME = "OnePlus-PKG110";
+const SIMULATED_WATCH_DURATION_MIN_SEC = 300;
+// The minute cron can add almost 60 seconds before the stop event is sent.
+const SIMULATED_WATCH_DURATION_MAX_SEC = 390;
 const CLIENT_PROFILES = [
   { id: "yamby", label: "Yamby Android", ua: "Yamby/2.0.4.6(Android", client: "Yamby", version: "2.0.4.6", device: "Android", authStyle: "yamby", idFormat: "uuid" },
   { id: "hills_android", label: "Hills Android", ua: "Hills/1.7.2 (android; 15)", client: "Hills", version: "1.7.2", device: "diting", authStyle: "hills", idLength: 16 },
@@ -26,10 +29,21 @@ export default {
     }
   },
 
-  async scheduled(_event, env, ctx) {
-    ctx.waitUntil(cleanOldVisitorLogs(env));
-    ctx.waitUntil(sendKeepaliveReminders(env));
-    ctx.waitUntil(sendTelegramDailyIfDue(env));
+  async scheduled(event, env, ctx) {
+    // 每分钟：推进进行中的真实模拟观看会话（进度心跳）
+    ctx.waitUntil(processWatchSessions(env));
+    // 整点附近额外做清理 / 自动开播 / 日报
+    const minute = new Date(Date.now() + 8 * 60 * 60 * 1000).getUTCMinutes();
+    if (minute === 0) {
+      ctx.waitUntil(cleanOldVisitorLogs(env));
+      ctx.waitUntil(cleanOldWatchLogs(env));
+      ctx.waitUntil(cleanOldWatchSessions(env));
+      ctx.waitUntil(runAutoSimulatedWatches(env));
+      ctx.waitUntil(sendTelegramDailyIfDue(env));
+    } else if (minute % 10 === 0) {
+      // 每 10 分钟也检查一次到期节点，尽快开播
+      ctx.waitUntil(runAutoSimulatedWatches(env));
+    }
   }
 };
 
@@ -93,6 +107,11 @@ async function initializeSchema(env) {
       renew_days INTEGER DEFAULT 0,
       remind_before_days INTEGER DEFAULT 0,
       keepalive_at TEXT DEFAULT '',
+      emby_user TEXT DEFAULT '',
+      emby_password TEXT DEFAULT '',
+      emby_user_id TEXT DEFAULT '',
+      emby_access_token TEXT DEFAULT '',
+      emby_play_id TEXT DEFAULT '',
       created_at INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL DEFAULT 0
     )`,
@@ -128,6 +147,46 @@ async function initializeSchema(env) {
       last_notify_day TEXT DEFAULT '',
       notify_count INTEGER DEFAULT 0
     )`,
+    `CREATE TABLE IF NOT EXISTS watch_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      node TEXT NOT NULL,
+      display_name TEXT DEFAULT '',
+      ts INTEGER NOT NULL,
+      source TEXT DEFAULT 'manual',
+      note TEXT DEFAULT '',
+      duration_sec INTEGER DEFAULT 0,
+      started_at INTEGER DEFAULT 0,
+      ended_at INTEGER DEFAULT 0,
+      title TEXT DEFAULT '',
+      item_id TEXT DEFAULT ''
+    )`,
+    `CREATE TABLE IF NOT EXISTS sim_watch_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      node TEXT NOT NULL,
+      display_name TEXT DEFAULT '',
+      source TEXT DEFAULT 'manual',
+      note TEXT DEFAULT '',
+      title TEXT DEFAULT '',
+      item_id TEXT DEFAULT '',
+      media_source_id TEXT DEFAULT '',
+      play_session_id TEXT DEFAULT '',
+      base_url TEXT DEFAULT '',
+      access_token TEXT DEFAULT '',
+      user_id TEXT DEFAULT '',
+      device_id TEXT DEFAULT '',
+      device_name TEXT DEFAULT '',
+      client_profile TEXT DEFAULT '',
+      target_duration_sec INTEGER DEFAULT 300,
+      started_at INTEGER NOT NULL,
+      last_tick_at INTEGER DEFAULT 0,
+      next_tick_at INTEGER DEFAULT 0,
+      tick_count INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'running',
+      error TEXT DEFAULT '',
+      remain_days INTEGER DEFAULT 0,
+      renew_days INTEGER DEFAULT 0
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_sim_watch_sessions_status_next ON sim_watch_sessions(status, next_tick_at)`,
     `CREATE TABLE IF NOT EXISTS dns_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts INTEGER NOT NULL,
@@ -143,7 +202,9 @@ async function initializeSchema(env) {
     )`,
     `CREATE INDEX IF NOT EXISTS idx_nodes_sort ON nodes(sort_order, name)`,
     `CREATE INDEX IF NOT EXISTS idx_visitor_logs_ts ON visitor_logs(ts)`,
-    `CREATE INDEX IF NOT EXISTS idx_request_stats_day ON request_stats(day)`
+    `CREATE INDEX IF NOT EXISTS idx_request_stats_day ON request_stats(day)`,
+    `CREATE INDEX IF NOT EXISTS idx_watch_logs_ts ON watch_logs(ts)`,
+    `CREATE INDEX IF NOT EXISTS idx_watch_logs_node_ts ON watch_logs(node, ts)`
   ];
   for (const statement of statements) {
     await env.DB.prepare(statement).run();
@@ -167,6 +228,11 @@ async function initializeSchema(env) {
     renew_days: "INTEGER DEFAULT 0",
     remind_before_days: "INTEGER DEFAULT 0",
     keepalive_at: "TEXT DEFAULT ''",
+    emby_user: "TEXT DEFAULT ''",
+    emby_password: "TEXT DEFAULT ''",
+    emby_user_id: "TEXT DEFAULT ''",
+    emby_access_token: "TEXT DEFAULT ''",
+    emby_play_id: "TEXT DEFAULT ''",
     created_at: "INTEGER NOT NULL DEFAULT 0",
     updated_at: "INTEGER NOT NULL DEFAULT 0"
   });
@@ -181,6 +247,16 @@ async function initializeSchema(env) {
   await ensureColumns(env, "request_stats", {
     bytes: "INTEGER DEFAULT 0",
     updated_at: "INTEGER NOT NULL DEFAULT 0"
+  });
+  await ensureColumns(env, "watch_logs", {
+    display_name: "TEXT DEFAULT ''",
+    source: "TEXT DEFAULT 'manual'",
+    note: "TEXT DEFAULT ''",
+    duration_sec: "INTEGER DEFAULT 0",
+    started_at: "INTEGER DEFAULT 0",
+    ended_at: "INTEGER DEFAULT 0",
+    title: "TEXT DEFAULT ''",
+    item_id: "TEXT DEFAULT ''"
   });
 }
 
@@ -234,7 +310,12 @@ async function handleAPI(request, env, ctx) {
   }
   if (url.pathname === "/api/keepalive/reset" && request.method === "POST") {
     const body = await readJSON(request);
-    return json(await resetKeepalive(env, body));
+    return json(await resetKeepalive(env, body, ctx));
+  }
+  if (url.pathname === "/api/watch-logs" && request.method === "GET") {
+    const days = Number(url.searchParams.get("days") || 3);
+    const limit = Number(url.searchParams.get("limit") || 100);
+    return json({ ok: true, items: await listWatchLogs(env, { days, limit }) });
   }
   if (url.pathname === "/api/nodes" && request.method === "GET") {
     return json({ ok: true, nodes: await listNodesWithKeepalive(env) });
@@ -1709,8 +1790,9 @@ async function saveNode(env, input) {
       name, display_name, targets, stream_target, secret, client_profile, impersonate,
       header_mode, stream_mode, direct_external, cache_image, tag, remark,
       icon, sort_order, enabled, renew_days, remind_before_days, keepalive_at,
+      emby_user, emby_password, emby_user_id, emby_access_token, emby_play_id,
       created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(name) DO UPDATE SET
       display_name = excluded.display_name,
       targets = excluded.targets,
@@ -1730,6 +1812,11 @@ async function saveNode(env, input) {
       renew_days = excluded.renew_days,
       remind_before_days = excluded.remind_before_days,
       keepalive_at = excluded.keepalive_at,
+      emby_user = excluded.emby_user,
+      emby_password = excluded.emby_password,
+      emby_user_id = excluded.emby_user_id,
+      emby_access_token = excluded.emby_access_token,
+      emby_play_id = excluded.emby_play_id,
       updated_at = excluded.updated_at
   `).bind(
     node.name,
@@ -1751,6 +1838,11 @@ async function saveNode(env, input) {
     node.renewDays,
     node.remindBeforeDays,
     node.keepaliveAt,
+    node.embyUser,
+    node.embyPassword,
+    node.embyUserId,
+    node.embyAccessToken,
+    node.embyPlayId,
     current?.createdAt || now,
     now
   ).run();
@@ -1806,6 +1898,11 @@ function rowToNode(row) {
     renewDays: Number(row.renew_days || 0),
     remindBeforeDays: Number(row.remind_before_days || 0),
     keepaliveAt: row.keepalive_at || "",
+    embyUser: row.emby_user || "",
+    embyPassword: row.emby_password || "",
+    embyUserId: row.emby_user_id || "",
+    embyAccessToken: row.emby_access_token || "",
+    embyPlayId: row.emby_play_id || "",
     createdAt: Number(row.created_at || 0),
     updatedAt: Number(row.updated_at || 0)
   };
@@ -1840,6 +1937,11 @@ function normalizeNode(input, current, now) {
     renewDays: intValue(input.renewDays ?? input.renew_days ?? current?.renewDays ?? 0),
     remindBeforeDays: intValue(input.remindBeforeDays ?? input.remind_before_days ?? current?.remindBeforeDays ?? 0),
     keepaliveAt: cleanString(input.keepaliveAt ?? input.keepalive_at ?? current?.keepaliveAt ?? ""),
+    embyUser: cleanString(input.embyUser ?? input.emby_user ?? current?.embyUser ?? ""),
+    embyPassword: cleanString(input.embyPassword ?? input.emby_password ?? current?.embyPassword ?? ""),
+    embyUserId: cleanString(input.embyUserId ?? input.emby_user_id ?? current?.embyUserId ?? ""),
+    embyAccessToken: cleanString(input.embyAccessToken ?? input.emby_access_token ?? current?.embyAccessToken ?? ""),
+    embyPlayId: cleanString(input.embyPlayId ?? input.emby_play_id ?? current?.embyPlayId ?? ""),
     createdAt: current?.createdAt || now,
     updatedAt: now
   };
@@ -1920,6 +2022,18 @@ async function ensureKeepaliveTable(env) {
   `).run();
 }
 
+
+function parseKeepaliveAt(value) {
+  const raw = cleanString(value);
+  if (!raw) return 0;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0) {
+    return n < 10000000000 ? n * 1000 : n;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 async function ensureKeepaliveState(env, node) {
   if (!node?.name || !node.renewDays) {
     return;
@@ -1985,27 +2099,981 @@ async function keepaliveStatusMap(env, nodes) {
   return map;
 }
 
-async function resetKeepalive(env, body) {
+async function resetKeepalive(env, body, ctx = null) {
   const name = normalizeName(body.name || "");
-  if (!name) {
-    return { ok: false, error: "missing node name" };
+  if (!name) return { ok: false, error: "missing node name" };
+  const node = await getNode(env, name);
+  if (!node) return { ok: false, error: "node not found" };
+  if (!node.embyUser || !(node.embyPassword || node.embyAccessToken)) {
+    return { ok: false, error: "请先在节点配置 Emby 用户名和密码（或 AccessToken）" };
   }
-  const ts = Number(body.ts || Date.now());
-  await markKeepalivePlayback(env, name, Number.isFinite(ts) ? ts : Date.now());
-  return { ok: true, node: name, ts };
+  const work = async () => {
+    try {
+      return await startWatchSession(env, {
+        node,
+        source: body.source || "manual",
+        note: body.note || "手动真实模拟观看",
+        remainDays: null,
+        renewDays: node.renewDays
+      });
+    } catch (err) {
+      const error = errMessage(err);
+      try {
+        await insertWatchLog(env, {
+          node: name,
+          displayName: node.displayName || name,
+          ts: Date.now(),
+          source: body.source || "manual",
+          note: `启动失败：${error}`.slice(0, 300),
+          durationSec: 0,
+          startedAt: Date.now(),
+          endedAt: Date.now(),
+          title: "（启动失败）",
+          itemId: ""
+        });
+      } catch {}
+      if (body.notify !== false) {
+        try {
+          await notifySimulatedWatchFailure(env, {
+            node: name,
+            displayName: node.displayName || name,
+            source: body.source || "manual",
+            error,
+            endedAt: Date.now()
+          }, {});
+        } catch {}
+      }
+      throw err;
+    }
+  };
+  if (ctx) {
+    // 启动会话是短任务；进度由分钟 cron 推进
+    const started = await work();
+    return {
+      ok: true,
+      accepted: true,
+      pending: true,
+      sessionId: started.sessionId,
+      node: name,
+      displayName: node.displayName || name,
+      title: started.title,
+      itemId: started.itemId,
+      durationSec: started.targetDurationSec,
+      startedAt: started.startedAt,
+      message: `真实模拟已开始：${started.title || "条目"}\n预计 5-7.5 分钟内结束，期间按真实墙钟上报进度；完成后通知 TG。`
+    };
+  }
+  const started = await work();
+  return { ok: true, pending: true, ...started, node: name, displayName: node.displayName || name };
 }
 
-function parseKeepaliveAt(value) {
-  const raw = cleanString(value);
-  if (!raw) {
-    return 0;
+function randomSimulatedWatchDurationSec() {
+  const min = SIMULATED_WATCH_DURATION_MIN_SEC;
+  const max = SIMULATED_WATCH_DURATION_MAX_SEC;
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+function formatDurationSec(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds || 0)));
+  const min = Math.floor(total / 60);
+  const sec = total % 60;
+  if (min <= 0) {
+    return `${sec} 秒`;
   }
-  const n = Number(raw);
-  if (Number.isFinite(n) && n > 0) {
-    return n < 10000000000 ? n * 1000 : n;
+  return `${min} 分 ${String(sec).padStart(2, "0")} 秒`;
+}
+
+function sleepMs(ms) {
+  const wait = Math.max(0, Number(ms || 0));
+  return new Promise((resolve) => setTimeout(resolve, wait));
+}
+
+function randomUUIDLike() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID().replace(/-/g, "");
   }
-  const parsed = Date.parse(raw);
-  return Number.isFinite(parsed) ? parsed : 0;
+  return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+}
+
+function embyTicks(seconds) {
+  return Math.max(0, Math.round(Number(seconds || 0) * 10000000));
+}
+
+function nodeUpstreamBase(node) {
+  const target = cleanString((node.targets || [])[0] || node.streamTarget || "");
+  if (!target) {
+    throw new Error("节点未配置上游地址");
+  }
+  const url = new URL(target.includes("://") ? target : `https://${target}`);
+  return url.origin;
+}
+
+function buildEmbyAuthHeader(profile, device, deviceId, token = "", userId = "") {
+  const client = profile?.client || "Emby";
+  const version = profile?.version || "4.8.0";
+  const parts = [
+    `MediaBrowser Client="${String(client).replace(/"/g, "")}"`,
+    `Device="${String(device || profile?.device || "Android").replace(/"/g, "")}"`,
+    `DeviceId="${String(deviceId).replace(/"/g, "")}"`,
+    `Version="${String(version).replace(/"/g, "")}"`
+  ];
+  if (token) parts.push(`Token="${String(token).replace(/"/g, "")}"`);
+  if (userId) parts.push(`UserId="${String(userId).replace(/"/g, "")}"`);
+  return parts.join(", ");
+}
+
+function embyDeviceProfile() {
+  return {
+    MaxStreamingBitrate: 40000000,
+    MaxStaticBitrate: 40000000,
+    MusicStreamingTranscodingBitrate: 192000,
+    DirectPlayProfiles: [
+      { Container: "mp4,m4v,mkv,webm,ts,mov", Type: "Video", VideoCodec: "h264,hevc,vp8,vp9,av1", AudioCodec: "aac,mp3,ac3,eac3,flac,opus" }
+    ],
+    TranscodingProfiles: [
+      { Container: "ts", Type: "Video", VideoCodec: "h264", AudioCodec: "aac", Protocol: "hls", EstimateContentLength: false, EnableMpegtsM2TsMode: false, TranscodeSeekInfo: "Auto", CopyTimestamps: false, Context: "Streaming", MaxAudioChannels: "6" }
+    ],
+    ContainerProfiles: [],
+    CodecProfiles: [],
+    SubtitleProfiles: [
+      { Format: "srt", Method: "External" },
+      { Format: "ass", Method: "External" },
+      { Format: "vtt", Method: "External" }
+    ],
+    ResponseProfiles: []
+  };
+}
+
+
+async function embyFetchJSON(base, path, { method = "GET", headers = {}, body, timeoutMs = 20000, tryPrefixes = true } = {}) {
+  const prefixes = tryPrefixes ? ["", "/emby", "/Mediabrowser"] : [""];
+  let lastErr = null;
+  for (const prefix of prefixes) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort("timeout"), timeoutMs);
+    try {
+      const url = base.replace(/\/+$/, "") + prefix + path;
+      const res = await fetch(url, {
+        method,
+        headers,
+        body: body == null ? undefined : (typeof body === "string" ? body : JSON.stringify(body)),
+        signal: controller.signal,
+        cf: { cacheTtl: 0, cacheEverything: false }
+      });
+      const textBody = await res.text();
+      let data = null;
+      try {
+        data = textBody ? JSON.parse(textBody) : null;
+      } catch {
+        data = textBody;
+      }
+      if (!res.ok) {
+        const msg = (data && (data.Message || data.message || data.error)) || (typeof data === "string" ? data.slice(0, 180) : "") || res.statusText;
+        lastErr = new Error(`Emby ${method} ${prefix}${path} -> ${res.status} ${msg}`);
+        if (res.status === 404 || res.status === 502 || res.status === 503) continue;
+        // auth errors: still try other prefixes once
+        if (res.status === 401 || res.status === 403) continue;
+        throw lastErr;
+      }
+      return data;
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      if (String(lastErr.message || "").includes("abort")) {
+        lastErr = new Error(`Emby ${method} ${prefix}${path} 超时`);
+      }
+      continue;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastErr || new Error(`Emby ${method} ${path} 失败`);
+}
+
+function embyProfileDeviceName(profile, nodeName) {
+  if (profile?.devicePrefix) {
+    return `${profile.devicePrefix}${String(nodeName || "NODE").replace(/[^a-zA-Z0-9]/g, "").slice(0, 8).toUpperCase() || "DEVICE"}`;
+  }
+  return profile?.device || profile?.client || "Android";
+}
+
+async function embyLogin(node) {
+  const base = nodeUpstreamBase(node);
+  const profile = getClientProfile(node.clientProfile || DEFAULT_CLIENT_PROFILE);
+  const device = embyProfileDeviceName(profile, node.name);
+  const deviceId = `ep-${normalizeName(node.name)}-${(fnv1a(String(profile.id || "p") + "|" + node.name) >>> 0).toString(16)}`;
+  const headersBase = {
+    "content-type": "application/json",
+    "accept": "application/json",
+    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "user-agent": profile.ua || "Emby/4.8.0",
+    "x-emby-authorization": buildEmbyAuthHeader(profile, device, deviceId)
+  };
+
+  if (node.embyAccessToken && node.embyUserId) {
+    return {
+      base,
+      token: node.embyAccessToken,
+      userId: node.embyUserId,
+      deviceId,
+      profile,
+      device,
+      reused: true
+    };
+  }
+
+  if (!node.embyUser || !node.embyPassword) {
+    throw new Error("缺少 Emby 用户名或密码");
+  }
+
+  let data = null;
+  let lastErr = null;
+  for (const body of [
+    { Username: node.embyUser, Pw: node.embyPassword },
+    { Username: node.embyUser, Password: node.embyPassword },
+    { Username: node.embyUser, Pw: node.embyPassword, Password: node.embyPassword }
+  ]) {
+    try {
+      data = await embyFetchJSON(base, "/Users/AuthenticateByName", {
+        method: "POST",
+        headers: headersBase,
+        body,
+        timeoutMs: 25000
+      });
+      if (data) break;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  if (!data) throw lastErr || new Error("登录失败");
+  const token = data?.AccessToken || data?.accessToken;
+  const userId = data?.User?.Id || data?.user?.id;
+  if (!token || !userId) throw new Error("登录成功但未返回 AccessToken/UserId");
+  return { base, token, userId, deviceId, profile, device, reused: false, raw: data };
+}
+
+async function persistEmbyCredentials(env, nodeName, auth) {
+  if (!auth?.token || !auth?.userId) {
+    return;
+  }
+  await env.DB.prepare(`
+    UPDATE nodes
+    SET emby_user_id = ?, emby_access_token = ?, updated_at = ?
+    WHERE name = ?
+  `).bind(auth.userId, auth.token, Date.now(), normalizeName(nodeName)).run();
+}
+
+
+function embyAuthHeaders(auth) {
+  return {
+    "content-type": "application/json",
+    "accept": "application/json",
+    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "user-agent": auth.profile?.ua || "Emby/4.8.0",
+    "x-emby-token": auth.token,
+    "x-emby-authorization": buildEmbyAuthHeader(auth.profile, auth.device, auth.deviceId, auth.token, auth.userId)
+  };
+}
+
+async function embyPickPlayItem(auth, node) {
+  const headers = embyAuthHeaders(auth);
+  if (node.embyPlayId) {
+    const item = await embyFetchJSON(auth.base, `/Users/${auth.userId}/Items/${encodeURIComponent(node.embyPlayId)}`, { headers });
+    if (!item?.Id) {
+      throw new Error("指定 embyPlayId 无效");
+    }
+    return item;
+  }
+
+  const queries = [
+    `/Users/${auth.userId}/Items/Resume?Limit=12&MediaTypes=Video&Fields=BasicSyncInfo,RunTimeTicks,UserData,MediaSources`,
+    `/Users/${auth.userId}/Items/Latest?Limit=20&IncludeItemTypes=Movie,Episode&Fields=BasicSyncInfo,RunTimeTicks,UserData`,
+    `/Users/${auth.userId}/Items?SortBy=DateCreated&SortOrder=Descending&IncludeItemTypes=Movie,Episode&Recursive=true&Limit=30&Fields=BasicSyncInfo,RunTimeTicks,UserData`
+  ];
+  const candidates = [];
+  for (const path of queries) {
+    try {
+      const data = await embyFetchJSON(auth.base, path, { headers });
+      const items = Array.isArray(data) ? data : (data?.Items || []);
+      for (const item of items) {
+        if (!item?.Id) continue;
+        if (item.Type && !["Movie", "Episode", "Video"].includes(item.Type)) continue;
+        candidates.push(item);
+      }
+      if (candidates.length >= 5) break;
+    } catch (err) {
+      console.log("pick item query failed", path, errMessage(err));
+    }
+  }
+  if (!candidates.length) {
+    throw new Error("上游未找到可播放视频条目");
+  }
+  // 随机挑一个
+  return candidates[Math.floor(Math.random() * candidates.length)];
+}
+
+function itemDisplayTitle(item) {
+  if (!item) return "";
+  if (item.Type === "Episode") {
+    const show = item.SeriesName || item.Album || "";
+    const ep = item.Name || "";
+    const sn = item.ParentIndexNumber != null ? `S${item.ParentIndexNumber}` : "";
+    const en = item.IndexNumber != null ? `E${item.IndexNumber}` : "";
+    return [show, sn + en, ep].filter(Boolean).join(" ");
+  }
+  return item.Name || item.Path || item.Id || "";
+}
+
+async function embyPlaybackInfo(auth, itemId) {
+  const headers = embyAuthHeaders(auth);
+  const qs = new URLSearchParams({
+    UserId: auth.userId,
+    StartTimeTicks: "0",
+    IsPlayback: "true",
+    AutoOpenLiveStream: "true",
+    MaxStreamingBitrate: "40000000"
+  });
+  const data = await embyFetchJSON(auth.base, `/Items/${encodeURIComponent(itemId)}/PlaybackInfo?${qs}`, {
+    method: "POST",
+    headers,
+    body: {
+      DeviceProfile: embyDeviceProfile(),
+      AllowVideoStreamCopy: true,
+      AllowAudioStreamCopy: true
+    }
+  });
+  const media = (data?.MediaSources || [])[0] || {};
+  return {
+    playSessionId: data?.PlaySessionId || randomUUIDLike(),
+    mediaSourceId: media.Id || itemId,
+    directStreamUrl: media.DirectStreamUrl || "",
+    runTimeTicks: Number(media.RunTimeTicks || 0)
+  };
+}
+
+async function embyPostSession(auth, path, payload) {
+  await embyFetchJSON(auth.base, path, {
+    method: "POST",
+    headers: embyAuthHeaders(auth),
+    body: payload,
+    timeoutMs: 15000
+  });
+}
+
+function buildPlayingPayload(auth, item, session, positionTicks, { stop = false } = {}) {
+  const nowTicks = embyTicks(Date.now() / 1000);
+  return {
+    ItemId: item.Id,
+    MediaSourceId: session.mediaSourceId,
+    PlaySessionId: session.playSessionId,
+    PositionTicks: positionTicks,
+    IsPaused: false,
+    IsMuted: false,
+    PlaybackRate: 1,
+    VolumeLevel: 100,
+    PlayMethod: "DirectStream",
+    CanSeek: true,
+    RepeatMode: "RepeatNone",
+    SubtitleStreamIndex: -1,
+    AudioStreamIndex: -1,
+    PlaylistIndex: 0,
+    PlaylistLength: stop ? 0 : 1,
+    NowPlayingQueue: stop ? [] : [{ Id: item.Id, PlaylistItemId: "playlistItem0" }],
+    MaxStreamingBitrate: 420000000,
+    PlaybackStartTimeTicks: nowTicks
+  };
+}
+
+async function embyPullStreamSample(auth, session, itemId) {
+  // 轻量拉一点流，证明真有播放行为；失败不阻断会话上报
+  try {
+    const url = session.directStreamUrl
+      ? (session.directStreamUrl.startsWith("http") ? session.directStreamUrl : (auth.base.replace(/\/+$/, "") + session.directStreamUrl))
+      : `${auth.base.replace(/\/+$/, "")}/Videos/${encodeURIComponent(itemId)}/stream?Static=true&MediaSourceId=${encodeURIComponent(session.mediaSourceId)}&PlaySessionId=${encodeURIComponent(session.playSessionId)}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort("stream-timeout"), 12000);
+    try {
+      const res = await fetch(url, {
+        method: "GET",
+        headers: {
+          ...embyAuthHeaders(auth),
+          range: "bytes=0-65535",
+          "user-agent": "VLC/3.0.18 LibVLC/3.0.18"
+        },
+        signal: controller.signal,
+        cf: { cacheTtl: 0, cacheEverything: false }
+      });
+      // 读最多 64KB
+      if (res.body) {
+        const reader = res.body.getReader();
+        let total = 0;
+        while (total < 65536) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value?.byteLength || 0;
+        }
+        try { await reader.cancel(); } catch {}
+        return { ok: res.ok, bytes: total, status: res.status };
+      }
+      return { ok: res.ok, bytes: 0, status: res.status };
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (err) {
+    return { ok: false, error: errMessage(err) };
+  }
+}
+
+async function embyPlayItem(auth, item, durationSec) {
+  // 已弃用长等待路径：真实模拟改为 sim_watch_sessions + 分钟心跳
+  const session = await embyPlaybackInfo(auth, item.Id);
+  await embyPostSession(auth, "/Sessions/Playing", buildPlayingPayload(auth, item, session, 0));
+  return {
+    title: itemDisplayTitle(item),
+    itemId: item.Id,
+    durationSec: Number(durationSec || 0),
+    playSessionId: session.playSessionId,
+    mediaSourceId: session.mediaSourceId,
+    stream: await embyPullStreamSample(auth, session, item.Id)
+  };
+}
+
+
+async function ensureWatchSessionsTable(env) {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS sim_watch_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      node TEXT NOT NULL,
+      display_name TEXT DEFAULT '',
+      source TEXT DEFAULT 'manual',
+      note TEXT DEFAULT '',
+      title TEXT DEFAULT '',
+      item_id TEXT DEFAULT '',
+      media_source_id TEXT DEFAULT '',
+      play_session_id TEXT DEFAULT '',
+      base_url TEXT DEFAULT '',
+      access_token TEXT DEFAULT '',
+      user_id TEXT DEFAULT '',
+      device_id TEXT DEFAULT '',
+      device_name TEXT DEFAULT '',
+      client_profile TEXT DEFAULT '',
+      target_duration_sec INTEGER DEFAULT 300,
+      started_at INTEGER NOT NULL,
+      last_tick_at INTEGER DEFAULT 0,
+      next_tick_at INTEGER DEFAULT 0,
+      tick_count INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'running',
+      error TEXT DEFAULT '',
+      remain_days INTEGER DEFAULT 0,
+      renew_days INTEGER DEFAULT 0
+    )
+  `).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_sim_watch_sessions_status_next ON sim_watch_sessions(status, next_tick_at)`).run();
+  await ensureColumns(env, "sim_watch_sessions", {
+    display_name: "TEXT DEFAULT ''",
+    source: "TEXT DEFAULT 'manual'",
+    note: "TEXT DEFAULT ''",
+    title: "TEXT DEFAULT ''",
+    item_id: "TEXT DEFAULT ''",
+    media_source_id: "TEXT DEFAULT ''",
+    play_session_id: "TEXT DEFAULT ''",
+    base_url: "TEXT DEFAULT ''",
+    access_token: "TEXT DEFAULT ''",
+    user_id: "TEXT DEFAULT ''",
+    device_id: "TEXT DEFAULT ''",
+    device_name: "TEXT DEFAULT ''",
+    client_profile: "TEXT DEFAULT ''",
+    target_duration_sec: "INTEGER DEFAULT 300",
+    last_tick_at: "INTEGER DEFAULT 0",
+    next_tick_at: "INTEGER DEFAULT 0",
+    tick_count: "INTEGER DEFAULT 0",
+    status: "TEXT DEFAULT 'running'",
+    error: "TEXT DEFAULT ''",
+    remain_days: "INTEGER DEFAULT 0",
+    renew_days: "INTEGER DEFAULT 0"
+  });
+}
+
+async function cleanOldWatchSessions(env) {
+  if (!env.DB) return;
+  await ensureWatchSessionsTable(env);
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  await env.DB.prepare(`DELETE FROM sim_watch_sessions WHERE started_at < ? AND status != 'running'`).bind(cutoff).run();
+}
+
+function authFromSession(row) {
+  const profile = getClientProfile(row.client_profile || DEFAULT_CLIENT_PROFILE);
+  return {
+    base: row.base_url,
+    token: row.access_token,
+    userId: row.user_id,
+    deviceId: row.device_id,
+    device: row.device_name || embyProfileDeviceName(profile, row.node),
+    profile
+  };
+}
+
+async function hasRunningWatchSession(env, nodeName) {
+  await ensureWatchSessionsTable(env);
+  const row = await env.DB.prepare(
+    `SELECT id FROM sim_watch_sessions WHERE node = ? AND status = 'running' LIMIT 1`
+  ).bind(normalizeName(nodeName)).first();
+  return Boolean(row?.id);
+}
+
+async function startWatchSession(env, { node, source = "manual", note = "", remainDays = null, renewDays = null } = {}) {
+  if (!node?.name) throw new Error("missing node");
+  if (!node.embyUser || !(node.embyPassword || node.embyAccessToken)) {
+    throw new Error("节点未配置 Emby 账号密码，无法真实模拟观看");
+  }
+  if (await hasRunningWatchSession(env, node.name)) {
+    throw new Error("该节点已有进行中的模拟观看，请等待完成后再试");
+  }
+  const targetDurationSec = randomSimulatedWatchDurationSec();
+
+  let auth = await embyLogin(node);
+  try {
+    if (auth.reused) {
+      await embyFetchJSON(auth.base, `/Users/${auth.userId}`, { headers: embyAuthHeaders(auth), timeoutMs: 12000 });
+    }
+  } catch {
+    node.embyAccessToken = "";
+    node.embyUserId = "";
+    auth = await embyLogin(node);
+  }
+  await persistEmbyCredentials(env, node.name, auth);
+  const item = await embyPickPlayItem(auth, node);
+  const sessionMeta = await embyPlaybackInfo(auth, item.Id);
+  const streamInfo = await embyPullStreamSample(auth, sessionMeta, item.Id);
+  await sleepMs(200 + Math.floor(Math.random() * 300));
+  const startedAt = Date.now();
+  await embyPostSession(auth, "/Sessions/Playing", buildPlayingPayload(auth, item, sessionMeta, 0));
+
+  const title = itemDisplayTitle(item);
+  await ensureWatchSessionsTable(env);
+  const nextTickAt = startedAt + 60 * 1000;
+  const result = await env.DB.prepare(`
+    INSERT INTO sim_watch_sessions (
+      node, display_name, source, note, title, item_id, media_source_id, play_session_id,
+      base_url, access_token, user_id, device_id, device_name, client_profile,
+      target_duration_sec, started_at, last_tick_at, next_tick_at, tick_count, status, error, remain_days, renew_days
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'running', '', ?, ?)
+  `).bind(
+    node.name,
+    node.displayName || node.name,
+    source,
+    note || "",
+    title,
+    item.Id || "",
+    sessionMeta.mediaSourceId || "",
+    sessionMeta.playSessionId || "",
+    auth.base || "",
+    auth.token || "",
+    auth.userId || "",
+    auth.deviceId || "",
+    auth.device || "",
+    auth.profile?.id || node.clientProfile || "",
+    targetDurationSec,
+    startedAt,
+    startedAt,
+    nextTickAt,
+    Number.isFinite(Number(remainDays)) ? Number(remainDays) : 0,
+    Number.isFinite(Number(renewDays)) ? Number(renewDays) : Number(node.renewDays || 0)
+  ).run();
+
+  return {
+    sessionId: Number(result?.meta?.last_row_id || 0),
+    title,
+    itemId: item.Id,
+    targetDurationSec,
+    startedAt,
+    stream: streamInfo
+  };
+}
+
+async function processWatchSessions(env) {
+  if (!env.DB) return { ok: false, skipped: true };
+  await ensureWatchSessionsTable(env);
+  const now = Date.now();
+  const rows = await env.DB.prepare(`
+    SELECT * FROM sim_watch_sessions
+    WHERE status = 'running' AND next_tick_at <= ?
+    ORDER BY next_tick_at ASC
+    LIMIT 5
+  `).bind(now).all();
+  const list = rows.results || [];
+  if (!list.length) return { ok: true, count: 0 };
+  const results = [];
+  for (const row of list) {
+    try {
+      results.push(await tickWatchSession(env, row, now));
+    } catch (err) {
+      const error = errMessage(err);
+      try {
+        const auth = authFromSession(row);
+        const elapsedSec = Math.max(0, Math.floor((now - Number(row.started_at || now)) / 1000));
+        await embyPostSession(
+          auth,
+          "/Sessions/Playing/Stopped",
+          buildPlayingPayload(auth, { Id: row.item_id }, {
+            mediaSourceId: row.media_source_id,
+            playSessionId: row.play_session_id
+          }, embyTicks(elapsedSec), { stop: true })
+        );
+      } catch {}
+      await env.DB.prepare(`UPDATE sim_watch_sessions SET status = 'failed', error = ?, last_tick_at = ? WHERE id = ?`)
+        .bind(error.slice(0, 500), now, row.id).run();
+      try {
+        await insertWatchLog(env, {
+          node: row.node,
+          displayName: row.display_name || row.node,
+          ts: now,
+          source: row.source || "manual",
+          note: `进行中失败：${error}`.slice(0, 300),
+          durationSec: Math.max(0, Math.round((now - Number(row.started_at || now)) / 1000)),
+          startedAt: Number(row.started_at || now),
+          endedAt: now,
+          title: row.title ? `${row.title}（失败）` : "（失败）",
+          itemId: row.item_id || ""
+        });
+      } catch {}
+      try {
+        await notifySimulatedWatchFailure(env, {
+          node: row.node,
+          displayName: row.display_name || row.node,
+          source: row.source || "manual",
+          error,
+          endedAt: now
+        }, { remainDays: row.remain_days, renewDays: row.renew_days });
+      } catch {}
+      results.push({ ok: false, id: row.id, error });
+    }
+  }
+  return { ok: true, count: results.length, results };
+}
+
+async function tickWatchSession(env, row, now = Date.now()) {
+  const startedAt = Number(row.started_at || now);
+  const target = Math.max(60, Number(row.target_duration_sec || 300));
+  const elapsedSec = Math.max(0, Math.floor((now - startedAt) / 1000));
+  const auth = authFromSession(row);
+  const item = { Id: row.item_id };
+  const sessionMeta = {
+    mediaSourceId: row.media_source_id,
+    playSessionId: row.play_session_id
+  };
+
+  if (elapsedSec >= target) {
+    const actualDurationSec = elapsedSec;
+    const stopPos = embyTicks(actualDurationSec * (0.96 + Math.random() * 0.03));
+    try {
+      await embyPostSession(auth, "/Sessions/Playing/Progress", {
+        ...buildPlayingPayload(auth, item, sessionMeta, stopPos, { stop: true }),
+        EventName: "timeupdate"
+      });
+    } catch {}
+    try {
+      await embyPostSession(auth, "/Sessions/Playing/Stopped", buildPlayingPayload(auth, item, sessionMeta, stopPos, { stop: true }));
+    } catch {}
+    try {
+      await embyFetchJSON(auth.base, `/Users/${auth.userId}/PlayedItems/${encodeURIComponent(item.Id)}`, {
+        method: "POST",
+        headers: embyAuthHeaders(auth),
+        body: {}
+      });
+    } catch {}
+
+    const endedAt = now;
+    await markKeepalivePlayback(env, row.node, endedAt);
+    const log = await insertWatchLog(env, {
+      node: row.node,
+      displayName: row.display_name || row.node,
+      ts: endedAt,
+      source: row.source || "manual",
+      note: row.note || "真实模拟观看完成",
+      durationSec: actualDurationSec,
+      startedAt,
+      endedAt,
+      title: row.title || "",
+      itemId: row.item_id || ""
+    });
+    await env.DB.prepare(`
+      UPDATE sim_watch_sessions
+      SET status = 'done', last_tick_at = ?, next_tick_at = ?, tick_count = tick_count + 1, error = ''
+      WHERE id = ?
+    `).bind(endedAt, endedAt, row.id).run();
+
+    const watch = {
+      ok: true,
+      node: row.node,
+      displayName: row.display_name || row.node,
+      source: row.source || "manual",
+      note: log.note,
+      durationSec: actualDurationSec,
+      startedAt,
+      endedAt,
+      title: row.title || "",
+      itemId: row.item_id || "",
+      ts: endedAt,
+      log
+    };
+    try {
+      await notifySimulatedWatch(env, watch, {
+        remainDays: row.remain_days,
+        renewDays: row.renew_days
+      });
+    } catch (err) {
+      console.log("notify complete failed", errMessage(err));
+    }
+    return { ok: true, id: row.id, done: true, title: row.title };
+  }
+
+  const ratio = Math.min(0.95, elapsedSec / target);
+  const pos = embyTicks(target * ratio);
+  await embyPostSession(auth, "/Sessions/Playing/Progress", {
+    ...buildPlayingPayload(auth, item, sessionMeta, pos),
+    EventName: "timeupdate"
+  });
+  if (Number(row.tick_count || 0) % 2 === 0) {
+    try { await embyPullStreamSample(auth, sessionMeta, item.Id); } catch {}
+  }
+  const nextTickAt = now + 60 * 1000;
+  await env.DB.prepare(`
+    UPDATE sim_watch_sessions
+    SET last_tick_at = ?, next_tick_at = ?, tick_count = tick_count + 1
+    WHERE id = ?
+  `).bind(now, nextTickAt, row.id).run();
+  return { ok: true, id: row.id, done: false, elapsedSec, target };
+}
+
+async function performSimulatedWatch(env, options = {}) {
+  const name = normalizeName(options.name || options.node || "");
+  const node = options.node || await getNode(env, name);
+  if (!node) return { ok: false, error: "node not found" };
+  try {
+    const started = await startWatchSession(env, {
+      node,
+      source: options.source || "manual",
+      note: options.note || "",
+      remainDays: options.remainDays,
+      renewDays: options.renewDays
+    });
+    return {
+      ok: true,
+      pending: true,
+      accepted: true,
+      ...started,
+      node: node.name,
+      displayName: node.displayName || node.name
+    };
+  } catch (err) {
+    const endedAt = Date.now();
+    const failed = {
+      ok: false,
+      node: node.name,
+      displayName: node.displayName || node.name,
+      source: options.source || "manual",
+      error: errMessage(err),
+      startedAt: Number(options.startedAt || endedAt),
+      endedAt,
+      title: "",
+      durationSec: 0
+    };
+    try {
+      await insertWatchLog(env, {
+        node: node.name,
+        displayName: node.displayName || node.name,
+        ts: endedAt,
+        source: options.source || "manual",
+        note: `失败：${failed.error}`.slice(0, 300),
+        durationSec: 0,
+        startedAt: failed.startedAt,
+        endedAt,
+        title: "（失败）",
+        itemId: ""
+      });
+    } catch {}
+    if (options.notify !== false) {
+      try { failed.notify = await notifySimulatedWatchFailure(env, failed, options); } catch {}
+    }
+    return failed;
+  }
+}
+
+async function notifySimulatedWatch(env, watch, options = {}) {
+  if (!env.TG_BOT_TOKEN || !telegramChatIds(env).length) {
+    return { ok: false, skipped: true };
+  }
+  const sourceLabel = watch.source === "auto" ? "自动模拟" : "手动模拟";
+  const lines = [
+    "👀 模拟观看完成",
+    `站点：${watch.displayName || watch.node}`,
+    `节点：${watch.node}`,
+    `内容：${watch.title || "未知条目"}`,
+    `开始：${formatDateTime(watch.startedAt || watch.ts)}`,
+    `结束：${formatDateTime(watch.endedAt || watch.ts)}`,
+    `时长：${formatDurationSec(watch.durationSec)}`,
+    `来源：${sourceLabel}`
+  ];
+  if (watch.itemId) lines.push(`条目ID：${watch.itemId}`);
+  if (options.remainDays != null && Number.isFinite(Number(options.remainDays))) {
+    lines.push(`触发时剩余：${Number(options.remainDays)} 天`);
+  }
+  if (options.renewDays != null && Number.isFinite(Number(options.renewDays))) {
+    lines.push(`周期：${Number(options.renewDays)} 天`);
+  }
+  if (watch.note) lines.push(`备注：${watch.note}`);
+  return sendTelegramReportText(env, lines.join("\n"));
+}
+
+async function notifySimulatedWatchFailure(env, watch, options = {}) {
+  if (!env.TG_BOT_TOKEN || !telegramChatIds(env).length) {
+    return { ok: false, skipped: true };
+  }
+  const sourceLabel = watch.source === "auto" ? "自动模拟" : "手动模拟";
+  const lines = [
+    "⚠️ 模拟观看失败",
+    `站点：${watch.displayName || watch.node}`,
+    `节点：${watch.node}`,
+    `来源：${sourceLabel}`,
+    `时间：${formatDateTime(watch.endedAt || Date.now())}`,
+    `原因：${watch.error || "unknown"}`
+  ];
+  return sendTelegramReportText(env, lines.join("\n"));
+}
+
+async function runAutoSimulatedWatches(env) {
+  if (!env.DB) return { ok: false, skipped: true, reason: "missing DB" };
+  const statuses = await getKeepaliveStatuses(env);
+  const targets = statuses.filter((item) => item.status === "due" || item.status === "warn");
+  if (!targets.length) return { ok: true, skipped: true, reason: "no due nodes", count: 0 };
+  const results = [];
+  for (const item of targets) {
+    try {
+      const node = await getNode(env, item.node);
+      if (!node?.embyUser || !(node.embyPassword || node.embyAccessToken)) {
+        await notifySimulatedWatchFailure(env, {
+          node: item.node,
+          displayName: item.displayName || item.node,
+          source: "auto",
+          error: "节点未配置 Emby 用户名/密码，无法真实模拟观看",
+          endedAt: Date.now()
+        }, {});
+        results.push({ ok: false, node: item.node, error: "missing emby credentials" });
+        continue;
+      }
+      if (await hasRunningWatchSession(env, item.node)) {
+        results.push({ ok: true, node: item.node, skipped: true, reason: "already running" });
+        continue;
+      }
+      const note = item.status === "due"
+        ? `自动真实模拟：已超期 ${Math.abs(item.remainDays)} 天`
+        : `自动真实模拟：剩余 ${item.remainDays} 天触发`;
+      const started = await startWatchSession(env, {
+        node,
+        source: "auto",
+        note,
+        remainDays: item.remainDays,
+        renewDays: item.renewDays
+      });
+      results.push({ ok: true, node: item.node, ...started });
+    } catch (err) {
+      results.push({ ok: false, node: item.node, error: errMessage(err) });
+    }
+  }
+  return { ok: results.every((item) => item.ok), count: results.length, results };
+}
+
+async function ensureWatchLogsTable(env) {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS watch_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      node TEXT NOT NULL,
+      display_name TEXT DEFAULT '',
+      ts INTEGER NOT NULL,
+      source TEXT DEFAULT 'manual',
+      note TEXT DEFAULT '',
+      duration_sec INTEGER DEFAULT 0,
+      started_at INTEGER DEFAULT 0,
+      ended_at INTEGER DEFAULT 0,
+      title TEXT DEFAULT '',
+      item_id TEXT DEFAULT ''
+    )
+  `).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_watch_logs_ts ON watch_logs(ts)`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_watch_logs_node_ts ON watch_logs(node, ts)`).run();
+  await ensureColumns(env, "watch_logs", {
+    display_name: "TEXT DEFAULT ''",
+    source: "TEXT DEFAULT 'manual'",
+    note: "TEXT DEFAULT ''",
+    duration_sec: "INTEGER DEFAULT 0",
+    started_at: "INTEGER DEFAULT 0",
+    ended_at: "INTEGER DEFAULT 0",
+    title: "TEXT DEFAULT ''",
+    item_id: "TEXT DEFAULT ''"
+  });
+}
+
+async function insertWatchLog(env, entry) {
+  await ensureWatchLogsTable(env);
+  const node = normalizeName(entry.node || "");
+  const displayName = cleanString(entry.displayName || entry.display_name || node);
+  const ts = Number(entry.ts || Date.now());
+  const source = cleanString(entry.source || "manual") || "manual";
+  const note = cleanString(entry.note || "");
+  const durationSec = Math.max(0, Math.round(Number(entry.durationSec ?? entry.duration_sec ?? 0)));
+  const startedAt = Number(entry.startedAt ?? entry.started_at ?? 0) || 0;
+  const endedAt = Number(entry.endedAt ?? entry.ended_at ?? ts) || ts;
+  const title = cleanString(entry.title || "");
+  const itemId = cleanString(entry.itemId || entry.item_id || "");
+  const result = await env.DB.prepare(`
+    INSERT INTO watch_logs (node, display_name, ts, source, note, duration_sec, started_at, ended_at, title, item_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(node, displayName, ts, source, note, durationSec, startedAt, endedAt, title, itemId).run();
+  return {
+    id: Number(result?.meta?.last_row_id || 0),
+    node,
+    displayName,
+    ts,
+    source,
+    note,
+    durationSec,
+    startedAt,
+    endedAt,
+    title,
+    itemId
+  };
+}
+
+async function listWatchLogs(env, options = {}) {
+  if (!env.DB) {
+    return [];
+  }
+  await ensureWatchLogsTable(env);
+  const days = Math.max(1, Math.min(30, Number(options.days || 3) || 3));
+  const limit = Math.max(1, Math.min(200, Number(options.limit || 100) || 100));
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const rows = await env.DB.prepare(`
+    SELECT id, node, display_name, ts, source, note, duration_sec, started_at, ended_at, title, item_id
+    FROM watch_logs
+    WHERE ts >= ?
+    ORDER BY ts DESC
+    LIMIT ?
+  `).bind(cutoff, limit).all();
+  return (rows.results || []).map((row) => ({
+    id: Number(row.id || 0),
+    node: row.node || "",
+    displayName: row.display_name || row.node || "",
+    ts: Number(row.ts || 0),
+    source: row.source || "manual",
+    note: row.note || "",
+    durationSec: Number(row.duration_sec || 0),
+    startedAt: Number(row.started_at || 0),
+    endedAt: Number(row.ended_at || row.ts || 0),
+    title: row.title || "",
+    itemId: row.item_id || "",
+    durationText: formatDurationSec(row.duration_sec || 0),
+    time: formatDateTime(row.ts)
+  }));
 }
 
 async function cleanOldVisitorLogs(env) {
@@ -2014,6 +3082,15 @@ async function cleanOldVisitorLogs(env) {
   }
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
   await env.DB.prepare(`DELETE FROM visitor_logs WHERE ts < ?`).bind(cutoff).run();
+}
+
+async function cleanOldWatchLogs(env) {
+  if (!env.DB) {
+    return;
+  }
+  await ensureWatchLogsTable(env);
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  await env.DB.prepare(`DELETE FROM watch_logs WHERE ts < ?`).bind(cutoff).run();
 }
 
 async function pingTarget(target) {
@@ -2693,11 +3770,12 @@ async function sendTelegramReport(env, options = {}) {
 
 async function buildTelegramReport(env, section = "full") {
   const stats = await getStats(env);
-  const [traffic, nodes, keepalive, dns] = await Promise.all([
+  const [traffic, nodes, keepalive, dns, watchLogs] = await Promise.all([
     getCFTraffic(env, "today").catch((err) => ({ ok: false, error: errMessage(err) })),
     listNodesWithKeepalive(env).catch(() => []),
     getKeepaliveStatuses(env).catch(() => []),
-    getDNSRecordsCompat(env).catch((err) => ({ success: false, error: errMessage(err), result: [] }))
+    getDNSRecordsCompat(env).catch((err) => ({ success: false, error: errMessage(err), result: [] })),
+    listWatchLogs(env, { days: 3, limit: 20 }).catch(() => [])
   ]);
   const rows = stats.today || [];
   const enabled = nodes.filter((node) => node.enabled).length;
@@ -2784,11 +3862,25 @@ async function buildTelegramReport(env, section = "full") {
     sections.recent.push("暂无播放记录");
   }
 
+  sections.watch = ["👀 最近 3 天模拟观看"];
+  if (watchLogs.length) {
+    watchLogs.slice(0, 12).forEach((item, index) => {
+      const site = item.displayName || item.node || "-";
+      const title = item.title || "未知内容";
+      const time = item.time || formatDateTime(item.ts);
+      const source = item.source === "auto" ? "自动" : "手动";
+      const duration = item.durationText || formatDurationSec(item.durationSec || 0);
+      sections.watch.push(`${index + 1}. ${site} · ${title} · ${time} · ${duration} · ${source}`);
+    });
+  } else {
+    sections.watch.push("暂无模拟观看记录");
+  }
+
   const header = [
     "📡 媒体线路日报",
     `📅 ${stats.day} · ${formatDateTime(Date.now()).slice(11)} 自动汇总`
   ];
-  const sectionKeys = ["today", "playback", "traffic", "keepalive", "health", "dns", "recent"];
+  const sectionKeys = ["today", "playback", "traffic", "keepalive", "watch", "health", "dns", "recent"];
   const selected = section === "full" || !sections[section] ? sectionKeys : [section];
   const lines = [...header];
   for (const key of selected) {
@@ -2809,11 +3901,14 @@ function buildTelegramKeyboard(env, section = "full") {
       { text: "⏰ 观看提醒", callback_data: "report:keepalive" }
     ],
     [
+      { text: "👀 模拟观看", callback_data: "report:watch" },
+      { text: "🧾 最近播放", callback_data: "report:recent" }
+    ],
+    [
       { text: "🚦 线路健康", callback_data: "report:health" },
       { text: "🧭 DNS 状态", callback_data: "report:dns" }
     ],
     [
-      { text: "🧾 最近播放", callback_data: "report:recent" },
       { text: section === "full" ? "🔄 刷新日报" : "📡 完整日报", callback_data: "refresh_stats" }
     ]
   ];
@@ -2851,32 +3946,8 @@ function aggregateNodeRows(rows) {
 }
 
 async function sendKeepaliveReminders(env) {
-  if (!env.TG_BOT_TOKEN || !telegramChatIds(env).length || !env.DB) {
-    return { ok: false, skipped: true };
-  }
-  const day = beijingDay();
-  const statuses = await getKeepaliveStatuses(env);
-  const due = statuses.filter((item) => item.status === "due" || item.status === "warn")
-    .filter((item) => item.lastNotifyDay !== day);
-  if (!due.length) {
-    return { ok: true, skipped: true, reason: "no reminders" };
-  }
-  const lines = ["观看提醒", `日期: ${day}`];
-  for (const item of due) {
-    const tag = item.status === "due" ? "已超期" : "即将到期";
-    const last = item.lastPlayTs ? formatDateTime(item.lastPlayTs) : "无真实播放记录";
-    lines.push(`- ${item.displayName}: ${tag}, 剩余 ${item.remainDays} 天, 上次观看 ${last}`);
-  }
-  const sent = await sendTelegramReportText(env, lines.join("\n"));
-  if (sent.ok) {
-    await ensureKeepaliveTable(env);
-    await env.DB.batch(due.map((item) => env.DB.prepare(`
-      UPDATE keepalive_state
-      SET last_notify_day = ?, notify_count = notify_count + 1
-      WHERE node = ?
-    `).bind(day, item.node)));
-  }
-  return { ok: sent.ok, count: due.length, result: sent };
+  // 兼容旧调用：到期/提醒窗口改为自动模拟观看，并实时推送 TG
+  return runAutoSimulatedWatches(env);
 }
 
 async function handleTelegramWebhook(request, env) {
@@ -3327,80 +4398,641 @@ function adminHTML(env = {}) {
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
 <title>媒体线路控制台</title>
 <style>
-:root{color-scheme:light;--primary:#007aff;--primary-hover:#0066d6;--bg:#f5f5f7;--card:rgba(255,255,255,.82);--text:#1d1d1f;--text-sec:#6e6e73;--border:rgba(60,60,67,.18);--danger:#ff3b30;--ok:#34c759;--warn:#ff9500;--violet:#5856d6;--cyan:#32ade6;--radius-card:12px;--shadow:0 8px 24px rgba(0,0,0,.06)}
-body.dark{color-scheme:dark;--primary:#0a84ff;--primary-hover:#409cff;--bg:#111113;--card:rgba(28,28,30,.82);--text:#f5f5f7;--text-sec:#a1a1a6;--border:rgba(235,235,245,.16);--shadow:0 10px 30px rgba(0,0,0,.24)}
+:root{
+  /* Trust / Professional default */
+  --bg0:#F8FAFC;
+  --bg1:#FFFFFF;
+  --bg-glow-a:rgba(37,99,235,.10);
+  --bg-glow-b:rgba(14,165,233,.08);
+  --ink:#1E293B;          /* deep slate, not pure black */
+  --ink-2:#334155;
+  --muted:#64748B;
+  --line:rgba(15,23,42,.10);
+  --line-strong:rgba(15,23,42,.16);
+  --glass:rgba(255,255,255,.72);
+  --glass-strong:rgba(255,255,255,.88);
+  --glass-soft:rgba(248,250,252,.66);
+  --highlight:rgba(255,255,255,.9);
+  --shadow:0 10px 28px rgba(15,23,42,.06);
+  --shadow-lg:0 22px 50px rgba(15,23,42,.10);
+  --accent:#2563EB;       /* Klein blue */
+  --accent-2:#3B82F6;
+  --accent-ink:#1D4ED8;
+  --accent-soft:rgba(37,99,235,.12);
+  --neon:#2563EB;
+  --neon-2:#06B6D4;
+  --ok:#059669;
+  --warn:#D97706;
+  --danger:#E11D48;
+  --grad-accent:linear-gradient(135deg,#2563EB 0%,#3B82F6 55%,#06B6D4 100%);
+  --grad-text:linear-gradient(90deg,#1E293B 0%,#2563EB 100%);
+  --grad-border:linear-gradient(135deg,rgba(37,99,235,.55),rgba(6,182,212,.45));
+  --radius:18px;
+  --radius-sm:12px;
+  --font:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Noto Sans SC","Microsoft YaHei",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --blur:20px;
+  --ease:cubic-bezier(.22,1,.36,1);
+  --grid-line:rgba(15,23,42,.035);
+  color-scheme:light;
+}
+
+/* Cyber dark */
+body.theme-cyber{
+  color-scheme:dark;
+  --bg0:#0B0B0C;
+  --bg1:#0B0B0C;
+  --bg-glow-a:rgba(0,245,212,.10);
+  --bg-glow-b:rgba(255,0,122,.08);
+  --ink:#E8EEF5;          /* soft off-white, not pure white */
+  --ink-2:#C7D0DB;
+  --muted:#9AA6B2;
+  --line:rgba(255,255,255,.08);
+  --line-strong:rgba(255,255,255,.14);
+  --glass:rgba(30,31,34,.78);     /* #1E1F22 */
+  --glass-strong:rgba(30,31,34,.92);
+  --glass-soft:rgba(30,31,34,.62);
+  --highlight:rgba(255,255,255,.08);
+  --shadow:0 12px 36px rgba(0,0,0,.45);
+  --shadow-lg:0 28px 70px rgba(0,0,0,.55);
+  --accent:#00F5D4;
+  --accent-2:#FF007A;
+  --accent-ink:#00F5D4;
+  --accent-soft:rgba(0,245,212,.12);
+  --neon:#00F5D4;
+  --neon-2:#FF007A;
+  --ok:#00F5D4;
+  --warn:#FBBF24;
+  --danger:#FF007A;
+  --grad-accent:linear-gradient(135deg,#00F5D4 0%,#22D3EE 45%,#FF007A 100%);
+  --grad-text:linear-gradient(90deg,#E8EEF5 0%,#00F5D4 55%,#FF007A 100%);
+  --grad-border:linear-gradient(135deg,rgba(0,245,212,.7),rgba(255,0,122,.55));
+  --grid-line:rgba(0,245,212,.045);
+}
+
+/* Trust / professional explicit (also default :root) */
+body.theme-trust{
+  color-scheme:light;
+  --bg0:#F8FAFC;
+  --bg1:#FFFFFF;
+  --bg-glow-a:rgba(37,99,235,.10);
+  --bg-glow-b:rgba(37,99,235,.05);
+  --ink:#1E293B;
+  --ink-2:#334155;
+  --muted:#64748B;
+  --line:rgba(15,23,42,.10);
+  --line-strong:rgba(15,23,42,.16);
+  --glass:rgba(255,255,255,.76);
+  --glass-strong:rgba(255,255,255,.92);
+  --glass-soft:rgba(248,250,252,.7);
+  --highlight:rgba(255,255,255,.95);
+  --shadow:0 10px 28px rgba(15,23,42,.06);
+  --shadow-lg:0 22px 50px rgba(15,23,42,.10);
+  --accent:#2563EB;
+  --accent-2:#3B82F6;
+  --accent-ink:#1D4ED8;
+  --accent-soft:rgba(37,99,235,.12);
+  --neon:#2563EB;
+  --neon-2:#3B82F6;
+  --ok:#059669;
+  --warn:#D97706;
+  --danger:#E11D48;
+  --grad-accent:linear-gradient(135deg,#1D4ED8 0%,#2563EB 50%,#38BDF8 100%);
+  --grad-text:linear-gradient(90deg,#0F172A 10%,#2563EB 100%);
+  --grad-border:linear-gradient(135deg,rgba(37,99,235,.5),rgba(56,189,248,.4));
+  --grid-line:rgba(15,23,42,.035);
+}
+
 *{box-sizing:border-box}
-[hidden]{display:none!important}
-html,body{min-height:100%;margin:0;background:var(--bg);color:var(--text);font:13px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;-webkit-text-size-adjust:100%}
-body{padding:14px 14px 88px;transition:background-color .25s,color .25s;background:linear-gradient(180deg,#fbfbfd 0,#f5f5f7 42%,#f2f2f7 100%)}
-body.dark{background:linear-gradient(180deg,#141416 0,#111113 100%)}
+html,body{margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  min-height:100vh;
+  font-family:var(--font);
+  color:var(--ink);
+  background:
+    radial-gradient(900px 480px at 8% -8%, var(--bg-glow-a), transparent 55%),
+    radial-gradient(700px 420px at 100% 0%, var(--bg-glow-b), transparent 50%),
+    linear-gradient(180deg,var(--bg1),var(--bg0));
+  background-attachment:fixed;
+  padding:18px 18px 96px;
+  line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+}
+body:before{
+  content:"";
+  position:fixed;inset:0;pointer-events:none;z-index:0;
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size:48px 48px;
+  mask-image:radial-gradient(ellipse at center, #000 18%, transparent 75%);
+}
+body.theme-cyber:after{
+  content:"";
+  position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:
+    radial-gradient(600px 280px at 15% 20%, rgba(0,245,212,.06), transparent 60%),
+    radial-gradient(500px 260px at 85% 15%, rgba(255,0,122,.05), transparent 60%);
+}
 button,input,select,textarea{font:inherit}
 button{cursor:pointer}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-.login-shell{min-height:calc(100vh - 28px);display:grid;place-items:center}
-.login-box{width:min(340px,100%);display:grid;gap:10px}
-.login-shell input{width:100%;height:42px;border:1px solid var(--border);border-radius:11px;background:var(--card);color:var(--text);padding:0 14px;text-align:center;font-size:14px;box-shadow:var(--shadow);backdrop-filter:blur(16px)}
-.login-shell .btn{width:100%;height:38px;border-radius:11px}
-.login-error{display:none}
-.login-shell input:focus,.search-input:focus,input:focus,select:focus,textarea:focus{outline:0;border-color:var(--primary);box-shadow:0 0 0 3px rgba(0,113,227,.16)}
-.app{display:none}.authed .login-shell{display:none}.authed .app{display:block}
-.container{width:min(1180px,100%);margin:0 auto;display:flex;flex-direction:column;gap:12px}
-.topbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
-.brand h1{margin:0;font-size:22px;letter-spacing:0;line-height:1.12}.brand p{margin:4px 0 0;color:var(--text-sec);font-size:12px}
-.actions,.toolbar,.card-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.btn{min-height:34px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.72);color:var(--text);padding:0 11px;font-weight:650;display:inline-flex;align-items:center;justify-content:center;gap:6px;transition:.16s;white-space:nowrap;box-shadow:0 1px 2px rgba(0,0,0,.03);backdrop-filter:blur(14px)}
-body.dark .btn{background:rgba(44,44,46,.72)}
-.btn:hover{border-color:rgba(0,122,255,.36);color:var(--primary);transform:translateY(-1px);box-shadow:0 5px 14px rgba(0,0,0,.07)}
-.btn.primary{background:var(--primary);border-color:var(--primary);color:#fff;box-shadow:0 5px 14px rgba(0,122,255,.22)}
-.btn.green{background:rgba(52,199,89,.1);border-color:rgba(52,199,89,.28);color:var(--ok)}.btn.orange{background:rgba(255,149,0,.1);border-color:rgba(255,149,0,.3);color:var(--warn)}.btn.violet{background:rgba(88,86,214,.1);border-color:rgba(88,86,214,.28);color:var(--violet)}.btn.cyan{background:rgba(50,173,230,.1);border-color:rgba(50,173,230,.28);color:var(--cyan)}.btn.danger{color:var(--danger);border-color:rgba(255,59,48,.28);background:rgba(255,59,48,.08)}.btn.small{min-height:28px;padding:0 8px;font-size:12px;border-radius:8px}
-.btn.icon{width:34px;padding:0;font-size:16px}
-.status-pill{font-size:12px;font-weight:650;padding:7px 10px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.62);display:inline-flex;gap:7px;align-items:center;backdrop-filter:blur(14px)}
-body.dark .status-pill{background:rgba(44,44,46,.62)}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 6px var(--ok)}
+button:disabled{opacity:.5;cursor:not-allowed}
+a{color:var(--accent-ink)}
+.mono{font-family:var(--mono)}
+
+/* micro-gradient text utility */
+.grad-text{
+  background:var(--grad-text);
+  -webkit-background-clip:text;background-clip:text;
+  color:transparent;
+}
+.grad-border{
+  position:relative;
+}
+.grad-border:before{
+  content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;
+  background:var(--grad-border);
+  -webkit-mask:linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  pointer-events:none;
+}
+
+.app{display:none;position:relative;z-index:1}
+body.authed .app{display:block}
+body.authed .login-shell{display:none}
+.login-shell{position:relative;z-index:1;min-height:calc(100vh - 36px);display:grid;place-items:center;padding:18px}
+.glass{
+  background:var(--glass);
+  border:1px solid var(--line);
+  box-shadow:var(--shadow), inset 0 1px 0 var(--highlight);
+  backdrop-filter:blur(var(--blur)) saturate(1.25);
+  -webkit-backdrop-filter:blur(var(--blur)) saturate(1.25);
+}
+.login-box{
+  width:min(420px,100%);
+  padding:28px 24px 22px;
+  border-radius:24px;
+  display:grid;gap:12px;
+  animation:rise .5s var(--ease) both;
+}
+.login-visual{
+  width:52px;height:52px;border-radius:16px;
+  background:
+    linear-gradient(135deg, rgba(255,255,255,.45), transparent 42%),
+    var(--grad-accent);
+  box-shadow:0 14px 34px color-mix(in srgb, var(--accent) 28%, transparent), inset 0 1px 0 rgba(255,255,255,.45);
+}
+.login-box h1{margin:0;font-size:22px;letter-spacing:-.02em;color:var(--ink)}
+.login-box p{margin:0;color:var(--muted);font-size:13px;line-height:1.55}
+.login-box input{
+  width:100%;height:46px;border-radius:14px;border:1px solid var(--line);
+  background:var(--glass-strong);color:var(--ink);padding:0 14px;
+  box-shadow:inset 0 1px 0 var(--highlight);
+  transition:border-color .18s var(--ease), box-shadow .18s var(--ease);
+}
+.login-box input:focus{outline:none;border-color:color-mix(in srgb, var(--accent) 55%, transparent);box-shadow:0 0 0 4px var(--accent-soft), inset 0 1px 0 var(--highlight)}
+.login-box .btn{width:100%;height:46px;border-radius:14px}
+.login-error{color:var(--danger);font-size:12px;min-height:18px}
+
+.app-shell{
+  position:relative;z-index:1;
+  display:grid;grid-template-columns:252px minmax(0,1fr);gap:16px;
+  width:min(1380px,100%);margin:0 auto;align-items:start;
+}
+.sidebar{
+  position:sticky;top:16px;display:flex;flex-direction:column;gap:14px;
+  padding:16px;border-radius:24px;min-height:calc(100vh - 32px);
+  animation:rise .45s var(--ease) both;
+}
+.side-brand{display:flex;gap:12px;align-items:center;padding:4px 2px 10px}
+.side-logo{
+  width:44px;height:44px;border-radius:15px;flex:0 0 auto;
+  background:
+    linear-gradient(135deg, rgba(255,255,255,.42), transparent 42%),
+    var(--grad-accent);
+  box-shadow:0 12px 28px color-mix(in srgb, var(--accent) 26%, transparent), inset 0 1px 0 rgba(255,255,255,.45);
+}
+.side-brand b{display:block;font-size:13px;letter-spacing:-.01em;color:var(--ink);font-weight:720}
+.side-brand small{display:block;color:var(--muted);font-size:11px;margin-top:2px}
+.side-nav{display:grid;gap:6px}
+.side-link{
+  display:flex;align-items:center;gap:10px;min-height:44px;padding:0 12px;
+  border:1px solid transparent;border-radius:14px;background:transparent;
+  color:var(--muted);font-weight:720;text-align:left;
+  transition:transform .18s var(--ease), background .18s var(--ease), color .18s var(--ease), box-shadow .18s var(--ease), border-color .18s var(--ease);
+}
+.side-link:hover{background:var(--glass-soft);color:var(--ink);transform:translateX(2px)}
+.side-link.active{
+  color:#fff;border-color:transparent;
+  background:
+    linear-gradient(135deg, rgba(255,255,255,.2), transparent 42%),
+    var(--grad-accent);
+  box-shadow:0 12px 28px color-mix(in srgb, var(--accent) 26%, transparent), inset 0 1px 0 rgba(255,255,255,.28);
+}
+body.theme-cyber .side-link.active{
+  color:#0B0B0C;
+  text-shadow:none;
+  box-shadow:0 0 0 1px rgba(0,245,212,.25), 0 12px 28px rgba(0,245,212,.12), 0 0 24px rgba(255,0,122,.08);
+}
+.side-link .ico{width:18px;text-align:center;opacity:.95}
+.side-meta{margin-top:auto;display:grid;gap:8px;padding-top:12px;border-top:1px solid var(--line)}
+.side-stat{display:flex;justify-content:space-between;gap:8px;font-size:12px;color:var(--muted)}
+.side-stat b{color:var(--ink);font-variant-numeric:tabular-nums}
+.side-stat b.compact-value{max-width:148px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}
+
+.main-panel{display:grid;gap:14px;min-width:0}
+.hero-bar{
+  display:flex;justify-content:space-between;align-items:center;gap:14px;
+  padding:18px;border-radius:24px;
+  animation:rise .5s var(--ease) both;
+}
+.hero-bar h1{margin:0;font-size:18px;letter-spacing:-.02em;color:var(--ink);font-weight:760}
+.hero-bar p{margin:6px 0 0;color:var(--muted);font-size:12px}
+.hero-actions,.toolbar-inline,.actions,.toolbar,.card-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+
+/* top-right style switcher */
+.theme-switch{
+  display:inline-flex;align-items:center;gap:4px;padding:4px;
+  border-radius:14px;border:1px solid var(--line);
+  background:var(--glass-soft);
+  box-shadow:inset 0 1px 0 var(--highlight);
+}
+.theme-switch button{
+  min-height:32px;border:0;border-radius:10px;padding:0 12px;
+  background:transparent;color:var(--muted);font-size:12px;font-weight:760;
+  transition:all .16s var(--ease);
+}
+.theme-switch button.active{
+  color:#fff;
+  background:var(--grad-accent);
+  box-shadow:0 8px 18px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+body.theme-cyber .theme-switch button.active{color:#0B0B0C}
+
+.section-kicker{
+  display:inline-flex;align-items:center;gap:6px;
+  font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+  margin-bottom:4px;opacity:.72;
+  color:var(--muted);
+  background:none;-webkit-background-clip:initial;background-clip:initial;
+}
+.btn{
+  min-height:38px;border:1px solid var(--line);border-radius:12px;
+  background:var(--glass-strong);color:var(--ink);padding:0 13px;
+  font-weight:720;display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  box-shadow:inset 0 1px 0 var(--highlight), 0 1px 2px rgba(15,23,42,.04);
+  backdrop-filter:blur(14px);
+  transition:transform .16s var(--ease), box-shadow .16s var(--ease), filter .16s var(--ease);
+  white-space:nowrap;
+}
+.btn:hover{transform:translateY(-1px);box-shadow:0 10px 22px rgba(15,23,42,.10), inset 0 1px 0 var(--highlight)}
+.btn:active{transform:translateY(0)}
+.btn.primary{
+  color:#fff;border-color:transparent;
+  background:var(--grad-accent);
+  box-shadow:0 12px 26px color-mix(in srgb, var(--accent) 26%, transparent), inset 0 1px 0 rgba(255,255,255,.28);
+}
+body.theme-cyber .btn.primary{color:#0B0B0C}
+.btn.danger{
+  color:#fff;border-color:transparent;
+  background:linear-gradient(135deg,#FB7185,#E11D48);
+  box-shadow:0 12px 24px rgba(225,29,72,.22), inset 0 1px 0 rgba(255,255,255,.22);
+}
+body.theme-cyber .btn.danger{
+  background:linear-gradient(135deg,#FF4D9D,#FF007A);
+  box-shadow:0 0 0 1px rgba(255,0,122,.25), 0 12px 28px rgba(255,0,122,.18);
+}
+.btn.cyan{
+  color:#fff;border-color:transparent;
+  background:linear-gradient(135deg,#22D3EE,#0891B2);
+  box-shadow:0 12px 24px rgba(8,145,178,.22), inset 0 1px 0 rgba(255,255,255,.22);
+}
+body.theme-cyber .btn.cyan{
+  color:#0B0B0C;
+  background:linear-gradient(135deg,#00F5D4,#22D3EE);
+  box-shadow:0 0 0 1px rgba(0,245,212,.25), 0 12px 28px rgba(0,245,212,.14);
+}
+.btn.small{min-height:32px;padding:0 10px;font-size:12px;border-radius:10px}
+.btn.icon{width:38px;padding:0}
+
+.page,
+.panel-stack.page{display:none !important}
+.page.active,
+.panel-stack.page.active{display:grid !important;gap:14px;animation:rise .35s var(--ease) both}
+.panel,.stat-tile,.chart-card,.emby-card{
+  background:var(--glass);
+  border:1px solid var(--line);
+  box-shadow:var(--shadow), inset 0 1px 0 var(--highlight);
+  backdrop-filter:blur(var(--blur)) saturate(1.2);
+  -webkit-backdrop-filter:blur(var(--blur)) saturate(1.2);
+}
+body.theme-cyber .panel,
+body.theme-cyber .stat-tile,
+body.theme-cyber .chart-card,
+body.theme-cyber .emby-card{
+  background:var(--glass);
+  box-shadow:var(--shadow), inset 0 1px 0 rgba(255,255,255,.04), 0 0 0 1px rgba(0,245,212,.04);
+}
+.panel{border-radius:22px;overflow:hidden}
+.panel-head{
+  display:flex;justify-content:space-between;align-items:flex-start;gap:12px;
+  padding:16px 16px 12px;border-bottom:1px solid var(--line);
+  background:linear-gradient(180deg, var(--glass-soft), transparent);
+}
+.panel-head h2{margin:0;font-size:16px;letter-spacing:-.01em;color:var(--ink)}
+.panel-head p,.hint{margin:4px 0 0;color:var(--muted);font-size:12px;line-height:1.55}
+.panel-body{padding:16px}
+.panel-body.tight{padding:12px 16px 16px}
+.panel-stack{display:grid;gap:14px}
+.form-section{display:grid;gap:10px;margin:0 0 14px;padding:0 0 14px;border-bottom:1px dashed var(--line)}
+.form-section:last-child{margin:0;padding:0;border:0}
+.form-section-title{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.form-section-title b{font-size:13px;color:var(--ink)}
+.form-section-title span{color:var(--muted);font-size:11px}
+.form-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.node-form{grid-template-columns:repeat(12,minmax(0,1fr));gap:10px}
+.field{display:grid;gap:6px}
+.node-form .field{grid-column:span 3}
+.node-form .field.w2{grid-column:span 2}
+.node-form .field.w3{grid-column:span 3}
+.node-form .field.w4{grid-column:span 4}
+.node-form .field.w6{grid-column:span 6}
+.node-form .field.full,.node-form .field.w12,.field.full{grid-column:1/-1}
+.field label{color:var(--muted);font-size:11px;font-weight:760}
+.field input,.field textarea,.field select,.search-input{
+  width:100%;border:1px solid var(--line);border-radius:12px;
+  background:var(--glass-strong);color:var(--ink);min-height:38px;padding:8px 12px;
+  box-shadow:inset 0 1px 0 var(--highlight);
+  transition:border-color .16s var(--ease), box-shadow .16s var(--ease);
+}
+.field input:focus,.field textarea:focus,.field select:focus,.search-input:focus{
+  outline:none;border-color:color-mix(in srgb, var(--accent) 50%, transparent);
+  box-shadow:0 0 0 4px var(--accent-soft), inset 0 1px 0 var(--highlight)
+}
+.field textarea{min-height:72px;resize:vertical}
+.option-row{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.check{display:flex;align-items:center;gap:8px;min-height:36px;color:var(--ink);font-weight:640;font-size:13px}
+.check input,.ip-checkbox{width:16px;height:16px;accent-color:var(--accent)}
+.search-input{height:38px;min-width:220px}
+.chip-row{display:flex;flex-wrap:wrap;gap:6px}
+.chip{
+  min-height:26px;padding:0 10px;border-radius:999px;border:1px solid var(--line);
+  background:var(--glass-soft);color:var(--muted);font-size:11px;font-weight:760;
+  display:inline-flex;align-items:center;gap:6px;
+  box-shadow:inset 0 1px 0 var(--highlight);
+}
+.chip.ok{color:var(--ok);background:color-mix(in srgb, var(--ok) 12%, transparent);border-color:color-mix(in srgb, var(--ok) 28%, transparent)}
+.chip.warn{color:var(--warn);background:color-mix(in srgb, var(--warn) 12%, transparent);border-color:color-mix(in srgb, var(--warn) 28%, transparent)}
+.chip.primary{color:var(--accent-ink);background:var(--accent-soft);border-color:color-mix(in srgb, var(--accent) 28%, transparent)}
+body.theme-cyber .chip.primary{color:var(--accent);box-shadow:0 0 12px rgba(0,245,212,.08)}
+.badge{
+  min-height:24px;border-radius:999px;font-size:11px;font-weight:760;display:inline-flex;align-items:center;
+  padding:0 9px;border:1px solid var(--line);background:var(--glass-soft);color:var(--muted)
+}
+.badge.ok{color:var(--ok);border-color:color-mix(in srgb, var(--ok) 30%, transparent);background:color-mix(in srgb, var(--ok) 12%, transparent)}
+.badge.warn{color:var(--warn);border-color:color-mix(in srgb, var(--warn) 30%, transparent);background:color-mix(in srgb, var(--warn) 12%, transparent)}
+
+.node-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
+.emby-card{
+  position:relative;overflow:hidden;display:flex;flex-direction:column;gap:0;
+  padding:0;border-radius:20px;min-width:0;
+  transition:transform .2s var(--ease), box-shadow .2s var(--ease);
+}
+.emby-card:before{
+  content:"";position:absolute;inset:0 auto 0 0;width:3px;
+  background:var(--grad-accent);
+}
+.emby-card:after{
+  content:"";position:absolute;right:-40px;top:-40px;width:120px;height:120px;border-radius:50%;
+  background:radial-gradient(circle, color-mix(in srgb, var(--accent) 18%, transparent), transparent 68%);
+  pointer-events:none;
+}
+.emby-card:hover{transform:translateY(-3px);box-shadow:var(--shadow-lg), inset 0 1px 0 var(--highlight)}
+body.theme-cyber .emby-card:hover{
+  box-shadow:0 0 0 1px rgba(0,245,212,.16), 0 18px 40px rgba(0,0,0,.45), 0 0 30px rgba(255,0,122,.06);
+}
+.emby-card .card-top{
+  display:flex;justify-content:space-between;align-items:flex-start;gap:10px;
+  padding:14px 14px 12px;border-bottom:1px solid var(--line);
+  background:linear-gradient(105deg, color-mix(in srgb, var(--accent) 10%, transparent), transparent 58%);
+}
+.card-title-group{display:flex;align-items:center;gap:10px;min-width:0}
+.emby-icon{
+  width:42px;height:42px;border-radius:14px;border:1px solid var(--line);
+  background:var(--glass-strong);display:grid;place-items:center;overflow:hidden;flex:0 0 auto;
+  box-shadow:inset 0 1px 0 var(--highlight);
+}
+.emby-icon img{width:100%;height:100%;object-fit:cover}
+.emby-icon span{font-size:18px}
+.card-title{min-width:0}
+.card-title b{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
+.card-title small{display:block;color:var(--muted);font-size:11px;margin-top:2px}
+.emby-card .card-body{display:grid;gap:8px;padding:12px 14px}
+.emby-card .card-footer{
+  display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;
+  margin-top:auto;padding:12px 14px;border-top:1px dashed var(--line);
+  background:linear-gradient(180deg, transparent, var(--glass-soft));
+}
+.info-row{display:grid;grid-template-columns:78px 1fr;gap:8px;align-items:start;font-size:12px}
+.info-label{color:var(--muted);font-weight:760}
+.info-value{min-width:0;text-align:left;word-break:break-all;color:var(--ink)}
+.masked{letter-spacing:1px;color:var(--muted)}
+.split-2{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(300px,.85fr);gap:14px}
+.table-wrapper{
+  width:100%;border:1px solid var(--line);border-radius:16px;overflow:auto;
+  background:var(--glass-soft);box-shadow:inset 0 1px 0 var(--highlight)
+}
+table{width:100%;border-collapse:collapse;min-width:720px}
+th,td{padding:12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle;color:var(--ink)}
+th{
+  color:var(--muted);font-weight:780;font-size:11px;letter-spacing:.03em;
+  background:color-mix(in srgb, var(--accent) 7%, transparent)
+}
+tr:last-child td{border-bottom:0}
+tr{transition:background .15s var(--ease)}
+tr:hover td{background:color-mix(in srgb, var(--accent) 5%, transparent)}
+.output{
+  min-height:180px;max-height:420px;overflow:auto;margin:0;
+  background:var(--glass-soft);color:var(--ink);border:1px solid var(--line);
+  border-radius:16px;padding:12px;font-size:11px;white-space:pre-wrap;word-break:break-word;
+  font-family:var(--mono);box-shadow:inset 0 1px 0 var(--highlight)
+}
+.empty{padding:34px 18px;text-align:center;color:var(--muted);grid-column:1/-1}
+.stat-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.stat-tile{
+  position:relative;overflow:hidden;padding:14px;border-radius:18px;
+  transition:transform .18s var(--ease), box-shadow .18s var(--ease);
+}
+.stat-tile:hover{transform:translateY(-2px);box-shadow:var(--shadow-lg), inset 0 1px 0 var(--highlight)}
+.stat-tile:before{
+  content:"";position:absolute;right:-18px;top:-18px;width:86px;height:86px;border-radius:50%;
+  background:radial-gradient(circle, color-mix(in srgb, var(--accent) 18%, transparent), transparent 70%);
+}
+.stat-tile span{display:block;color:var(--muted);font-size:11px;font-weight:780}
+.stat-tile b{display:block;margin-top:8px;font-size:22px;letter-spacing:-.03em;color:var(--ink)}
+.stat-tile em{display:block;margin-top:4px;font-style:normal;color:var(--muted);font-size:11px}
+.chart-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:12px}
+.chart-card{border-radius:18px;padding:14px;min-height:170px}
+.chart-card h3{margin:0 0 10px;font-size:14px;color:var(--ink)}
+.bar-row{display:grid;grid-template-columns:minmax(70px,130px) 1fr auto;gap:8px;align-items:center;margin:8px 0}
+.bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}
+.bar-track{height:8px;border-radius:999px;background:color-mix(in srgb, var(--muted) 18%, transparent);overflow:hidden}
+.bar-fill{
+  height:100%;border-radius:999px;background:var(--grad-accent);
+  box-shadow:0 0 12px color-mix(in srgb, var(--accent) 35%, transparent);
+  transition:width .45s var(--ease);
+}
+.bar-value{font-family:var(--mono);color:var(--ink);font-size:11px}
+.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:14px}
+.dialog-backdrop{
+  position:fixed;inset:0;z-index:9998;display:none;align-items:center;justify-content:center;padding:18px;
+  background:rgba(15,23,42,.28);backdrop-filter:blur(14px) saturate(1.15)
+}
+body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
+.dialog-backdrop.show{display:flex}
+.dialog-card{
+  width:min(420px,100%);border-radius:22px;padding:18px;
+  background:var(--glass-strong);border:1px solid var(--line);
+  box-shadow:var(--shadow-lg), inset 0 1px 0 var(--highlight);
+  backdrop-filter:blur(24px) saturate(1.25);
+  animation:rise .22s var(--ease) both;
+}
+.dialog-title{font-size:16px;font-weight:800;margin:0 0 6px;color:var(--ink)}
+.dialog-message{color:var(--muted);font-size:13px;line-height:1.55;white-space:pre-wrap;word-break:break-word}
+.dialog-input{
+  width:100%;min-height:160px;margin-top:12px;border:1px solid var(--line);border-radius:14px;
+  background:var(--glass);color:var(--ink);padding:10px;resize:vertical
+}
+.dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}
+.dialog-actions .btn{min-width:78px}
+.dialog-actions[hidden]{display:none !important}
+.toast{
+  position:fixed;left:50%;bottom:22px;z-index:10000;max-width:min(520px,calc(100vw - 28px));
+  padding:10px 14px;border-radius:12px;border:1px solid var(--line);
+  background:var(--glass-strong);color:var(--ink);box-shadow:var(--shadow-lg);
+  backdrop-filter:blur(18px);font-size:13px;line-height:1.45;white-space:pre-wrap;
+  opacity:0;transform:translate(-50%,12px);pointer-events:none;
+  transition:opacity .18s var(--ease),transform .18s var(--ease)
+}
+.toast.show{opacity:1;transform:translate(-50%,0)}
 .notice{display:none}
-.page-tabs{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:50;display:flex;gap:6px;align-items:center;flex-wrap:nowrap;border:1px solid rgba(255,255,255,.55);background:rgba(255,255,255,.62);padding:7px;border-radius:18px;box-shadow:0 16px 36px rgba(0,0,0,.14);backdrop-filter:blur(22px) saturate(1.4);-webkit-backdrop-filter:blur(22px) saturate(1.4);max-width:calc(100vw - 24px);overflow:auto}
-body.dark .page-tabs{border-color:rgba(235,235,245,.12);background:rgba(30,30,32,.62)}
-.page-tab{min-height:38px;border:1px solid transparent;border-radius:13px;background:transparent;color:var(--text-sec);padding:0 13px;font-weight:700;white-space:nowrap;transition:.16s}
-.page-tab:hover{color:var(--text);background:rgba(118,118,128,.12)}
-.page-tab.active{color:#fff;background:var(--primary);box-shadow:0 5px 16px rgba(0,122,255,.24)}
-.page{display:none}.page.active{display:block}
-.trace-grid.page.active,.metrics.page.active{display:grid}
-#toast{position:fixed;top:-70px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.85);color:#fff;padding:12px 22px;border-radius:30px;font-size:14px;font-weight:650;transition:top .28s;z-index:9999;max-width:90vw;text-align:center;word-break:break-word}#toast.show{top:20px}
-.dialog-backdrop{position:fixed;inset:0;z-index:9998;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(0,0,0,.18);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}.dialog-backdrop.show{display:flex}.dialog-card{width:min(390px,100%);border:1px solid rgba(255,255,255,.55);border-radius:18px;background:rgba(255,255,255,.84);box-shadow:0 24px 70px rgba(0,0,0,.22);padding:16px;transform:translateY(8px);animation:dialogIn .18s ease forwards}body.dark .dialog-card{background:rgba(30,30,32,.88);border-color:rgba(235,235,245,.12)}@keyframes dialogIn{to{transform:translateY(0)}}.dialog-title{font-size:16px;font-weight:750;margin:0 0 6px}.dialog-message{color:var(--text-sec);font-size:13px;line-height:1.55;white-space:pre-wrap;word-break:break-word}.dialog-input{width:100%;min-height:160px;margin-top:12px;border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.72);color:var(--text);padding:10px;resize:vertical}.dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}.dialog-actions .btn{min-width:74px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius-card);box-shadow:var(--shadow);padding:14px;position:relative;overflow:hidden;backdrop-filter:blur(18px)}
-.card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px}
-.card-head h2{margin:0;font-size:16px}.card-head p{margin:3px 0 0;color:var(--text-sec);font-size:12px}
-.trace-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
-.trace-box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:11px 12px;display:flex;gap:10px;align-items:center;min-width:0;box-shadow:var(--shadow);backdrop-filter:blur(18px)}
-.trace-icon{font-size:18px;line-height:1}.trace-label{color:var(--text-sec);font-size:11px}.trace-value{font-weight:650;font-size:13px;word-break:break-all}
-.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
-.metric{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px;box-shadow:var(--shadow);backdrop-filter:blur(18px)}.metric span{display:block;color:var(--text-sec);font-size:11px;font-weight:650}.metric b{display:block;margin-top:6px;font-size:22px;line-height:1;letter-spacing:0}
-.form-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.node-form{grid-template-columns:repeat(12,minmax(0,1fr));gap:10px}.field{display:grid;gap:5px}.node-form .field{grid-column:span 3;align-items:stretch}.node-form .field.w2{grid-column:span 2}.node-form .field.w4{grid-column:span 4}.node-form .field.w6{grid-column:span 6}.node-form .field.full{grid-column:span 6}.node-form .field.w12{grid-column:1/-1}.field.span2{grid-column:span 2}.field.full{grid-column:1/-1}.field label{color:var(--text-sec);font-size:11px;font-weight:650;line-height:1.2}.field input,.field textarea,.field select{width:100%;border:1px solid var(--border);border-radius:9px;background:rgba(255,255,255,.74);color:var(--text);min-height:32px;padding:6px 9px}.field textarea{min-height:58px;resize:vertical}.node-form .field.full textarea{min-height:62px}.check{display:flex;align-items:center;gap:7px;min-height:32px;color:var(--text);font-weight:600}.option-row{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;align-items:center}.option-row .check{min-height:30px}.check input,.ip-checkbox{width:16px;height:16px;accent-color:var(--primary)}
-body.dark .field input,body.dark .field textarea,body.dark .field select{background:rgba(44,44,46,.74)}
-.hint{color:var(--text-sec);font-size:11px;line-height:1.55}
-.search-input{height:34px;min-width:220px;border:1px solid var(--border);border-radius:9px;background:rgba(255,255,255,.74);color:var(--text);padding:0 10px}
-body.dark .search-input{background:rgba(44,44,46,.74)}
-.node-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
-.emby-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px;box-shadow:var(--shadow);display:flex;flex-direction:column;gap:10px;transition:.16s;min-width:0;backdrop-filter:blur(18px)}
-.emby-card:hover{box-shadow:0 10px 28px rgba(0,0,0,.09);transform:translateY(-1px)}
-.card-header{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;border-bottom:1px solid var(--border);padding-bottom:9px}
-.card-title-group{display:flex;align-items:center;gap:10px;min-width:0}.emby-icon{width:34px;height:34px;border-radius:9px;border:1px solid var(--border);background:rgba(118,118,128,.12);display:grid;place-items:center;overflow:hidden;flex:0 0 auto}.emby-icon img{width:100%;height:100%;object-fit:cover}.emby-icon span{font-size:18px}
-.card-title{min-width:0}.card-title b{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.card-title small{display:block;color:var(--text-sec);font-size:11px;margin-top:1px}
-.badge{min-height:22px;border-radius:999px;font-size:11px;font-weight:650;display:inline-flex;align-items:center;padding:0 8px;border:1px solid var(--border);background:rgba(118,118,128,.08);color:var(--text-sec)}.badge.ok{color:var(--ok);border-color:rgba(52,199,89,.28);background:rgba(52,199,89,.1)}.badge.warn{color:var(--warn);border-color:rgba(255,149,0,.28);background:rgba(255,149,0,.1)}
-.info-row{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;font-size:12px}.info-label{color:var(--text-sec);font-weight:600;flex:0 0 70px}.info-value{min-width:0;text-align:right;word-break:break-all}.masked{letter-spacing:1px;color:var(--text-sec)}
-.card-footer{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-top:auto;padding-top:9px;border-top:1px dashed var(--border)}
-.table-wrapper{width:100%;border:1px solid var(--border);border-radius:10px;overflow:auto;background:var(--card);backdrop-filter:blur(18px)}table{width:100%;border-collapse:collapse;min-width:720px}th,td{padding:9px 10px;border-bottom:1px solid var(--border);text-align:left;vertical-align:middle}th{color:var(--text-sec);font-weight:650;background:rgba(118,118,128,.08);font-size:11px}tr:last-child td{border-bottom:0}
-.output{min-height:180px;max-height:420px;overflow:auto;margin:0;background:rgba(255,255,255,.62);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px;font-size:11px;white-space:pre-wrap;word-break:break-word}.empty{padding:26px;text-align:center;color:var(--text-sec);grid-column:1/-1}
-body.dark .output{background:rgba(28,28,30,.62)}
-.two-col{display:grid;grid-template-columns:minmax(0,1.08fr) minmax(290px,.92fr);gap:12px}.dns-status{display:flex;gap:6px;flex-wrap:wrap}.modal-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:12px}.modal-head h2{margin:0;font-size:17px}.x{width:34px;height:34px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.72);color:var(--text-sec);font-size:18px}
-body.dark .x{background:rgba(44,44,46,.72)}
-.chart-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-bottom:12px}.chart-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px;min-height:170px;backdrop-filter:blur(18px)}.chart-card h3{margin:0 0 10px;font-size:14px}.bar-row{display:grid;grid-template-columns:minmax(70px,130px) 1fr auto;gap:8px;align-items:center;margin:8px 0}.bar-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-sec)}.bar-track{height:8px;border-radius:999px;background:rgba(118,118,128,.16);overflow:hidden}.bar-fill{height:100%;border-radius:999px;background:var(--primary)}.bar-value{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--text);font-size:11px}
-@media(max-width:900px){body{padding:10px 10px 86px}.trace-grid,.metrics,.two-col,.chart-grid{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr 1fr}.node-form{grid-template-columns:repeat(2,minmax(0,1fr))}.node-form .field,.node-form .field.w2,.node-form .field.w4,.node-form .field.w6,.node-form .field.full,.node-form .field.w12{grid-column:span 1}.option-row{grid-template-columns:repeat(2,minmax(0,1fr))}.field.span2,.field.full{grid-column:1/-1}.topbar{align-items:flex-start}.actions,.toolbar,.card-actions{width:100%}.actions .btn:not(.icon),.toolbar .btn,.card-actions .btn{flex:1}.page-tabs{bottom:10px;width:calc(100vw - 16px);justify-content:flex-start}.page-tab{min-height:38px;padding:0 11px;font-size:12px}.search-input{width:100%;min-width:0}.node-grid{grid-template-columns:1fr}.info-row{display:grid}.info-value{text-align:left}}
-@media(max-width:520px){.container{gap:10px}.card{padding:12px}.brand h1{font-size:20px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.metric b{font-size:20px}.form-grid,.node-form,.option-row{grid-template-columns:1fr}.node-form .field,.node-form .field.w2,.node-form .field.w4,.node-form .field.w6,.node-form .field.full,.node-form .field.w12{grid-column:1/-1}.node-grid{gap:10px}.topbar .actions{display:grid;grid-template-columns:1fr auto auto auto;gap:7px}.status-pill{min-width:0}.bar-row{grid-template-columns:80px 1fr}.bar-value{grid-column:2/3}.page-tabs{padding:6px;gap:4px}.page-tab{min-height:36px;padding:0 10px}.ip-table table,.ip-table thead,.ip-table tbody,.ip-table tr,.ip-table td{display:block;width:100%;min-width:0}.ip-table table{border-collapse:separate}.ip-table thead{display:none}.ip-table tr{position:relative;margin:10px 0;padding:12px;border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.58);box-shadow:0 6px 18px rgba(0,0,0,.05)}body.dark .ip-table tr{background:rgba(44,44,46,.58)}.ip-table td{border:0;padding:4px 0}.ip-table td:first-child{position:absolute;right:12px;top:12px;width:auto}.ip-table .ip-text{display:block;max-width:calc(100% - 42px);font-size:13px;word-break:break-all}.ip-table .latency:before{content:"延迟 ";color:var(--text-sec);font-weight:650}.ip-table .speed:before{content:"状态 ";color:var(--text-sec);font-weight:650}.ip-table .loc:before{content:"归属 ";color:var(--text-sec);font-weight:650}.ip-table td:last-child{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.ip-table td:last-child .btn{flex:1}.ip-table tr:not(.test-row) td{padding:16px 8px;text-align:center}.ip-table tr:not(.test-row) td:before{content:""}}
+.page-tabs{display:none !important}
+.mobile-nav{
+  display:none;position:fixed;left:50%;bottom:12px;transform:translateX(-50%);z-index:200;
+  gap:6px;padding:7px;border-radius:18px;max-width:calc(100vw - 16px);overflow:auto;
+  background:var(--glass-strong);border:1px solid var(--line);
+  box-shadow:var(--shadow-lg), inset 0 1px 0 var(--highlight);
+  backdrop-filter:blur(22px) saturate(1.25);
+}
+.mobile-nav .side-link{min-height:36px;padding:0 12px;font-size:12px;flex:0 0 auto}
+.dns-status{display:flex;gap:6px;flex-wrap:wrap}
+.x{
+  width:36px;height:36px;border:1px solid var(--line);border-radius:12px;
+  background:var(--glass-strong);color:var(--muted);font-size:18px
+}
+.status-pill{
+  display:inline-flex;align-items:center;gap:7px;min-height:34px;padding:0 10px;
+  border-radius:999px;border:1px solid var(--line);background:var(--glass-soft);
+  color:var(--muted);font-size:12px;font-weight:720
+}
+.status-pill .dot,.dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 4px color-mix(in srgb, var(--ok) 18%, transparent)}
+@keyframes rise{
+  from{opacity:0;transform:translateY(10px) scale(.992)}
+  to{opacity:1;transform:none}
+}
+@media (prefers-reduced-motion: reduce){
+  *{animation:none !important;transition:none !important}
+}
+@media(max-width:980px){
+  body{padding:12px 12px 88px}
+  .app-shell{grid-template-columns:1fr}
+  .sidebar{position:relative;top:0;min-height:auto;border-radius:20px}
+  .side-nav{display:none}
+  .mobile-nav{display:flex}
+  .stat-strip,.metrics,.chart-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .split-2{grid-template-columns:1fr}
+  .form-grid{grid-template-columns:1fr 1fr}
+  .node-form{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .node-form .field,.node-form .field.w2,.node-form .field.w3,.node-form .field.w4,.node-form .field.w6{grid-column:span 1}
+  .option-row{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(max-width:560px){
+  .hero-bar{flex-direction:column;align-items:flex-start}
+  .hero-actions,.toolbar-inline{width:100%}
+  .hero-actions .btn,.toolbar-inline .btn{flex:1}
+  .theme-switch{width:100%;justify-content:space-between}
+  .theme-switch button{flex:1}
+  .stat-strip,.metrics{grid-template-columns:1fr 1fr}
+  .chart-grid{grid-template-columns:1fr}
+  .node-grid{grid-template-columns:1fr}
+  .form-grid,.node-form,.option-row{grid-template-columns:1fr}
+  .node-form .field,.node-form .field.w2,.node-form .field.w3,.node-form .field.w4,.node-form .field.w6,.node-form .field.full,.node-form .field.w12{grid-column:1/-1}
+  .ip-table table,.ip-table thead,.ip-table tbody,.ip-table tr,.ip-table td{display:block;width:100%;min-width:0}
+  .ip-table thead{display:none}
+  .ip-table tr{
+    position:relative;margin:10px 0;padding:12px;border:1px solid var(--line);border-radius:14px;
+    background:var(--glass);box-shadow:var(--shadow)
+  }
+  .ip-table td{border:0;padding:4px 0}
+  .ip-table td:first-child{position:absolute;right:12px;top:12px;width:auto}
+  .ip-table .ip-text{display:block;max-width:calc(100% - 42px);font-size:13px;word-break:break-all}
+  .ip-table td:last-child{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+  .ip-table td:last-child .btn{flex:1}
+}
+
+/* compact top actions */
+.hero-actions{gap:6px}
+.icon-menu{position:relative}
+.icon-menu summary{
+  list-style:none;min-height:34px;min-width:34px;border:1px solid var(--line);border-radius:11px;
+  background:var(--glass-strong);color:var(--ink);display:inline-flex;align-items:center;justify-content:center;
+  padding:0 10px;font-weight:760;cursor:pointer;box-shadow:inset 0 1px 0 var(--highlight)
+}
+.icon-menu summary::-webkit-details-marker{display:none}
+.icon-menu[open] summary{border-color:color-mix(in srgb, var(--accent) 40%, var(--line))}
+.icon-menu .menu-pop{
+  position:absolute;right:0;top:calc(100% + 6px);z-index:40;min-width:168px;
+  padding:6px;border-radius:14px;border:1px solid var(--line);background:var(--glass-strong);
+  box-shadow:var(--shadow-lg), inset 0 1px 0 var(--highlight);
+  backdrop-filter:blur(18px);display:grid;gap:4px
+}
+.icon-menu .menu-pop button,.icon-menu .menu-pop .menu-item{
+  width:100%;min-height:34px;border:0;border-radius:10px;background:transparent;color:var(--ink);
+  text-align:left;padding:0 10px;font-weight:680;cursor:pointer
+}
+.icon-menu .menu-pop button:hover,.icon-menu .menu-pop .menu-item:hover{background:var(--accent-soft)}
+.theme-switch.compact{padding:2px;gap:2px}
+.theme-switch.compact button{min-height:28px;padding:0 8px;font-size:11px}
+.theme-icon-btn{
+  width:34px;height:34px;min-height:34px;padding:0;border-radius:11px;
+  border:1px solid var(--line);background:var(--glass-strong);color:var(--ink);
+  display:inline-flex;align-items:center;justify-content:center;
+  box-shadow:inset 0 1px 0 var(--highlight);font-size:15px;line-height:1;
+}
+.theme-icon-btn:hover{transform:translateY(-1px)}
+.menu-pop .theme-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;color:var(--muted);font-size:12px}
+.login-theme-float{position:fixed;top:12px;right:12px;z-index:5}
+.latency-chip{font-variant-numeric:tabular-nums}
+.latency-chip.good{color:var(--ok);border-color:color-mix(in srgb, var(--ok) 30%, transparent);background:color-mix(in srgb, var(--ok) 12%, transparent)}
+.latency-chip.mid{color:var(--warn);border-color:color-mix(in srgb, var(--warn) 30%, transparent);background:color-mix(in srgb, var(--warn) 12%, transparent)}
+.latency-chip.bad{color:var(--danger);border-color:color-mix(in srgb, var(--danger) 30%, transparent);background:color-mix(in srgb, var(--danger) 12%, transparent)}
+.latency-chip.pending{color:var(--muted)}
+#nodeEditorPanel[hidden],#deployBody[hidden]{display:none !important}
+.pie-wrap{display:grid;grid-template-columns:140px 1fr;gap:12px;align-items:center;min-height:150px}
+.pie-svg{width:140px;height:140px;filter:drop-shadow(0 8px 16px rgba(0,0,0,.12))}
+.pie-legend{display:grid;gap:8px}
+.pie-legend-row{display:grid;grid-template-columns:12px 1fr auto;gap:8px;align-items:center;font-size:12px}
+.pie-dot{width:10px;height:10px;border-radius:50%}
+.pie-name{color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pie-val{color:var(--muted);font-family:var(--mono);font-size:11px}
+.chart-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+@media(max-width:900px){.pie-wrap{grid-template-columns:120px 1fr}.pie-svg{width:120px;height:120px}}
+@media(max-width:560px){.chart-grid{grid-template-columns:1fr}.pie-wrap{grid-template-columns:1fr;justify-items:center}.pie-legend{width:100%}}
 </style>
 </head>
-<body>
-<div id="toast"></div>
+<body class="theme-cyber">
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
 <div id="dialogBackdrop" class="dialog-backdrop" role="dialog" aria-modal="true">
   <div class="dialog-card">
     <div id="dialogTitle" class="dialog-title">提示</div>
@@ -3411,186 +5043,314 @@ body.dark .x{background:rgba(44,44,46,.72)}
     </div>
   </div>
 </div>
+
 <div id="loginShell" class="login-shell">
-  <div class="login-box">
+  <button type="button" class="theme-icon-btn login-theme-float" id="loginThemeBtn" title="切换风格" aria-label="切换风格">◐</button>
+  <div class="login-box glass" id="loginModal">
+    <div class="login-visual"></div>
+    <h1>媒体线路控制台</h1>
+    <p>管理节点、真实模拟观看、测速与 DNS。输入访问密码进入。</p>
     <input id="loginToken" type="password" placeholder="访问密码" autocomplete="current-password" autofocus>
-    <button class="btn primary" id="loginBtn" type="button">进入</button>
+    <button class="btn primary" id="loginBtn" type="button">进入控制台</button>
     <div id="loginError" class="login-error"></div>
   </div>
 </div>
+
 <div id="app" class="app">
-  <main class="container">
-    <section class="topbar">
-      <div class="brand">
-        <h1>媒体线路控制台</h1>
-        <p>v${BUILD_VERSION} · 管理 ${escapeHTML(managementDomain || "-")} · 调度 ${escapeHTML(dispatchDomain || "-")}</p>
-      </div>
-      <div class="actions">
-        <div class="status-pill" title="浏览器到当前 Worker 的往返延迟"><span class="dot" id="rttDot"></span><span>RTT</span><b id="rttValue" class="mono">--</b></div>
-        <button class="btn icon" id="themeBtn" title="切换深色模式">◐</button>
-        <button class="btn" id="exportBtn">导出</button>
-        <button class="btn" id="importBtn">导入</button>
-        <button class="btn danger" id="logoutBtn">退出</button>
-      </div>
-    </section>
-    <div id="notice" class="notice"></div>
-    <nav class="page-tabs">
-      <button class="page-tab active" data-page-tab="overview">总览</button>
-      <button class="page-tab" data-page-tab="nodes">线路配置</button>
-      <button class="page-tab" data-page-tab="network">测速与 DNS</button>
-      <button class="page-tab" data-page-tab="deploy">代码更新</button>
-      <button class="page-tab" data-page-tab="dashboard">数据大屏</button>
-    </nav>
-
-    <section class="trace-grid page active" data-page="overview">
-      <div class="trace-box">
-        <div class="trace-icon">⌖</div>
-        <div><div class="trace-label">访客入口</div><div id="traceEntry" class="trace-value mono">读取中...</div></div>
-      </div>
-      <div class="trace-box">
-        <div class="trace-icon">↗</div>
-        <div><div class="trace-label">Worker 出口</div><div id="traceEgress" class="trace-value mono">读取中...</div></div>
-      </div>
-    </section>
-
-    <section class="metrics page active" data-page="overview">
-      <div class="metric"><span>节点总数</span><b id="metricNodes">0</b></div>
-      <div class="metric"><span>已启用</span><b id="metricEnabled">0</b></div>
-      <div class="metric"><span>今日请求</span><b id="metricRequests">0</b></div>
-      <div class="metric"><span>今日流量</span><b id="metricBytes">0 B</b></div>
-    </section>
-
-    <section class="card page" data-page="deploy" style="border-left:4px solid var(--danger)">
-      <div class="card-head">
-        <div><h2>一键覆盖 / 更新核心代码</h2><p>仅接受已混淆的 Worker 模块代码。明文代码会被后端拒绝，避免直接上传明文到 Cloudflare。</p></div>
-        <button class="btn danger" id="deployBtn">立即覆盖并重启</button>
-      </div>
-      <div class="field full"><label>混淆后的 Worker 代码</label><textarea id="codeArea" rows="6" placeholder="粘贴已经混淆后的 dist/index.js 内容"></textarea></div>
-      <div class="toolbar" style="margin-top:12px">
-        <input type="file" id="fileInput" accept=".js" style="max-width:100%">
-        <span class="hint">本地推荐仍使用 npm run deploy；网页覆盖适合紧急替换混淆产物。</span>
-      </div>
-    </section>
-
-    <section class="card page" data-page="nodes">
-      <div class="card-head">
-        <div><h2 id="formTitle">部署 / 编辑媒体线路</h2><p>接入地址由节点名和访问密钥组成，外部客户端访问接入地址即可进入对应线路。</p></div>
-        <div class="card-actions"><button class="btn" id="resetBtn">清空表单</button><button class="btn primary" id="saveNodeBtn">保存部署</button></div>
-      </div>
-      <div class="form-grid node-form">
-        <input type="hidden" id="editingName">
-        <div class="field"><label>节点名</label><input id="name" placeholder="vip-1"></div>
-        <div class="field"><label>显示名</label><input id="displayName" placeholder="VIP Emby"></div>
-        <div class="field"><label>图标</label><input id="icon" placeholder="留空默认"></div>
-        <div class="field"><label>密钥</label><input id="secret" placeholder="可空"></div>
-        <div class="field full"><label>服务器线路</label><textarea id="targets" placeholder="https://media.example.com&#10;https://backup.example.com"></textarea></div>
-        <div class="field full"><label>备注</label><textarea id="remark" placeholder="内部备注"></textarea></div>
-        <div class="field w6"><label>视频线路</label><input id="streamTarget" placeholder="可空，留空使用主线路"></div>
-        <div class="field"><label>模拟客户端</label><select id="clientProfile">${clientProfileOptionsHTML()}</select></div>
-        <div class="field"><label>Header</label><select id="headerMode"><option value="off">保守 off</option><option value="realip_only">严格 realip_only</option><option value="dual">兼容 dual</option><option value="strict">强力 strict</option></select></div>
-        <div class="field"><label>播放</label><select id="streamMode"><option value="proxy">中转播放</option><option value="direct">直连播放</option><option value="auto">自动</option></select></div>
-        <div class="field"><label>标签</label><input id="tag" placeholder="客户、区域或线路"></div>
-        <div class="field w2"><label>周期</label><input id="renewDays" type="number" min="0" step="1" placeholder="21"></div>
-        <div class="field w2"><label>提醒</label><input id="remindBeforeDays" type="number" min="0" step="1" placeholder="3"></div>
-        <div class="field w2"><label>起算</label><input id="keepaliveAt" placeholder="2026-07-07"></div>
-        <div class="option-row">
-          <label class="check"><input id="impersonate" type="checkbox" checked>启用模拟客户端</label>
-          <label class="check"><input id="directExternal" type="checkbox">自动模式允许直链</label>
-          <label class="check"><input id="cacheImage" type="checkbox" checked>海报及图片缓存</label>
-          <label class="check"><input id="enabled" type="checkbox" checked>启用节点</label>
-        </div>
-      </div>
-      <div class="hint" style="margin-top:12px">Header 策略只控制真实 IP、Origin、Referer 等请求头；模拟客户端由“启用模拟客户端”和“模拟客户端”选择控制。</div>
-    </section>
-
-    <section class="card page" data-page="network">
-      <div class="card-head">
-        <div><h2>专属线路测速与动态 DNS</h2><p>拉取优选 IP、维护调度域名 DNS 记录，也可以粘贴自定义 IP/CNAME。</p></div>
-        <div class="toolbar">
-          <select id="ipType" class="search-input" style="min-width:160px"><option value="all">综合混合源</option><option value="电信">电信专属</option><option value="联通">联通专属</option><option value="移动">移动专属</option><option value="多线">多线 BGP</option><option value="ipv6">IPv6 节点</option><option value="优选">顶尖优选库</option></select>
-          <button class="btn cyan" id="preferredBtn">提取预设源并测速</button>
-          <button class="btn orange" id="copyItdogBtn">复制去 ITDog</button>
-          <button class="btn" id="clearIPsBtn">清空列表</button>
-        </div>
-      </div>
-      <div class="two-col">
+  <div class="app-shell">
+    <aside class="sidebar glass">
+      <div class="side-brand">
+        <div class="side-logo"></div>
         <div>
-          <div class="toolbar" style="margin-bottom:12px">
-            <input id="customApiUrl" class="search-input" style="flex:1" value="https://ip.v2too.top/api/nodes" placeholder="自定义 JSON 或文本 API 链接">
-            <button class="btn cyan" id="fetchCustomApiBtn">拉取 API 并测速</button>
-          </div>
-          <div class="field full"><label>自定义 IP、IPv6 或 CNAME</label><textarea id="customIps" placeholder="每行一个，也支持粘贴混杂文本自动提取"></textarea></div>
-          <div class="toolbar" style="margin:12px 0"><button class="btn violet" id="testCustomBtn">测试粘贴的节点</button><button class="btn violet" id="directCnameBtn">直推 CNAME</button><button class="btn green" id="topDnsBtn">TOP3 写入 DNS</button><button class="btn primary" id="selectedDnsBtn">选中写入 DNS</button></div>
-          <div id="statusText" class="hint">优选 IP 是 Cloudflare 边缘入口候选。实际体验还会受运营商、TLS、Worker 调度、线路距离影响。</div>
-          <div class="table-wrapper ip-table" style="margin-top:14px">
-            <table>
-              <thead><tr><th style="width:44px"><input type="checkbox" id="selectAll" class="ip-checkbox"></th><th>专属节点</th><th>预估延迟</th><th>连通状态</th><th>记录/归属地</th><th>单节点操作</th></tr></thead>
-              <tbody id="ipRows"><tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无数据，请拉取节点或输入自定义 IP/域名测试</td></tr></tbody>
-            </table>
-          </div>
+          <b>线路控制台</b>
+          <small>v${BUILD_VERSION}</small>
         </div>
+      </div>
+      <nav class="side-nav">
+        <button class="side-link active" data-page-tab="nodes" type="button"><span class="ico">▣</span>线路配置</button>
+        <button class="side-link" data-page-tab="network" type="button"><span class="ico">⌁</span>测速与 DNS</button>
+        <button class="side-link" data-page-tab="dashboard" type="button"><span class="ico">◈</span>数据大屏</button>
+        <button class="side-link" data-page-tab="deploy" type="button"><span class="ico">⬆</span>代码更新</button>
+      </nav>
+      <div class="side-meta">
+        <div class="side-stat"><span>节点</span><b id="metricNodes">0</b></div>
+        <div class="side-stat"><span>启用</span><b id="metricEnabled">0</b></div>
+        <div class="side-stat"><span>今日请求</span><b id="metricRequests">0</b></div>
+        <div class="side-stat"><span>今日流量</span><b id="metricBytes">0 B</b></div>
+        <div class="side-stat"><span>访客入口</span><b id="traceEntry" class="compact-value mono">--</b></div>
+        <div class="side-stat"><span>Worker 出口</span><b id="traceEgress" class="compact-value mono">--</b></div>
+        <div class="side-stat"><span>RTT</span><b id="rttValue" class="mono">--</b></div>
+      </div>
+    </aside>
+
+    <div class="main-panel">
+      <header class="hero-bar glass">
         <div>
-          <div class="trace-box" style="margin-bottom:14px;display:block">
-            <div class="trace-label">调度域名 DNS</div>
-            <div id="dnsStatus" class="dns-status" style="margin-top:8px"><span class="badge">未查询</span></div>
-          </div>
-          <div class="form-grid" style="grid-template-columns:1fr 110px">
-            <div class="field"><label>调度域名</label><input id="dnsName" value="${escapeHTML(dispatchDomain)}" placeholder="md.8899.qzz.io"></div>
-            <div class="field"><label>类型</label><select id="dnsType"><option>A</option><option>AAAA</option><option>CNAME</option></select></div>
-            <div class="field full"><label>记录值</label><textarea id="dnsValues" placeholder="一行一个记录值"></textarea></div>
-          </div>
-          <div class="toolbar" style="margin-top:12px"><button class="btn" id="dnsLoadBtn">查询 DNS</button><button class="btn primary" id="dnsUpdateBtn">更新 DNS</button></div>
-          <pre id="dnsOut" class="output" style="margin-top:14px;min-height:180px"></pre>
+          <div class="section-kicker">控制台</div>
+          <h1 id="pageTitle">线路配置</h1>
+          <p>管理 ${escapeHTML(managementDomain || "-")} · 调度 ${escapeHTML(dispatchDomain || "-")} · <span id="rttDot" class="dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);vertical-align:middle"></span> 边缘延迟见侧栏</p>
         </div>
-      </div>
-    </section>
-
-    <section class="card page" data-page="nodes">
-      <div class="card-head">
-        <div><h2>已配置的媒体线路</h2><p>卡片内可复制接入地址、隐藏/显示线路和密钥、测试连通性。</p></div>
-        <div class="toolbar">
-          <button class="btn cyan" id="pingAllBtn">全局测速</button>
-          <button class="btn" id="purgeBtn">刷新海报缓存</button>
-          <input id="search" class="search-input" placeholder="搜索备注、节点名或线路">
-          <button class="btn" id="reloadNodesBtn">刷新</button>
+        <div class="hero-actions">
+          <details class="icon-menu" id="moreMenu">
+            <summary title="更多">···</summary>
+            <div class="menu-pop">
+              <div class="menu-row theme-row">
+                <span>风格</span>
+                <button type="button" class="theme-icon-btn" id="themeToggleBtn" title="切换风格" aria-label="切换风格">◐</button>
+              </div>
+              <button type="button" id="exportBtn">导出节点</button>
+              <button type="button" id="importBtn">导入节点</button>
+              <button type="button" id="newNodeBtn">新建节点</button>
+              <button type="button" id="logoutBtn" style="color:var(--danger)">退出登录</button>
+            </div>
+          </details>
         </div>
-      </div>
-      <div id="nodeGrid" class="node-grid"></div>
-    </section>
+      </header>
+      <div id="notice" class="notice"></div>
 
-    <section id="dashboardModal" class="card page" data-page="dashboard">
-    <div class="modal-head">
-      <div><h2>数据大屏</h2><div class="hint">D1 请求统计、最近访问记录和 Cloudflare 边缘流量。</div></div>
-      <button class="x" id="closeDashboardBtn">×</button>
+      <!-- NODES -->
+      <section class="panel-stack page active" data-page="nodes">
+        <section class="panel" id="nodeEditorPanel" hidden>
+          <div class="panel-head">
+            <div>
+              <div class="section-kicker">编辑</div>
+              <h2 id="formTitle">部署 / 编辑媒体线路</h2>
+              <p>接入地址由节点名 + 密钥组成；真实模拟观看需要 Emby 账号。</p>
+            </div>
+            <div class="toolbar-inline">
+              <button class="btn" id="cancelEditBtn" type="button">取消</button>
+              <button class="btn" id="resetBtn" type="button">清空</button>
+              <button class="btn primary" id="saveNodeBtn" type="button">保存</button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <input type="hidden" id="editingName">
+            <div class="form-section">
+              <div class="form-section-title"><b>基础信息</b><span>名称 / 接入</span></div>
+              <div class="form-grid node-form">
+                <div class="field w4"><label>节点名</label><input id="name" placeholder="vip-1"></div>
+                <div class="field w4"><label>显示名</label><input id="displayName" placeholder="VIP Emby"></div>
+                <div class="field w2"><label>图标</label><input id="icon" placeholder="留空默认"></div>
+                <div class="field w2"><label>密钥</label><input id="secret" placeholder="可空"></div>
+                <div class="field w6"><label>标签</label><input id="tag" placeholder="客户、区域或线路"></div>
+                <div class="field w6"><label>备注</label><input id="remark" placeholder="内部备注"></div>
+              </div>
+            </div>
+            <div class="form-section">
+              <div class="form-section-title"><b>上游线路</b><span>媒体服务器地址</span></div>
+              <div class="form-grid node-form">
+                <div class="field full w12"><label>服务器线路</label><textarea id="targets" placeholder="https://media.example.com&#10;https://backup.example.com"></textarea></div>
+                <div class="field w12"><label>视频线路</label><input id="streamTarget" placeholder="可空，留空使用主线路"></div>
+              </div>
+            </div>
+            <div class="form-section">
+              <div class="form-section-title"><b>代理策略</b><span>客户端与播放模式</span></div>
+              <div class="form-grid node-form">
+                <div class="field w4"><label>模拟客户端</label><select id="clientProfile">${clientProfileOptionsHTML()}</select></div>
+                <div class="field w4"><label>Header</label><select id="headerMode"><option value="off">保守 off</option><option value="realip_only">严格 realip_only</option><option value="dual">兼容 dual</option><option value="strict">强力 strict</option></select></div>
+                <div class="field w4"><label>播放</label><select id="streamMode"><option value="proxy">中转播放</option><option value="direct">直连播放</option><option value="auto">自动</option></select></div>
+                <div class="option-row">
+                  <label class="check"><input id="impersonate" type="checkbox" checked>启用模拟客户端</label>
+                  <label class="check"><input id="directExternal" type="checkbox">自动模式允许直链</label>
+                  <label class="check"><input id="cacheImage" type="checkbox" checked>海报及图片缓存</label>
+                  <label class="check"><input id="enabled" type="checkbox" checked>启用节点</label>
+                </div>
+              </div>
+            </div>
+            <div class="form-section">
+              <div class="form-section-title"><b>观看保活</b><span>周期提醒 + 真实模拟账号</span></div>
+              <div class="form-grid node-form">
+                <div class="field w3" style="grid-column:span 3"><label>周期（天）</label><input id="renewDays" type="number" min="0" step="1" placeholder="21"></div>
+                <div class="field w3" style="grid-column:span 3"><label>提前提醒（天）</label><input id="remindBeforeDays" type="number" min="0" step="1" placeholder="3"></div>
+                <div class="field w3" style="grid-column:span 3"><label>起算日期</label><input id="keepaliveAt" placeholder="2026-07-07"></div>
+                <div class="field w3" style="grid-column:span 3"><label>指定条目 ID</label><input id="embyPlayId" placeholder="可空，自动选片"></div>
+                <div class="field w6"><label>Emby 用户名</label><input id="embyUser" placeholder="真实模拟观看账号"></div>
+                <div class="field w6"><label>Emby 密码</label><input id="embyPassword" type="password" placeholder="保存后用于登录上游"></div>
+              </div>
+              <div class="hint" style="margin-top:8px">进入提醒窗口后会真实登录上游 Emby 开播，并在约 5-7.5 分钟内按分钟上报进度；完成后写记录并 TG 通知。</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="section-kicker">节点</div>
+              <h2>已配置线路</h2>
+              <p>复制接入、测速、真实模拟观看、排序。</p>
+            </div>
+            <div class="toolbar-inline">
+              <button class="btn primary" id="newNodeBtn2" type="button">新建</button>
+              <button class="btn cyan" id="pingAllBtn" type="button">全局测速</button>
+              <button class="btn" id="purgeBtn" type="button">清海报缓存</button>
+              <input id="search" class="search-input" placeholder="搜索节点">
+              <button class="btn" id="reloadNodesBtn" type="button">刷新</button>
+            </div>
+          </div>
+          <div class="panel-body tight">
+            <div id="nodeGrid" class="node-grid"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="section-kicker">观看记录</div>
+              <h2>最近 3 天模拟观看</h2>
+              <p>站点 · 内容 · 时长 · 自动/手动</p>
+            </div>
+            <div class="toolbar-inline">
+              <button class="btn" id="reloadWatchLogsBtn">刷新记录</button>
+            </div>
+          </div>
+          <div class="panel-body tight">
+            <div class="table-wrapper">
+              <table>
+                <thead><tr><th>站点</th><th>内容</th><th>节点</th><th>观看时间</th><th>时长</th><th>来源</th></tr></thead>
+                <tbody id="watchLogRows"><tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无模拟观看记录</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <!-- NETWORK -->
+      <section class="panel-stack page" data-page="network">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="section-kicker">网络</div>
+              <h2>专属线路测速与动态 DNS</h2>
+              <p>拉取优选 IP、测速，并更新调度域名解析。</p>
+            </div>
+            <div class="toolbar-inline">
+              <select id="ipType" class="search-input" style="min-width:150px"><option value="all">综合混合源</option><option value="电信">电信专属</option><option value="联通">联通专属</option><option value="移动">移动专属</option><option value="多线">多线 BGP</option><option value="ipv6">IPv6 节点</option><option value="优选">顶尖优选库</option></select>
+              <button class="btn cyan" id="preferredBtn">提取预设源并测速</button>
+              <button class="btn" id="copyItdogBtn">复制去 ITDog</button>
+              <button class="btn" id="clearIPsBtn">清空列表</button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="split-2">
+              <div>
+                <div class="toolbar-inline" style="margin-bottom:12px">
+                  <input id="customApiUrl" class="search-input" style="flex:1" value="https://ip.v2too.top/api/nodes" placeholder="自定义 JSON 或文本 API 链接">
+                  <button class="btn cyan" id="fetchCustomApiBtn">拉取 API 并测速</button>
+                </div>
+                <div class="field full"><label>自定义 IP、IPv6 或 CNAME</label><textarea id="customIps" placeholder="每行一个，也支持粘贴混杂文本自动提取"></textarea></div>
+                <div class="toolbar-inline" style="margin:12px 0">
+                  <button class="btn" id="testCustomBtn">测试粘贴的节点</button>
+                  <button class="btn" id="directCnameBtn">直推 CNAME</button>
+                  <button class="btn" id="topDnsBtn">TOP3 写入 DNS</button>
+                  <button class="btn primary" id="selectedDnsBtn">选中写入 DNS</button>
+                </div>
+                <div id="statusText" class="hint">优选 IP 是 Cloudflare 边缘入口候选。实际体验还会受运营商、TLS、Worker 调度影响。</div>
+                <div class="table-wrapper ip-table" style="margin-top:14px">
+                  <table>
+                    <thead><tr><th style="width:44px"><input type="checkbox" id="selectAll" class="ip-checkbox"></th><th>专属节点</th><th>预估延迟</th><th>连通状态</th><th>记录/归属地</th><th>单节点操作</th></tr></thead>
+                    <tbody id="ipRows"><tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无数据，请拉取节点或输入自定义 IP/域名测试</td></tr></tbody>
+                  </table>
+                </div>
+              </div>
+              <div>
+                <div class="form-section-title" style="margin-bottom:10px"><b>调度域名 DNS</b><span id="dnsStatus" class="dns-status"><span class="badge">未查询</span></span></div>
+                <div class="form-grid" style="grid-template-columns:1fr 110px">
+                  <div class="field"><label>调度域名</label><input id="dnsName" value="${escapeHTML(dispatchDomain)}" placeholder="md.8899.qzz.io"></div>
+                  <div class="field"><label>类型</label><select id="dnsType"><option>A</option><option>AAAA</option><option>CNAME</option></select></div>
+                  <div class="field full"><label>记录值</label><textarea id="dnsValues" placeholder="一行一个记录值"></textarea></div>
+                </div>
+                <div class="toolbar-inline" style="margin-top:12px">
+                  <button class="btn" id="dnsLoadBtn">查询 DNS</button>
+                  <button class="btn primary" id="dnsUpdateBtn">更新 DNS</button>
+                </div>
+                <pre id="dnsOut" class="output" style="margin-top:14px;min-height:180px"></pre>
+              </div>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <!-- DASHBOARD -->
+      <section class="panel-stack page" data-page="dashboard" id="dashboardModal">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="section-kicker">数据</div>
+              <h2>数据大屏</h2>
+              <p>D1 请求统计、最近访问与 Cloudflare 边缘流量。</p>
+            </div>
+            <div class="toolbar-inline">
+              <button class="btn" id="closeDashboardBtn">返回线路</button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="stat-strip" style="margin-bottom:14px">
+              <div class="stat-tile"><span>今天流量</span><b id="trafficToday">--</b><em>Cloudflare</em></div>
+              <div class="stat-tile"><span>7 天</span><b id="traffic7d">--</b><em>Cloudflare</em></div>
+              <div class="stat-tile"><span>30 天</span><b id="traffic30d">--</b><em>Cloudflare</em></div>
+              <div class="stat-tile"><span>D1 日期</span><b id="statsDay" style="font-size:18px">--</b><em>北京时间</em></div>
+            </div>
+            <div id="dashboardCharts" class="chart-grid"></div>
+            <div class="table-wrapper" style="margin-top:12px">
+              <table>
+                <thead><tr><th>时间</th><th>节点</th><th>IP</th><th>地区</th><th>状态</th><th>路径</th></tr></thead>
+                <tbody id="logRows"><tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无数据</td></tr></tbody>
+              </table>
+            </div>
+            <pre id="statsOut" class="output" style="margin-top:14px"></pre>
+          </div>
+        </section>
+      </section>
+
+      <!-- DEPLOY -->
+      <section class="panel-stack page" data-page="deploy">
+        <section class="panel" style="border:1px solid rgba(225,29,72,.25)">
+          <div class="panel-head">
+            <div>
+              <div class="section-kicker">更新</div>
+              <h2>一键覆盖 / 更新核心代码</h2>
+              <p>默认收起。仅在需要紧急替换混淆产物时展开。</p>
+            </div>
+            <div class="toolbar-inline">
+              <button class="btn" id="toggleDeployBtn" type="button">展开编辑</button>
+            </div>
+          </div>
+          <div class="panel-body" id="deployBody" hidden>
+            <div class="field full"><label>混淆后的 Worker 代码</label><textarea id="codeArea" rows="8" placeholder="粘贴已经混淆后的 dist/index.js 内容"></textarea></div>
+            <div class="toolbar-inline" style="margin-top:12px">
+              <input type="file" id="fileInput" accept=".js" style="max-width:100%">
+              <span class="hint">本地推荐仍使用 npm run deploy；网页覆盖适合紧急替换混淆产物。</span>
+              <button class="btn danger" id="deployBtn" type="button">覆盖并重启</button>
+            </div>
+          </div>
+        </section>
+      </section>
     </div>
-    <section class="metrics" style="margin-bottom:16px">
-      <div class="metric"><span>今天</span><b id="trafficToday">--</b></div>
-      <div class="metric"><span>7 天</span><b id="traffic7d">--</b></div>
-      <div class="metric"><span>30 天</span><b id="traffic30d">--</b></div>
-      <div class="metric"><span>D1 日期</span><b id="statsDay" style="font-size:18px">--</b></div>
-    </section>
-    <div id="dashboardCharts" class="chart-grid"></div>
-    <div class="table-wrapper">
-      <table>
-        <thead><tr><th>时间</th><th>节点</th><th>IP</th><th>地区</th><th>状态</th><th>路径</th></tr></thead>
-        <tbody id="logRows"><tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无数据</td></tr></tbody>
-      </table>
-    </div>
-    <pre id="statsOut" class="output" style="margin-top:16px"></pre>
-    </section>
-  </main>
+  </div>
+
+  <nav class="mobile-nav">
+    <button class="side-link active" data-page-tab="nodes" type="button">线路</button>
+    <button class="side-link" data-page-tab="network" type="button">网络</button>
+    <button class="side-link" data-page-tab="dashboard" type="button">数据</button>
+    <button class="side-link" data-page-tab="deploy" type="button">更新</button>
+  </nav>
 </div>
+
 <script>
 let nodes = [];
+let latencyMap = {};
 let stats = null;
 let analytics = null;
+let watchLogs = [];
+let activeDialogClose = null;
+let toastTimer = null;
+const watchStarting = new Set();
 const CLIENT_LABELS = ${labels};
 const DEFAULT_NODE_ICON_CLIENT = ${JSON.stringify(DEFAULT_NODE_ICON)};
 const DISPATCH_ORIGIN = ${JSON.stringify(dispatchDomain ? "https://" + dispatchDomain : "")};
 const $ = (id) => document.getElementById(id);
 const tokenKey = "embyproxy_cf_admin_token";
 let adminToken = localStorage.getItem(tokenKey) || "";
-if (localStorage.getItem("embyproxy_cf_theme") === "dark") document.body.classList.add("dark");
 function showLogin(){
   document.body.classList.remove("authed");
   $("loginToken").value = "";
@@ -3606,15 +5366,22 @@ function saveToken(){
   $("loginError").textContent = "";
   adminToken = token;
   localStorage.setItem(tokenKey, token);
+  document.body.classList.add("authed");
+  switchPage("nodes");
   loadNodes({ quietAuth: true });
+  loadWatchLogs({ quiet: true });
+  loadStats();
+  loadTrace();
 }
 function logout(){
   adminToken = "";
   localStorage.removeItem(tokenKey);
   nodes = [];
+  document.body.classList.remove("authed");
   showLogin();
 }
 function showDialog(options = {}) {
+  if (activeDialogClose) activeDialogClose(false);
   const backdrop = $("dialogBackdrop");
   const cancel = $("dialogCancel");
   const ok = $("dialogOk");
@@ -3648,11 +5415,19 @@ function showDialog(options = {}) {
       ok.onclick = null;
       cancel.onclick = null;
       backdrop.onclick = null;
+      document.removeEventListener("keydown", onKeydown);
+      if (activeDialogClose === cleanup) activeDialogClose = null;
       resolve(input && value ? input.value : value);
     };
+    const onKeydown = (event) => {
+      if (event.key === "Escape") cleanup(false);
+      if (event.key === "Enter" && !input && !actions.hidden) cleanup(true);
+    };
+    activeDialogClose = cleanup;
     ok.onclick = () => cleanup(true);
     cancel.onclick = () => cleanup(false);
     backdrop.onclick = (event) => { if (event.target === backdrop) cleanup(false); };
+    document.addEventListener("keydown", onKeydown);
     if (options.autoCloseMs) timer = setTimeout(() => cleanup(true), options.autoCloseMs);
   });
 }
@@ -3664,9 +5439,6 @@ function uiConfirm(message, title = "确认操作") {
 }
 function uiPrompt(message, title = "输入内容", placeholder = "") {
   return showDialog({ title, message, input: true, placeholder, okText: "导入", cancelText: "取消" });
-}
-function uiNotice(message, title = "提示") {
-  return showDialog({ title, message, actions: false, autoCloseMs: 2000 });
 }
 function setNotice(message = "", isError = false) {
   if (!message) return;
@@ -3714,32 +5486,54 @@ async function loadNodes(options = {}){
   } catch(e) { handleError(e, options.quietAuth); }
 }
 function renderNodes(){
-  const q = $("search").value.trim().toLowerCase();
-  const list = nodes.filter(n => !q || [n.name,n.displayName,n.tag,n.remark,(n.targets||[]).join(" ")].join(" ").toLowerCase().includes(q));
+  const q = ($("search")?.value || "").trim().toLowerCase();
+  const list = nodes.filter(n => !q || [n.name,n.displayName,n.tag,n.remark,(n.targets||[]).join(" "),n.embyUser].join(" ").toLowerCase().includes(q));
   $("nodeGrid").innerHTML = list.map((n, index) => {
     const url = proxyURL(n);
     const firstTarget = (n.targets || [])[0] || "";
     const icon = iconHTML(n);
+    const keep = keepaliveHTML(n);
+    const emby = n.embyUser
+      ? '<span class="chip ok">' + esc(n.embyUser) + '</span>' + (n.embyPlayId ? '<span class="chip">ID ' + esc(n.embyPlayId) + '</span>' : '<span class="chip">自动选片</span>')
+      : '<span class="chip warn">Emby 未配置</span>';
+    const lat = latencyMap[n.name];
+    let latChip = '<span class="chip latency-chip pending" data-latency-for="' + attr(n.name) + '">未测速</span>';
+    if (lat && lat.ms >= 0) {
+      const cls = lat.ms < 180 ? "good" : (lat.ms < 450 ? "mid" : "bad");
+      latChip = '<span class="chip latency-chip ' + cls + '" data-latency-for="' + attr(n.name) + '">' + lat.ms + ' ms</span>';
+    } else if (lat && lat.ms < 0) {
+      latChip = '<span class="chip latency-chip bad" data-latency-for="' + attr(n.name) + '">超时</span>';
+    } else if (lat && lat.pending) {
+      latChip = '<span class="chip latency-chip pending" data-latency-for="' + attr(n.name) + '">测速中…</span>';
+    }
     return '<article class="emby-card" data-search="' + attr([n.name,n.displayName,n.tag,n.remark,firstTarget].join(" ")) + '">' +
-      '<div class="card-header"><div class="card-title-group"><div class="emby-icon">' + icon + '</div><div class="card-title"><b>' + esc(n.displayName || n.name) + '</b><small>' + esc(n.name) + (n.tag ? " · " + esc(n.tag) : "") + '</small></div></div><span class="badge ' + (n.enabled ? "ok" : "warn") + '">' + (n.enabled ? "启用" : "停用") + '</span></div>' +
-      infoRow("接入地址", '<span class="mono masked" data-secret="' + attr(url) + '">••••••••••••</span> <button class="btn small" data-act="reveal" data-name="' + attr(n.name) + '">显示</button>') +
-      infoRow("线路地址", '<span class="masked" data-secret="' + attr((n.targets || []).join("\\n")) + '">' + esc(firstTarget ? "••••••••••••" : "未配置") + '</span>') +
-      infoRow("Header", esc(n.headerMode || "dual") + " / " + esc(n.streamMode || "proxy")) +
-      infoRow("模拟", n.impersonate === false ? "关闭" : esc(CLIENT_LABELS[n.clientProfile] || n.clientProfile || "")) +
-      infoRow("观看提醒", keepaliveHTML(n)) +
-      infoRow("密钥", n.secret ? '<span class="masked" data-secret="' + attr(n.secret) + '">••••••</span>' : "无") +
-      '<div class="card-footer"><div class="card-actions"><button class="btn small" data-act="up" data-name="' + attr(n.name) + '" ' + (index === 0 ? "disabled" : "") + '>上移</button><button class="btn small" data-act="down" data-name="' + attr(n.name) + '" ' + (index === list.length - 1 ? "disabled" : "") + '>下移</button></div><div class="card-actions"><button class="btn small" data-act="copy" data-name="' + attr(n.name) + '">复制</button><button class="btn small" data-act="edit" data-name="' + attr(n.name) + '">编辑</button><button class="btn small" data-act="ping" data-name="' + attr(n.name) + '">测速</button><button class="btn small" data-act="keepalive" data-name="' + attr(n.name) + '">已观看</button><button class="btn small danger" data-act="delete" data-name="' + attr(n.name) + '">删除</button></div></div>' +
+      '<div class="card-top"><div class="card-title-group"><div class="emby-icon">' + icon + '</div><div class="card-title"><b>' + esc(n.displayName || n.name) + '</b><small>' + esc(n.name) + (n.tag ? " · " + esc(n.tag) : "") + '</small></div></div><span class="badge ' + (n.enabled ? "ok" : "warn") + '">' + (n.enabled ? "启用" : "停用") + '</span></div>' +
+      '<div class="card-body">' +
+        '<div class="chip-row">' +
+          latChip +
+          '<span class="chip primary">' + esc(n.headerMode || "dual") + '</span>' +
+          '<span class="chip">' + esc(n.streamMode || "proxy") + '</span>' +
+          '<span class="chip">' + (n.impersonate === false ? "模拟关" : esc(CLIENT_LABELS[n.clientProfile] || n.clientProfile || "client")) + '</span>' +
+          emby +
+        '</div>' +
+        infoRow("接入", '<span class="mono masked" data-secret="' + attr(url) + '">••••••••••••</span> <button class="btn small" data-act="reveal" data-name="' + attr(n.name) + '">显示</button>') +
+        infoRow("上游", '<span class="masked" data-secret="' + attr((n.targets || []).join("\\n")) + '">' + esc(firstTarget ? "••••••••••••" : "未配置") + '</span>') +
+        infoRow("保活", keep) +
+        (n.secret ? infoRow("密钥", '<span class="masked" data-secret="' + attr(n.secret) + '">••••••</span>') : '') +
+      '</div>' +
+      '<div class="card-footer"><div class="card-actions"><button class="btn small" data-act="up" data-name="' + attr(n.name) + '" ' + (index === 0 ? "disabled" : "") + '>上移</button><button class="btn small" data-act="down" data-name="' + attr(n.name) + '" ' + (index === list.length - 1 ? "disabled" : "") + '>下移</button></div><div class="card-actions"><button class="btn small" data-act="copy" data-name="' + attr(n.name) + '">复制</button><button class="btn small" data-act="edit" data-name="' + attr(n.name) + '">编辑</button><button class="btn small" data-act="ping" data-name="' + attr(n.name) + '">测速</button><button class="btn small primary" data-act="keepalive" data-name="' + attr(n.name) + '">已观看</button><button class="btn small danger" data-act="delete" data-name="' + attr(n.name) + '">删除</button></div></div>' +
     '</article>';
-  }).join("") || '<div class="empty">暂无节点</div>';
+  }).join("") || '<div class="empty">暂无节点。点右上角 ··· 或「新建」添加线路。</div>';
 }
+
 function infoRow(label, value){ return '<div class="info-row"><div class="info-label">' + esc(label) + '</div><div class="info-value">' + value + '</div></div>'; }
 function keepaliveHTML(n){
-  if (!n.renewDays) return '<span class="badge">关闭</span>';
+  if (!n.renewDays) return '<span class="chip">保活关闭</span>';
   const k = n.keepalive || {};
-  const cls = k.status === "due" ? "warn" : (k.status === "warn" ? "warn" : "ok");
+  const cls = k.status === "due" || k.status === "warn" ? "warn" : "ok";
   const text = k.status === "due" ? "已超期 " + Math.abs(k.remainDays || 0) + " 天" : "剩余 " + (k.remainDays ?? n.renewDays) + " 天";
   const last = k.lastPlayTs ? new Date(k.lastPlayTs).toLocaleString() : "无记录";
-  return '<span class="badge ' + cls + '">' + esc(text) + '</span><div class="hint">周期 ' + esc(n.renewDays) + ' 天，最近 ' + esc(last) + '</div>';
+  return '<span class="chip ' + cls + '">' + esc(text) + '</span><span class="chip">周期 ' + esc(n.renewDays) + ' 天</span><div class="hint" style="margin-top:4px">最近 ' + esc(last) + '</div>';
 }
 function iconHTML(n){
   const icon = n.icon || DEFAULT_NODE_ICON_CLIENT;
@@ -3747,6 +5541,7 @@ function iconHTML(n){
   return '<span>' + esc(icon || DEFAULT_NODE_ICON_CLIENT) + '</span>';
 }
 function renderMetrics(){
+  if (!$("metricNodes")) return;
   $("metricNodes").textContent = nodes.length;
   $("metricEnabled").textContent = nodes.filter(n => n.enabled).length;
   if (stats && stats.today) {
@@ -3789,11 +5584,15 @@ async function saveNode(){
     remark: $("remark").value,
     renewDays: Number($("renewDays").value || 0),
     remindBeforeDays: Number($("remindBeforeDays").value || 0),
-    keepaliveAt: $("keepaliveAt").value
+    keepaliveAt: $("keepaliveAt").value,
+    embyUser: $("embyUser").value,
+    embyPassword: $("embyPassword").value,
+    embyPlayId: $("embyPlayId").value
   };
   try {
     await api("/api/nodes", { method:"POST", body: JSON.stringify(body) });
-    resetForm();
+    resetForm({ keepOpen: false });
+    hideNodeEditor();
     await loadNodes({ quietAuth: true });
     showToast("节点已保存");
   }
@@ -3842,6 +5641,31 @@ function chineseInitialClient(char){
   for (const [start, initial] of ranges) if (code >= start) result = initial;
   return result;
 }
+
+function showNodeEditor(mode){
+  const panel = $("nodeEditorPanel");
+  if (!panel) return;
+  panel.hidden = false;
+  if (mode === "create") {
+    $("formTitle").textContent = "新建媒体线路";
+  }
+  try { panel.scrollIntoView({ behavior: "smooth", block: "start" }); } catch {}
+}
+function hideNodeEditor(){
+  const panel = $("nodeEditorPanel");
+  if (!panel) return;
+  panel.hidden = true;
+}
+function openCreateNode(){
+  resetForm({ keepOpen: true });
+  showNodeEditor("create");
+}
+function cancelNodeEditor(){
+  resetForm({ keepOpen: false });
+  hideNodeEditor();
+  showToast("已取消编辑");
+}
+
 function editNode(name){
   const n = nodes.find(x => x.name === name); if (!n) return;
   $("formTitle").textContent = "编辑节点 " + n.name;
@@ -3860,8 +5684,11 @@ function editNode(name){
   $("renewDays").value = n.renewDays || "";
   $("remindBeforeDays").value = n.remindBeforeDays || "";
   $("keepaliveAt").value = n.keepaliveAt || "";
+  $("embyUser").value = n.embyUser || "";
+  $("embyPassword").value = n.embyPassword || "";
+  $("embyPlayId").value = n.embyPlayId || "";
   $("tag").value = n.tag || ""; $("remark").value = n.remark || "";
-  window.scrollTo({ top: 0, behavior: "smooth" });
+  showNodeEditor("edit");
 }
 async function deleteNode(name){
   if (!await uiConfirm("删除后该线路配置将不可恢复。\\n节点：" + name, "删除节点")) return;
@@ -3874,18 +5701,122 @@ async function deleteNode(name){
 }
 async function pingNode(name, options = {}){
   const n = nodes.find(x => x.name === name); if (!n) return;
+  latencyMap[name] = { ...(latencyMap[name] || {}), pending: true };
+  updateLatencyChip(name);
   try {
     const data = await api("/api/ping-node?url=" + encodeURIComponent(n.targets[0] || ""));
-    if (!options.quiet) showToast(data.ms >= 0 ? "可用: " + data.ms + "ms" : "断连/超时");
+    latencyMap[name] = { ms: Number(data.ms), at: Date.now(), pending: false };
+    updateLatencyChip(name);
+    if (!options.quiet) showToast(data.ms >= 0 ? (n.displayName || name) + " · " + data.ms + "ms" : (n.displayName || name) + " · 断连/超时");
     return data;
-  } catch(e){ handleError(e); }
+  } catch(e){
+    latencyMap[name] = { ms: -1, at: Date.now(), pending: false };
+    updateLatencyChip(name);
+    if (!options.quiet) handleError(e);
+  }
 }
+function updateLatencyChip(name){
+  const key = String(name || '');
+  let el = null;
+  document.querySelectorAll('[data-latency-for]').forEach((node) => {
+    if (!el && node.getAttribute('data-latency-for') === key) el = node;
+  });
+  if (!el) {
+    if ($('nodeGrid')) renderNodes();
+    return;
+  }
+  const lat = latencyMap[name];
+  el.className = 'chip latency-chip';
+  if (!lat || lat.pending) {
+    el.classList.add('pending');
+    el.textContent = lat && lat.pending ? '测速中…' : '未测速';
+    return;
+  }
+  if (lat.ms >= 0) {
+    el.classList.add(lat.ms < 180 ? 'good' : (lat.ms < 450 ? 'mid' : 'bad'));
+    el.textContent = lat.ms + ' ms';
+  } else {
+    el.classList.add('bad');
+    el.textContent = '超时';
+  }
+}
+
 async function markWatched(name){
+  if (watchStarting.has(name)) return showToast("该节点正在启动模拟观看，请稍候。");
+  const node = nodes.find(item => item.name === name);
+  const label = node?.displayName || name;
+  const confirmed = await uiConfirm(
+    "节点：" + label + "\\n\\n将登录保存的 Emby 账号并真实播放，通常持续 5-7.5 分钟。确定开始吗？",
+    "开始模拟观看"
+  );
+  if (!confirmed) return;
+  watchStarting.add(name);
+  setWatchButtonState(name, true);
+  showToast("正在登录上游并选择播放内容…");
   try {
-    await api("/api/keepalive/reset", { method:"POST", body: JSON.stringify({ name }) });
-    showToast("已更新观看时间");
-    loadNodes({ quietAuth: true });
+    const data = await api("/api/keepalive/reset", { method:"POST", body: JSON.stringify({ name, source: "manual" }) });
+    if (data.pending) {
+      await uiAlert(
+        data.message || ("真实模拟观看已开始：" + (data.displayName || name) + "\\n预计 5-7.5 分钟内完成，完成后通知 TG。"),
+        "模拟观看已开始"
+      );
+      // 后台任务完成后自动刷新记录
+      setTimeout(() => {
+        loadWatchLogs({ quiet: true });
+        loadNodes({ quietAuth: true });
+      }, 70000);
+      setTimeout(() => {
+        loadWatchLogs({ quiet: true });
+        loadNodes({ quietAuth: true });
+      }, 390000);
+    } else {
+      showToast("已记录模拟观看：" + (data.displayName || name) + (data.durationSec ? (" · " + formatDurationClient(data.durationSec)) : "") + (data.title ? (" · " + data.title) : ""));
+      await Promise.all([
+        loadNodes({ quietAuth: true }),
+        loadWatchLogs({ quiet: true })
+      ]);
+    }
   } catch(e){ handleError(e); }
+  finally {
+    watchStarting.delete(name);
+    setWatchButtonState(name, false);
+  }
+}
+function setWatchButtonState(name, pending){
+  document.querySelectorAll('button[data-act="keepalive"]').forEach((button) => {
+    if (button.getAttribute("data-name") !== name) return;
+    button.disabled = pending;
+    button.textContent = pending ? "启动中…" : "已观看";
+  });
+}
+function formatDurationClient(seconds){
+  const total = Math.max(0, Math.round(Number(seconds || 0)));
+  const min = Math.floor(total / 60);
+  const sec = total % 60;
+  if (min <= 0) return sec + " 秒";
+  return min + " 分 " + String(sec).padStart(2, "0") + " 秒";
+}
+async function loadWatchLogs(options = {}){
+  try {
+    const data = await api("/api/watch-logs?days=3&limit=100");
+    watchLogs = data.items || [];
+    renderWatchLogs();
+    if (!options.quiet) showToast("已刷新模拟观看记录");
+  } catch(e){
+    if (!options.quiet) handleError(e);
+  }
+}
+function renderWatchLogs(){
+  const rows = $("watchLogRows");
+  if (!rows) return;
+  rows.innerHTML = watchLogs.map((item) => {
+    const site = item.displayName || item.node || "-";
+    const title = item.title || "-";
+    const time = item.time || (item.ts ? new Date(Number(item.ts)).toLocaleString() : "-");
+    const duration = item.durationText || formatDurationClient(item.durationSec || 0);
+    const source = item.source === "auto" ? "自动" : (item.source === "manual" ? "手动" : esc(item.source || "手动"));
+    return '<tr><td>' + esc(site) + '</td><td>' + esc(title) + '</td><td class="mono">' + esc(item.node || "") + '</td><td>' + esc(time) + '</td><td>' + esc(duration) + '</td><td>' + source + '</td></tr>';
+  }).join("") || '<tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无模拟观看记录</td></tr>';
 }
 async function loadStats(){
   try {
@@ -3925,20 +5856,22 @@ function renderDashboardCharts(){
   }, {}));
   const playbackRows = aggregateForChart(rows.filter(row => row.kind === "playback"), "count").slice(0, 6);
   const trafficRows = aggregateForChart(rows, "bytes").slice(0, 6);
+  // 7 日趋势：用总量做成占比饼（各天占 7 日合计）
   const trendRows = (analytics?.trend || []).map(row => ({ label: row.date || "-", value: Number(row.count || 0) })).slice(-7);
-  const healthRows = (stats?.recent || []).reduce((acc, row) => {
+  const healthRows = Object.values((stats?.recent || []).reduce((acc, row) => {
     const key = Number(row.status || 0) >= 400 ? "异常" : "正常";
     acc[key] = acc[key] || { label: key, value: 0 };
     acc[key].value++;
     return acc;
-  }, {});
+  }, {}));
   box.innerHTML =
-    chartCard("请求类型分布", kindRows, item => item.value + " 次") +
-    chartCard("播放最多节点", playbackRows, item => item.value + " 次") +
-    chartCard("节点流量排行", trafficRows, item => humanBytes(item.value)) +
-    chartCard("7 日请求趋势", trendRows, item => item.value + " 次") +
-    chartCard("最近状态", Object.values(healthRows), item => item.value + " 条");
+    pieCard("请求类型分布", kindRows, item => item.value + " 次") +
+    pieCard("播放最多节点", playbackRows, item => item.value + " 次") +
+    pieCard("节点流量占比", trafficRows, item => humanBytes(item.value)) +
+    pieCard("7 日请求占比", trendRows, item => item.value + " 次") +
+    pieCard("最近状态", healthRows, item => item.value + " 条");
 }
+
 function aggregateForChart(rows, key){
   const map = {};
   for (const row of rows) {
@@ -3948,15 +5881,48 @@ function aggregateForChart(rows, key){
   }
   return Object.values(map).sort((a,b) => b.value - a.value);
 }
-function chartCard(title, rows, format){
-  const list = rows.filter(row => Number(row.value || 0) > 0);
-  if (!list.length) return '<section class="chart-card"><h3>' + esc(title) + '</h3><div class="empty" style="padding:40px 0">暂无数据</div></section>';
-  const max = Math.max(...list.map(row => Number(row.value || 0)), 1);
-  return '<section class="chart-card"><h3>' + esc(title) + '</h3>' + list.map(row => {
-    const width = Math.max(4, Math.round(Number(row.value || 0) / max * 100));
-    return '<div class="bar-row"><div class="bar-label" title="' + attr(row.label) + '">' + esc(row.label) + '</div><div class="bar-track"><div class="bar-fill" style="width:' + width + '%"></div></div><div class="bar-value">' + esc(format(row)) + '</div></div>';
-  }).join("") + '</section>';
+function pieColors(n){
+  const base = ["#38bdf8","#22d3ee","#34d399","#fbbf24","#fb7185","#a3e635","#818cf8","#f472b6"];
+  return Array.from({ length: Math.max(n, 1) }, (_, i) => base[i % base.length]);
 }
+function pieCard(title, rows, format){
+  const list = (rows || []).map(r => ({ label: r.label || "-", value: Number(r.value || 0) })).filter(r => r.value > 0);
+  if (!list.length) {
+    return '<section class="chart-card"><h3>' + esc(title) + '</h3><div class="empty" style="padding:40px 0">暂无数据</div></section>';
+  }
+  const total = list.reduce((s, r) => s + r.value, 0) || 1;
+  const colors = pieColors(list.length);
+  let angle = -Math.PI / 2;
+  const cx = 60, cy = 60, r = 52;
+  let slices = "";
+  if (list.length === 1) {
+    slices = '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="' + colors[0] + '"></circle>';
+  } else {
+    slices = list.map((item, idx) => {
+      const portion = item.value / total;
+      const sweep = portion * Math.PI * 2;
+      const x1 = cx + r * Math.cos(angle);
+      const y1 = cy + r * Math.sin(angle);
+      angle += sweep;
+      const x2 = cx + r * Math.cos(angle);
+      const y2 = cy + r * Math.sin(angle);
+      const large = sweep > Math.PI ? 1 : 0;
+      const d = ["M", cx, cy, "L", x1, y1, "A", r, r, 0, large, 1, x2, y2, "Z"].join(" ");
+      return '<path d="' + d + '" fill="' + colors[idx] + '" stroke="rgba(0,0,0,.14)" stroke-width="1"></path>';
+    }).join("");
+  }
+  // 内圆做成甜甜圈，更现代
+  slices += '<circle cx="' + cx + '" cy="' + cy + '" r="28" fill="rgba(15,23,42,.55)"></circle>';
+  const legend = list.map((item, idx) => {
+    const pct = Math.round(item.value / total * 100);
+    return '<div class="pie-legend-row"><span class="pie-dot" style="background:' + colors[idx] + '"></span><span class="pie-name" title="' + attr(item.label) + '">' + esc(item.label) + '</span><span class="pie-val">' + esc(format(item)) + ' · ' + pct + '%</span></div>';
+  }).join("");
+  return '<section class="chart-card"><h3>' + esc(title) + '</h3><div class="pie-wrap"><svg class="pie-svg" viewBox="0 0 120 120" role="img" aria-label="' + attr(title) + '">' + slices + '</svg><div class="pie-legend">' + legend + '</div></div></section>';
+}
+function chartCard(title, rows, format){
+  return pieCard(title, rows, format);
+}
+
 async function loadPreferredIPs(){
   const btn = $("preferredBtn");
   const type = $("ipType").value;
@@ -3998,11 +5964,17 @@ async function updateDNS(){
 function renderLogs(rows){
   $("logRows").innerHTML = rows.map(r => '<tr><td>' + esc(new Date(Number(r.ts || 0)).toLocaleString()) + '</td><td>' + esc(r.node || "") + '</td><td class="mono">' + esc(r.ip || "") + '</td><td>' + esc(r.country || "") + '</td><td>' + esc(r.status || "") + '</td><td>' + esc(r.path || "") + '</td></tr>').join("") || '<tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无数据</td></tr>';
 }
-function resetForm(){
+function resetForm(options = {}){
   $("formTitle").textContent = "部署 / 编辑媒体线路";
-  for (const id of ["editingName","name","displayName","icon","targets","streamTarget","secret","tag","remark","renewDays","remindBeforeDays","keepaliveAt"]) $(id).value = "";
-  $("clientProfile").value = "yamby"; $("headerMode").value = "dual"; $("streamMode").value = "proxy";
-  $("impersonate").checked = true; $("directExternal").checked = false; $("cacheImage").checked = true; $("enabled").checked = true;
+  for (const id of ["editingName","name","displayName","icon","targets","streamTarget","secret","tag","remark","renewDays","remindBeforeDays","keepaliveAt","embyUser","embyPassword","embyPlayId"]) if ($(id)) $(id).value = "";
+  if ($("clientProfile")) $("clientProfile").value = "yamby";
+  if ($("headerMode")) $("headerMode").value = "dual";
+  if ($("streamMode")) $("streamMode").value = "proxy";
+  if ($("impersonate")) $("impersonate").checked = true;
+  if ($("directExternal")) $("directExternal").checked = false;
+  if ($("cacheImage")) $("cacheImage").checked = true;
+  if ($("enabled")) $("enabled").checked = true;
+  if (!options.keepOpen) hideNodeEditor();
 }
 async function importNodes(){
   const raw = await uiPrompt("粘贴导出的 JSON 内容。", "导入节点", "{\\n  \\"nodes\\": []\\n}");
@@ -4016,19 +5988,67 @@ async function importNodes(){
 }
 function exportNodes(){ location.href = "data:application/json;charset=utf-8," + encodeURIComponent(JSON.stringify({ nodes }, null, 2)); }
 function showToast(message){
-  return uiNotice(message, "提示");
+  const toast = $("toast");
+  if (!toast) return;
+  if (toastTimer) clearTimeout(toastTimer);
+  toast.textContent = String(message || "");
+  toast.classList.add("show");
+  toastTimer = setTimeout(() => {
+    toast.classList.remove("show");
+    toastTimer = null;
+  }, 2600);
 }
 function copyText(v){ navigator.clipboard.writeText(v || ""); showToast("复制成功"); }
-function toggleTheme(){ document.body.classList.toggle("dark"); localStorage.setItem("embyproxy_cf_theme", document.body.classList.contains("dark") ? "dark" : "light"); }
-function switchPage(page){
-  document.querySelectorAll("[data-page]").forEach(el => el.classList.toggle("active", el.dataset.page === page));
-  document.querySelectorAll("[data-page-tab]").forEach(el => el.classList.toggle("active", el.dataset.pageTab === page));
-  if (page === "dashboard") { loadStats(); loadAnalytics(); }
-  if (page === "network") loadDNS({ quiet: true });
-  if (page === "overview") { loadTrace(); loadStats(); }
+function applyTheme(theme){
+  const next = (theme === "trust") ? "trust" : "cyber";
+  document.body.classList.remove("theme-trust", "theme-cyber", "dark");
+  document.body.classList.add(next === "cyber" ? "theme-cyber" : "theme-trust");
+  if (next === "cyber") document.body.classList.add("dark");
+  localStorage.setItem("embyproxy_ui_theme", next);
+  // 小图标：赛博用月亮，信任用太阳
+  const icon = next === "cyber" ? "☾" : "☀";
+  document.querySelectorAll("#themeToggleBtn, #loginThemeBtn").forEach((btn) => {
+    if (btn) {
+      btn.textContent = icon;
+      btn.title = next === "cyber" ? "当前：赛博暗黑（点击切换专业信任）" : "当前：专业信任（点击切换赛博暗黑）";
+    }
+  });
+  document.querySelectorAll("[data-theme]").forEach((btn) => {
+    btn.classList.toggle("active", btn.getAttribute("data-theme") === next);
+  });
 }
+function toggleTheme(){
+  const cur = localStorage.getItem("embyproxy_ui_theme") || "cyber";
+  applyTheme(cur === "cyber" ? "trust" : "cyber");
+}
+
+function switchPage(page){
+  const next = String(page || "nodes");
+  document.querySelectorAll("[data-page]").forEach((el) => {
+    const on = (el.getAttribute("data-page") || "") === next;
+    el.classList.toggle("active", on);
+    // 双保险：避免 CSS 优先级导致多页同时显示
+    el.style.display = on ? "grid" : "none";
+  });
+  document.querySelectorAll("[data-page-tab]").forEach((el) => {
+    const tab = el.getAttribute("data-page-tab") || el.dataset.pageTab || "";
+    el.classList.toggle("active", tab === next);
+  });
+  const titles = { nodes: "线路配置", network: "测速与 DNS", dashboard: "数据大屏", deploy: "代码更新" };
+  if ($("pageTitle")) $("pageTitle").textContent = titles[next] || "控制台";
+  try {
+    if (next === "dashboard") { loadStats(); loadAnalytics(); }
+    if (next === "network") loadDNS({ quiet: true });
+    if (next === "nodes") loadWatchLogs({ quiet: true });
+    else hideNodeEditor();
+  } catch (err) {
+    console.log("switchPage side effect", err);
+  }
+  try { window.scrollTo({ top: 0, behavior: "smooth" }); } catch {}
+}
+
 function openDashboard(){ switchPage("dashboard"); }
-function closeDashboard(){ switchPage("overview"); }
+function closeDashboard(){ switchPage("nodes"); }
 async function loadTrace(){
   try {
     const data = await api("/api/trace");
@@ -4237,14 +6257,23 @@ async function deployWorker(){
   finally { btn.disabled = false; btn.textContent = "立即覆盖并重启"; }
 }
 async function pingAllNodes(){
+  if (!nodes.length) return showToast("暂无节点");
+  showToast("开始全局测速…");
   let ok = 0;
   let fail = 0;
-  for (const n of nodes) {
-    const data = await pingNode(n.name, { quiet: true });
-    if (data?.ms >= 0) ok++;
-    else fail++;
-  }
-  showToast("全局测速完成：可用 " + ok + " 个，异常 " + fail + " 个");
+  // 并发限制 4，避免打爆
+  const queue = nodes.map(n => n.name);
+  const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
+    while (queue.length) {
+      const name = queue.shift();
+      const data = await pingNode(name, { quiet: true });
+      if (data?.ms >= 0) ok++;
+      else fail++;
+    }
+  });
+  await Promise.all(workers);
+  renderNodes();
+  showToast("全局测速完成：可用 " + ok + " · 异常 " + fail);
 }
 async function moveNode(name, dir){
   const index = nodes.findIndex(n => n.name === name);
@@ -4265,22 +6294,48 @@ function humanBytes(bytes){
 }
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function attr(v){ return esc(v).replace(/\\n/g, " "); }
-$("loginToken").addEventListener("keydown", (event) => {
+if ($("loginToken")) $("loginToken").addEventListener("keydown", (event) => {
   if (event.key === "Enter") saveToken();
 });
-$("loginBtn").addEventListener("click", saveToken);
-document.querySelectorAll("[data-page-tab]").forEach(btn => btn.addEventListener("click", () => switchPage(btn.dataset.pageTab)));
+if ($("loginBtn")) $("loginBtn").addEventListener("click", saveToken);
+document.querySelectorAll("[data-page-tab]").forEach((btn) => {
+  btn.addEventListener("click", (event) => {
+    event.preventDefault();
+    const tab = btn.getAttribute("data-page-tab") || btn.dataset.pageTab || "nodes";
+    switchPage(tab);
+  });
+});
 $("reloadNodesBtn").addEventListener("click", () => loadNodes());
+$("reloadWatchLogsBtn").addEventListener("click", () => loadWatchLogs());
 $("logoutBtn").addEventListener("click", logout);
 $("exportBtn").addEventListener("click", exportNodes);
 $("importBtn").addEventListener("click", importNodes);
 $("saveNodeBtn").addEventListener("click", saveNode);
-$("resetBtn").addEventListener("click", resetForm);
+$("resetBtn").addEventListener("click", () => resetForm({ keepOpen: true }));
+if ($("cancelEditBtn")) $("cancelEditBtn").addEventListener("click", cancelNodeEditor);
+if ($("newNodeBtn")) $("newNodeBtn").addEventListener("click", openCreateNode);
+if ($("newNodeBtn2")) $("newNodeBtn2").addEventListener("click", openCreateNode);
+if ($("toggleDeployBtn")) $("toggleDeployBtn").addEventListener("click", () => {
+  const body = $("deployBody");
+  if (!body) return;
+  body.hidden = !body.hidden;
+  $("toggleDeployBtn").textContent = body.hidden ? "展开编辑" : "收起编辑";
+});
+// 点击菜单外关闭
+document.addEventListener("click", (e) => {
+  const menu = $("moreMenu");
+  if (menu && !menu.contains(e.target)) menu.open = false;
+});
 $("search").addEventListener("input", renderNodes);
 $("preferredBtn").addEventListener("click", loadPreferredIPs);
 $("dnsLoadBtn").addEventListener("click", loadDNS);
 $("dnsUpdateBtn").addEventListener("click", updateDNS);
-$("themeBtn").addEventListener("click", toggleTheme);
+if ($("themeToggleBtn")) $("themeToggleBtn").addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); toggleTheme(); });
+if ($("loginThemeBtn")) $("loginThemeBtn").addEventListener("click", (e) => { e.preventDefault(); toggleTheme(); });
+document.querySelectorAll("[data-theme]").forEach((btn) => {
+  btn.addEventListener("click", () => applyTheme(btn.getAttribute("data-theme")));
+});
+applyTheme(localStorage.getItem("embyproxy_ui_theme") || "cyber");
 $("closeDashboardBtn").addEventListener("click", closeDashboard);
 $("testCustomBtn").addEventListener("click", addCustomIPs);
 $("fetchCustomApiBtn").addEventListener("click", fetchCustomApiAndTest);
@@ -4319,7 +6374,10 @@ $("nodeGrid").addEventListener("click", (event) => {
   }
 });
 if (adminToken.trim()) {
+  document.body.classList.add("authed");
+  switchPage("nodes");
   loadNodes({ quietAuth: true });
+  loadWatchLogs({ quiet: true });
   loadStats();
   loadTrace();
 } else {

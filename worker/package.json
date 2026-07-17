@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "build:obfuscate": "mkdir -p dist && javascript-obfuscator src/index.js --output dist/index.js --config obfuscator.config.json",
+    "preview:admin": "node scripts/export-admin.mjs",
+    "test": "node --check src/index.js && node scripts/check-admin.mjs",
+    "test:admin": "node scripts/check-admin.mjs",
     "dev": "wrangler dev",
     "deploy": "npm run build:obfuscate && wrangler deploy",
-    "d1:init": "wrangler d1 execute media_c8af70 --file=./schema.sql"
+    "d1:init": "wrangler d1 execute media_c8af70 --remote --file=./schema.sql"
   },
   "devDependencies": {
     "javascript-obfuscator": "^5.4.3",

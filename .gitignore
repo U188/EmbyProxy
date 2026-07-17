@@ -8,6 +8,10 @@ worker/.wrangler/
 
 # Generated deployment bundle
 worker/dist/
+worker/review-admin.html
+
+# Local review notes
+worker/REVIEW-*.md
 
 # Local environment and secrets
 .env
