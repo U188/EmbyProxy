@@ -1,14 +1,28 @@
-const BUILD_VERSION = "0.4.9";
+const BUILD_VERSION = "0.5.2";
 const DEFAULT_MAX_REWRITE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_RETRY_BODY_BYTES = 16 * 1024 * 1024;
+const PROXY_NODE_CACHE_TTL_MS = 10000;
+const DEFAULT_UPSTREAM_HEADER_TIMEOUT_MS = 2500;
+const TARGET_HEALTH_SUCCESS_TTL_MS = 5 * 60 * 1000;
+const TARGET_HEALTH_FAILURE_TTL_MS = 30 * 1000;
+const PLAYBACK_AUX_WRITE_INTERVAL_MS = 60 * 1000;
+const SENSITIVE_QUERY_KEYS = new Set([
+  "api_key", "apikey", "token", "access_token",
+  "authorization", "x-authorization", "x-emby-authorization", "x-mediabrowser-authorization",
+  "x-emby-token", "x-mediabrowser-token"
+]);
 const DEFAULT_CLIENT_PROFILE = "yamby";
 const DEFAULT_NODE_ICON = "🎬";
 const IDENTITY_KEY = "system:upstream_identity";
+const SCHEMA_VERSION_KEY = "system:schema_version";
+const SCHEMA_VERSION = "0.5.2";
 const LEGACY_DEFAULT_DEVICE_NAME = "OnePlus-PKG110";
 const SIMULATED_WATCH_DURATION_MIN_SEC = 300;
 // The minute cron can add almost 60 seconds before the stop event is sent.
 const SIMULATED_WATCH_DURATION_MAX_SEC = 390;
 const AUTO_WATCH_FAILURE_BACKOFF_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_AUTO_WATCH_MAX_CONCURRENCY = 2;
+const PERFORMANCE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const CLIENT_PROFILES = [
   { id: "yamby", label: "Yamby Android", ua: "Yamby/2.0.4.6(Android", client: "Yamby", version: "2.0.4.6", device: "Android", authStyle: "yamby", idFormat: "uuid" },
   { id: "hills_android", label: "Hills Android", ua: "Hills/1.7.2 (android; 15)", client: "Hills", version: "1.7.2", device: "diting", authStyle: "hills", idLength: 16 },
@@ -20,6 +34,10 @@ let identityStatePromise;
 let traceEgressCache = { expires: 0, data: null };
 let traceEgressPromise;
 let nodeHostMapCache = { expires: 0, map: null };
+const proxyNodeCache = new Map();
+const targetHealthCache = new Map();
+const playbackVisitorSampleCache = new Map();
+const playbackKeepaliveWriteCache = new Map();
 
 export default {
   async fetch(request, env, ctx) {
@@ -39,6 +57,7 @@ export default {
       ctx.waitUntil(cleanOldVisitorLogs(env));
       ctx.waitUntil(cleanOldWatchLogs(env));
       ctx.waitUntil(cleanOldWatchSessions(env));
+      ctx.waitUntil(cleanOldPerformanceMetrics(env));
       ctx.waitUntil(runAutoSimulatedWatches(env));
       ctx.waitUntil(sendTelegramDailyIfDue(env));
     } else if (minute % 10 === 0) {
@@ -67,12 +86,14 @@ async function handleFetch(request, env, ctx) {
     await ensureSchema(env);
     return handleTelegramWebhook(request, env);
   }
+  if (url.pathname === "/api/health") {
+    return json({ ok: true, version: BUILD_VERSION });
+  }
   if (url.pathname.startsWith("/api/")) {
     await ensureSchema(env);
     return handleAPI(request, env, ctx);
   }
 
-  await ensureSchema(env);
   return handleProxy(request, env, ctx);
 }
 
@@ -81,12 +102,18 @@ async function ensureSchema(env) {
     throw new Error("D1 binding DB is not configured");
   }
   if (!schemaReady) {
-    schemaReady = initializeSchema(env);
+    schemaReady = initializeSchema(env).catch((err) => {
+      schemaReady = undefined;
+      throw err;
+    });
   }
   return schemaReady;
 }
 
 async function initializeSchema(env) {
+  if (await schemaVersionIsCurrent(env)) {
+    return;
+  }
   const statements = [
     `CREATE TABLE IF NOT EXISTS nodes (
       name TEXT PRIMARY KEY,
@@ -115,6 +142,15 @@ async function initializeSchema(env) {
       emby_access_token TEXT DEFAULT '',
       emby_auth_profile TEXT DEFAULT '',
       emby_play_id TEXT DEFAULT '',
+      stream_strategy TEXT DEFAULT 'auto',
+      stream_timeout_ms INTEGER DEFAULT 2500,
+      watch_window_start INTEGER DEFAULT 0,
+      watch_window_end INTEGER DEFAULT 24,
+      watch_daily_limit INTEGER DEFAULT 1,
+      watch_content_type TEXT DEFAULT 'mixed',
+      watch_failure_backoff_min INTEGER DEFAULT 360,
+      watch_duration_min_sec INTEGER DEFAULT 300,
+      watch_duration_max_sec INTEGER DEFAULT 390,
       created_at INTEGER NOT NULL DEFAULT 0,
       updated_at INTEGER NOT NULL DEFAULT 0
     )`,
@@ -191,6 +227,43 @@ async function initializeSchema(env) {
       renew_days INTEGER DEFAULT 0
     )`,
     `CREATE INDEX IF NOT EXISTS idx_sim_watch_sessions_status_next ON sim_watch_sessions(status, next_tick_at)`,
+    `CREATE TABLE IF NOT EXISTS performance_metrics (
+      node TEXT NOT NULL,
+      bucket_ts INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      request_count INTEGER DEFAULT 0,
+      success_count INTEGER DEFAULT 0,
+      error_count INTEGER DEFAULT 0,
+      failover_count INTEGER DEFAULT 0,
+      node_ms_sum REAL DEFAULT 0,
+      upstream_ms_sum REAL DEFAULT 0,
+      rewrite_ms_sum REAL DEFAULT 0,
+      total_ms_sum REAL DEFAULT 0,
+      total_ms_max REAL DEFAULT 0,
+      b100 INTEGER DEFAULT 0,
+      b250 INTEGER DEFAULT 0,
+      b500 INTEGER DEFAULT 0,
+      b1000 INTEGER DEFAULT 0,
+      b2500 INTEGER DEFAULT 0,
+      b5000 INTEGER DEFAULT 0,
+      bslow INTEGER DEFAULT 0,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (node, bucket_ts, kind)
+    )`,
+    `CREATE TABLE IF NOT EXISTS line_performance (
+      node TEXT NOT NULL,
+      bucket_ts INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      line_key TEXT NOT NULL,
+      line_label TEXT DEFAULT '',
+      attempts INTEGER DEFAULT 0,
+      successes INTEGER DEFAULT 0,
+      failures INTEGER DEFAULT 0,
+      latency_ms_sum REAL DEFAULT 0,
+      last_latency_ms REAL DEFAULT 0,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (node, bucket_ts, kind, line_key)
+    )`,
     `CREATE TABLE IF NOT EXISTS dns_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts INTEGER NOT NULL,
@@ -208,10 +281,16 @@ async function initializeSchema(env) {
     `CREATE INDEX IF NOT EXISTS idx_visitor_logs_ts ON visitor_logs(ts)`,
     `CREATE INDEX IF NOT EXISTS idx_request_stats_day ON request_stats(day)`,
     `CREATE INDEX IF NOT EXISTS idx_watch_logs_ts ON watch_logs(ts)`,
-    `CREATE INDEX IF NOT EXISTS idx_watch_logs_node_ts ON watch_logs(node, ts)`
+    `CREATE INDEX IF NOT EXISTS idx_watch_logs_node_ts ON watch_logs(node, ts)`,
+    `CREATE INDEX IF NOT EXISTS idx_performance_metrics_bucket ON performance_metrics(bucket_ts)`,
+    `CREATE INDEX IF NOT EXISTS idx_line_performance_bucket ON line_performance(bucket_ts)`
   ];
-  for (const statement of statements) {
-    await env.DB.prepare(statement).run();
+  if (typeof env.DB.batch === "function") {
+    await env.DB.batch(statements.map((statement) => env.DB.prepare(statement)));
+  } else {
+    for (const statement of statements) {
+      await env.DB.prepare(statement).run();
+    }
   }
   await ensureColumns(env, "nodes", {
     display_name: "TEXT DEFAULT ''",
@@ -239,6 +318,15 @@ async function initializeSchema(env) {
     emby_access_token: "TEXT DEFAULT ''",
     emby_auth_profile: "TEXT DEFAULT ''",
     emby_play_id: "TEXT DEFAULT ''",
+    stream_strategy: "TEXT DEFAULT 'auto'",
+    stream_timeout_ms: "INTEGER DEFAULT 2500",
+    watch_window_start: "INTEGER DEFAULT 0",
+    watch_window_end: "INTEGER DEFAULT 24",
+    watch_daily_limit: "INTEGER DEFAULT 1",
+    watch_content_type: "TEXT DEFAULT 'mixed'",
+    watch_failure_backoff_min: "INTEGER DEFAULT 360",
+    watch_duration_min_sec: "INTEGER DEFAULT 300",
+    watch_duration_max_sec: "INTEGER DEFAULT 390",
     created_at: "INTEGER NOT NULL DEFAULT 0",
     updated_at: "INTEGER NOT NULL DEFAULT 0"
   });
@@ -264,6 +352,19 @@ async function initializeSchema(env) {
     title: "TEXT DEFAULT ''",
     item_id: "TEXT DEFAULT ''"
   });
+  await env.DB.prepare(`
+    INSERT INTO system_config (k, v, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(k) DO UPDATE SET v = excluded.v, updated_at = excluded.updated_at
+  `).bind(SCHEMA_VERSION_KEY, SCHEMA_VERSION, Date.now()).run();
+}
+
+async function schemaVersionIsCurrent(env) {
+  try {
+    const row = await env.DB.prepare(`SELECT v FROM system_config WHERE k = ?`).bind(SCHEMA_VERSION_KEY).first();
+    return row?.v === SCHEMA_VERSION;
+  } catch {
+    return false;
+  }
 }
 
 async function ensureColumns(env, table, columns) {
@@ -355,6 +456,14 @@ async function handleAPI(request, env, ctx) {
   if (url.pathname === "/api/stats" && request.method === "GET") {
     return json({ ok: true, stats: await getStats(env) });
   }
+  if (url.pathname === "/api/performance" && request.method === "GET") {
+    const hours = Number(url.searchParams.get("hours") || 24);
+    return json({ ok: true, performance: await getPerformanceMetrics(env, hours) });
+  }
+  if (url.pathname === "/api/stream-health" && request.method === "POST") {
+    const body = await readJSON(request);
+    return json(await checkNodeStreamHealth(env, body.name));
+  }
   if (url.pathname === "/api/ping-node" && request.method === "GET") {
     return json(await pingTargetCompat(url.searchParams.get("url") || ""));
   }
@@ -395,9 +504,16 @@ async function handleProxy(request, env, ctx) {
     return text("Missing node name", 400);
   }
 
-  const node = await getNode(env, parsed.name);
+  const timing = createProxyTiming();
+  const nodeStarted = performanceNow();
+  const identityWarmup = getIdentityState(env).catch(() => null);
+  const node = await getProxyNode(env, parsed.name);
+  timing.node = performanceNow() - nodeStarted;
   if (!node || !node.enabled) {
     return text("Node not found", 404);
+  }
+  if (node.impersonate !== false) {
+    await identityWarmup;
   }
 
   const route = applyNodeSecret(parsed, node);
@@ -407,7 +523,7 @@ async function handleProxy(request, env, ctx) {
 
   const bodyBuffer = await retryableBody(request);
   if (route.path.startsWith("/__raw__/")) {
-    return handleRawProxy(request, env, ctx, node, route.path, bodyBuffer, inboundURL);
+    return handleRawProxy(request, env, ctx, node, route.path, bodyBuffer, inboundURL, timing);
   }
 
   const targets = selectTargets(node, route.path);
@@ -419,12 +535,14 @@ async function handleProxy(request, env, ctx) {
   let lastResponse;
   let lastResponseURL;
   for (const target of targets) {
+    const targetStarted = performanceNow();
+    let outcomeRecorded = false;
     try {
       const targetURL = buildTargetURL(target, route.path, inboundURL.search);
       const shouldRedirect = shouldUseDirectStream(node, request, route.path);
       if (shouldRedirect) {
-        ctx.waitUntil(recordRequest(env, request, node.name, route.path, 302, 0, "direct"));
-        return Response.redirect(targetURL.toString(), 302);
+        trackTargetOutcome(timing, target, "success", 0, route.path);
+        return completeProxyResponse(ctx, env, request, node.name, route.path, Response.redirect(targetURL.toString(), 302), "direct", timing);
       }
 
       const outbound = await buildOutboundRequest(request, targetURL, node, bodyBuffer, env);
@@ -433,43 +551,93 @@ async function handleProxy(request, env, ctx) {
       if (cacheableImage) {
         const cached = await caches.default.match(imageCacheKey);
         if (cached) {
-          ctx.waitUntil(recordRequest(env, request, node.name, route.path, cached.status, contentLength(cached), "image"));
-          return cached;
+          return completeProxyResponse(ctx, env, request, node.name, route.path, cached, "image", timing);
         }
       }
 
-      const upstream = await fetch(outbound);
+      const upstreamStarted = performanceNow();
+      timing.attempts++;
+      const upstream = await fetchWithHeaderTimeout(
+        outbound,
+        targets.length > 1 && ["GET", "HEAD"].includes(request.method) ? targetHeaderTimeoutMs(node, route.path, env) : 0
+      );
+      timing.upstream += performanceNow() - upstreamStarted;
       if (isRetryableStatus(upstream.status) && targets.length > 1) {
+        recordTargetOutcome(node.name, route.path, target, "failure", performanceNow() - targetStarted);
+        trackTargetOutcome(timing, target, "failure", performanceNow() - targetStarted, route.path);
+        outcomeRecorded = true;
+        discardResponseBody(lastResponse);
         lastResponse = upstream;
         lastResponseURL = targetURL;
         continue;
       }
 
+      const redirectStarted = performanceNow();
       const streamRedirect = await followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env);
+      timing.upstream += performanceNow() - redirectStarted;
       if (streamRedirect) {
         if (isRetryableStatus(streamRedirect.upstream.status) && targets.length > 1) {
+          recordTargetOutcome(node.name, route.path, target, "failure", performanceNow() - targetStarted);
+          trackTargetOutcome(timing, target, "failure", performanceNow() - targetStarted, route.path);
+          outcomeRecorded = true;
+          discardResponseBody(lastResponse);
           lastResponse = streamRedirect.upstream;
           lastResponseURL = streamRedirect.targetURL;
           continue;
         }
-        const response = await finishProxyResponse(streamRedirect.upstream, request, node, streamRedirect.targetURL, inboundURL, env);
-        return recordProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request));
+        recordTargetOutcome(node.name, route.path, target, "success", performanceNow() - targetStarted);
+        trackTargetOutcome(timing, target, "success", performanceNow() - targetStarted, route.path);
+        outcomeRecorded = true;
+        discardResponseBody(lastResponse);
+        lastResponse = undefined;
+        const response = await timedFinishProxyResponse(streamRedirect.upstream, request, node, streamRedirect.targetURL, inboundURL, env, timing);
+        return completeProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request), timing);
       }
 
-      const response = await finishProxyResponse(upstream, request, node, targetURL, inboundURL, env);
+      recordTargetOutcome(node.name, route.path, target, "success", performanceNow() - targetStarted);
+      trackTargetOutcome(timing, target, "success", performanceNow() - targetStarted, route.path);
+      outcomeRecorded = true;
+      discardResponseBody(lastResponse);
+      lastResponse = undefined;
+      const response = await timedFinishProxyResponse(upstream, request, node, targetURL, inboundURL, env, timing);
       if (cacheableImage && response.ok) {
         ctx.waitUntil(caches.default.put(imageCacheKey, response.clone()));
       }
-      return recordProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request));
+      return completeProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request), timing);
     } catch (err) {
+      if (!outcomeRecorded) {
+        recordTargetOutcome(node.name, route.path, target, "failure", performanceNow() - targetStarted);
+        trackTargetOutcome(timing, target, "failure", performanceNow() - targetStarted, route.path);
+      }
       lastError = errMessage(err);
     }
   }
 
   if (lastResponse) {
-    return finishProxyResponse(lastResponse, request, node, lastResponseURL || buildTargetURL(targets[0], route.path, inboundURL.search), inboundURL, env);
+    const response = await timedFinishProxyResponse(lastResponse, request, node, lastResponseURL || buildTargetURL(targets[0], route.path, inboundURL.search), inboundURL, env, timing);
+    return completeProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request), timing);
   }
-  return text("Line failover exhausted. Last Error: " + lastError, 502);
+  const exhausted = text("Line failover exhausted. Last Error: " + lastError, 502);
+  return completeProxyResponse(
+    ctx,
+    env,
+    request,
+    node.name,
+    route.path,
+    exhausted,
+    requestKind(route.path, exhausted, request),
+    timing
+  );
+}
+
+function discardResponseBody(response) {
+  if (!response?.body) return;
+  try {
+    const cancelled = response.body.cancel();
+    if (cancelled?.catch) cancelled.catch(() => {});
+  } catch {
+    // Ignore cleanup failures for discarded failover responses.
+  }
 }
 
 function parseProxyRoute(url) {
@@ -498,10 +666,98 @@ function applyNodeSecret(parsed, node) {
 }
 
 function selectTargets(node, path) {
-  const targets = path && isPlaybackStreamPath(path) && node.streamTarget
+  const streaming = Boolean(path && isPlaybackStreamPath(path));
+  const targets = streaming && node.streamTarget
     ? splitTargets(node.streamTarget)
     : splitTargets(node.targets);
-  return targets.filter((target) => /^https?:\/\//i.test(target));
+  const strategy = streaming ? node.streamStrategy : "auto";
+  return orderTargetsByHealth(node.name, path, targets.filter((target) => /^https?:\/\//i.test(target)), Date.now(), strategy);
+}
+
+function orderTargetsByHealth(nodeName, path, targets, now = Date.now(), strategy = "auto") {
+  const kind = isPlaybackStreamPath(path) ? "stream" : "api";
+  return targets.map((target, index) => {
+    const health = targetHealthCache.get(targetHealthKey(nodeName, kind, target)) || {};
+    let group = 1;
+    if (Number(health.failureUntil || 0) > now) group = 2;
+    else if (strategy === "auto" && Number(health.successUntil || 0) > now) group = 0;
+    return { target, index, group, latency: Number(health.latency || Number.MAX_SAFE_INTEGER) };
+  }).sort((a, b) => a.group - b.group || (strategy === "auto" ? a.latency - b.latency : 0) || a.index - b.index)
+    .map((item) => item.target);
+}
+
+function targetHeaderTimeoutMs(node, path, env) {
+  if (isPlaybackStreamPath(path)) {
+    return Math.max(500, Math.min(10000, Number(node?.streamTimeoutMs || DEFAULT_UPSTREAM_HEADER_TIMEOUT_MS)));
+  }
+  return upstreamHeaderTimeoutMs(env);
+}
+
+function targetLineIdentity(target) {
+  try {
+    const url = new URL(target);
+    const label = url.port ? `${url.hostname}:${url.port}` : url.hostname;
+    return { key: String(fnv1a(url.origin + url.pathname)).padStart(10, "0"), label };
+  } catch {
+    const value = cleanString(target).slice(0, 120);
+    return { key: String(fnv1a(value)).padStart(10, "0"), label: value || "unknown" };
+  }
+}
+
+function trackTargetOutcome(timing, target, result, latencyMs, path) {
+  if (!timing) return;
+  const identity = targetLineIdentity(target);
+  const item = {
+    ...identity,
+    kind: isPlaybackStreamPath(path) ? "stream" : "api",
+    result: result === "success" ? "success" : "failure",
+    latencyMs: Math.max(0, Number(latencyMs || 0))
+  };
+  timing.targetOutcomes = [...(timing.targetOutcomes || []), item];
+  if (item.result === "success") timing.selectedLine = item.label;
+}
+
+function recordTargetOutcome(nodeName, path, target, result, latencyMs, now = Date.now()) {
+  const kind = isPlaybackStreamPath(path) ? "stream" : "api";
+  const key = targetHealthKey(nodeName, kind, target);
+  const previous = targetHealthCache.get(key) || {};
+  if (result === "success") {
+    const latency = Number.isFinite(previous.latency)
+      ? previous.latency * 0.7 + Math.max(0, latencyMs) * 0.3
+      : Math.max(0, latencyMs);
+    targetHealthCache.set(key, { latency, successUntil: now + TARGET_HEALTH_SUCCESS_TTL_MS, failureUntil: 0 });
+  } else {
+    targetHealthCache.set(key, {
+      latency: Number(previous.latency || Number.MAX_SAFE_INTEGER),
+      successUntil: 0,
+      failureUntil: now + TARGET_HEALTH_FAILURE_TTL_MS
+    });
+  }
+  trimTargetHealthCache(now);
+}
+
+function targetHealthKey(nodeName, kind, target) {
+  return `${normalizeName(nodeName)}\n${kind}\n${String(target)}`;
+}
+
+function invalidateTargetHealth(nodeName) {
+  const prefix = normalizeName(nodeName || "") + "\n";
+  if (prefix === "\n") return;
+  for (const key of targetHealthCache.keys()) {
+    if (key.startsWith(prefix)) targetHealthCache.delete(key);
+  }
+}
+
+function trimTargetHealthCache(now = Date.now()) {
+  if (targetHealthCache.size <= 512) return;
+  for (const [key, value] of targetHealthCache) {
+    if (Number(value.successUntil || 0) <= now && Number(value.failureUntil || 0) <= now) {
+      targetHealthCache.delete(key);
+    }
+  }
+  while (targetHealthCache.size > 512) {
+    targetHealthCache.delete(targetHealthCache.keys().next().value);
+  }
 }
 
 function buildTargetURL(target, path, search) {
@@ -516,7 +772,7 @@ function buildTargetURL(target, path, search) {
   return base;
 }
 
-async function handleRawProxy(request, env, ctx, node, routePath, bodyBuffer, inboundURL) {
+async function handleRawProxy(request, env, ctx, node, routePath, bodyBuffer, inboundURL, timing) {
   const encoded = routePath.slice("/__raw__/".length);
   let raw = "";
   try {
@@ -532,12 +788,14 @@ async function handleRawProxy(request, env, ctx, node, routePath, bodyBuffer, in
     return text("Invalid raw URL signature", 403);
   }
   const targetURL = new URL(raw);
+  const upstreamStarted = performanceNow();
   const upstream = await fetchRawWithRetries(request, targetURL, node, bodyBuffer, env);
   const streamRedirect = await followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env);
+  timing.upstream += performanceNow() - upstreamStarted;
   const finalUpstream = streamRedirect?.upstream || upstream;
   const finalURL = streamRedirect?.targetURL || targetURL;
-  const response = await finishProxyResponse(finalUpstream, request, node, finalURL, inboundURL, env);
-  return recordProxyResponse(ctx, env, request, node.name, finalURL.pathname, response, requestKind(finalURL.pathname, response, request));
+  const response = await timedFinishProxyResponse(finalUpstream, request, node, finalURL, inboundURL, env, timing);
+  return completeProxyResponse(ctx, env, request, node.name, finalURL.pathname, response, requestKind(finalURL.pathname, response, request), timing);
 }
 
 async function fetchRawWithRetries(request, targetURL, node, bodyBuffer, env) {
@@ -613,6 +871,30 @@ async function buildOutboundRequest(request, targetURL, node, bodyBuffer, env, o
   return new Request(targetURL.toString(), init);
 }
 
+async function fetchWithHeaderTimeout(request, timeoutMs) {
+  const wait = Math.max(0, Number(timeoutMs || 0));
+  if (!wait) return fetch(request);
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, wait);
+  try {
+    return await fetch(new Request(request, { signal: controller.signal }));
+  } catch (err) {
+    if (timedOut) throw new Error(`upstream header timeout after ${wait}ms`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function upstreamHeaderTimeoutMs(env) {
+  const configured = Number(env?.UPSTREAM_HEADER_TIMEOUT_MS || DEFAULT_UPSTREAM_HEADER_TIMEOUT_MS);
+  return Math.max(500, Math.min(10000, Number.isFinite(configured) ? configured : DEFAULT_UPSTREAM_HEADER_TIMEOUT_MS));
+}
+
 async function buildHeaders(request, targetURL, node, env, options = {}) {
   const headers = new Headers(request.headers);
   stripHopByHop(headers);
@@ -663,12 +945,12 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
 
 function hasSensitiveRequestAuth(request) {
   const url = new URL(request.url);
-  const sensitiveQueryKeys = new Set(["api_key", "apikey", "token", "access_token", "x-emby-token"]);
   return Boolean(
     request.headers.get("authorization") ||
     request.headers.get("cookie") ||
     request.headers.get("x-emby-token") ||
-    [...url.searchParams.keys()].some((key) => sensitiveQueryKeys.has(key.toLowerCase()))
+    request.headers.get("x-mediabrowser-token") ||
+    [...url.searchParams.keys()].some((key) => SENSITIVE_QUERY_KEYS.has(key.toLowerCase()))
   );
 }
 
@@ -1177,7 +1459,10 @@ function sanitizeHeaderValue(value) {
 
 async function getIdentityState(env) {
   if (!identityStatePromise) {
-    identityStatePromise = loadIdentityState(env);
+    identityStatePromise = loadIdentityState(env).catch((err) => {
+      identityStatePromise = undefined;
+      throw err;
+    });
   }
   return identityStatePromise;
 }
@@ -1192,10 +1477,14 @@ async function loadIdentityState(env) {
   }
   const normalized = normalizeIdentityState(saved);
   if (JSON.stringify(saved) !== JSON.stringify(normalized)) {
-    await env.DB.prepare(`
-      INSERT INTO system_config (k, v, updated_at) VALUES (?, ?, ?)
-      ON CONFLICT(k) DO UPDATE SET v = excluded.v, updated_at = excluded.updated_at
-    `).bind(IDENTITY_KEY, JSON.stringify(normalized), Date.now()).run();
+    try {
+      await env.DB.prepare(`
+        INSERT INTO system_config (k, v, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(k) DO UPDATE SET v = excluded.v, updated_at = excluded.updated_at
+      `).bind(IDENTITY_KEY, JSON.stringify(normalized), Date.now()).run();
+    } catch {
+      // A fresh database may still be initializing; the normalized identity is usable in-memory.
+    }
   }
   return normalized;
 }
@@ -1391,6 +1680,15 @@ function deleteHeaders(headers, keys) {
   }
 }
 
+async function timedFinishProxyResponse(upstream, request, node, targetURL, inboundURL, env, timing) {
+  const started = performanceNow();
+  try {
+    return await finishProxyResponse(upstream, request, node, targetURL, inboundURL, env);
+  } finally {
+    timing.rewrite += performanceNow() - started;
+  }
+}
+
 async function finishProxyResponse(upstream, request, node, targetURL, inboundURL, env) {
   const headers = new Headers(upstream.headers);
   stripResponseHeaders(headers);
@@ -1400,7 +1698,7 @@ async function finishProxyResponse(upstream, request, node, targetURL, inboundUR
 
   if (shouldRewriteBody(upstream, request)) {
     const length = Number(upstream.headers.get("content-length") || "0");
-    if (!length || length <= DEFAULT_MAX_REWRITE_BYTES) {
+    if (length > 0 && length <= DEFAULT_MAX_REWRITE_BYTES) {
       const textBody = await upstream.text();
       const rewritten = await rewriteResponseText(textBody, targetURL, inboundURL, node, env, headers);
       headers.delete("content-length");
@@ -1409,9 +1707,70 @@ async function finishProxyResponse(upstream, request, node, targetURL, inboundUR
       headers.delete("etag");
       return new Response(rewritten, { status: upstream.status, statusText: upstream.statusText, headers });
     }
+    if (!length && upstream.body) {
+      const [candidate, passthrough] = upstream.body.tee();
+      try {
+        const textBody = await readStreamTextLimited(candidate, DEFAULT_MAX_REWRITE_BYTES);
+        discardStream(passthrough);
+        const rewritten = await rewriteResponseText(textBody, targetURL, inboundURL, node, env, headers);
+        headers.delete("content-length");
+        headers.delete("content-encoding");
+        headers.delete("content-md5");
+        headers.delete("etag");
+        return new Response(rewritten, { status: upstream.status, statusText: upstream.statusText, headers });
+      } catch (err) {
+        if (err instanceof BodyLimitError) {
+          return new Response(passthrough, { status: upstream.status, statusText: upstream.statusText, headers });
+        }
+        discardStream(passthrough);
+        throw err;
+      }
+    }
   }
 
   return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers });
+}
+
+class BodyLimitError extends Error {
+  constructor(limit) {
+    super(`body exceeds ${limit} byte limit`);
+    this.name = "BodyLimitError";
+    this.limit = limit;
+  }
+}
+
+async function readStreamTextLimited(stream, limit) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let output = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      total += chunk.byteLength;
+      if (total > limit) throw new BodyLimitError(limit);
+      output += decoder.decode(chunk, { stream: true });
+    }
+    return output + decoder.decode();
+  } catch (err) {
+    try {
+      const cancelled = reader.cancel(err);
+      if (cancelled?.catch) cancelled.catch(() => {});
+    } catch {}
+    throw err;
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+}
+
+function discardStream(stream) {
+  if (!stream) return;
+  try {
+    const cancelled = stream.cancel();
+    if (cancelled?.catch) cancelled.catch(() => {});
+  } catch {}
 }
 
 function shouldRewriteBody(response, request) {
@@ -1420,12 +1779,11 @@ function shouldRewriteBody(response, request) {
   }
   const type = (response.headers.get("content-type") || "").toLowerCase();
   const uri = new URL(request.url).pathname.toLowerCase();
-  return type.includes("application/json") ||
-    type.includes("text/plain") ||
+  return isSystemInfoPath(uri) ||
+    isPlaybackMetaPath(uri) ||
     type.includes("mpegurl") ||
     type.includes("dash+xml") ||
-    uri.includes("/playbackinfo") ||
-    uri.includes("/system/info");
+    /\.(m3u8|mpd)$/i.test(uri);
 }
 
 async function rewriteResponseText(body, targetURL, inboundURL, node, env, headers) {
@@ -1727,8 +2085,18 @@ function shouldUseDirectStream(node, request, path) {
   if (mode === "direct") {
     return true;
   }
-  // Auto mode is intentionally conservative in this first version.
-  return Boolean(node.directExternal);
+  if (!node.directExternal || isManifestRequestPath(path)) {
+    return false;
+  }
+  const targetHasPortableAuth = [...new URL(request.url).searchParams.keys()]
+    .some((key) => SENSITIVE_QUERY_KEYS.has(key.toLowerCase()));
+  const requestUsesHeaderAuth = Boolean(
+    request.headers.get("authorization") ||
+    request.headers.get("cookie") ||
+    request.headers.get("x-emby-token") ||
+    request.headers.get("x-mediabrowser-token")
+  );
+  return !requestUsesHeaderAuth || targetHasPortableAuth;
 }
 
 function isStreamingPath(path, request) {
@@ -1824,7 +2192,37 @@ async function retryableBody(request) {
   if (length > DEFAULT_RETRY_BODY_BYTES) {
     throw new Error("request body is too large for retry");
   }
-  return request.arrayBuffer();
+  if (length > 0) return request.arrayBuffer();
+  return readStreamBytesLimited(request.body, DEFAULT_RETRY_BODY_BYTES);
+}
+
+async function readStreamBytesLimited(stream, limit) {
+  if (!stream) return new ArrayBuffer(0);
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      total += chunk.byteLength;
+      if (total > limit) throw new BodyLimitError(limit);
+      chunks.push(chunk);
+    }
+    const output = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      output.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return output.buffer;
+  } catch (err) {
+    try { await reader.cancel(err); } catch {}
+    throw err;
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
 }
 
 async function listNodes(env) {
@@ -1843,6 +2241,65 @@ async function listNodesWithKeepalive(env) {
 async function getNode(env, name) {
   const row = await env.DB.prepare(`SELECT * FROM nodes WHERE name = ?`).bind(normalizeName(name)).first();
   return row ? rowToNode(row) : null;
+}
+
+async function getProxyNode(env, name) {
+  const key = normalizeName(name);
+  const now = Date.now();
+  const cached = proxyNodeCache.get(key);
+  if (cached && cached.expires > now) {
+    return Object.prototype.hasOwnProperty.call(cached, "value") ? cached.value : cached.promise;
+  }
+
+  const promise = getNode(env, key)
+    .catch(async (err) => {
+      if (!isMissingSchemaError(err)) throw err;
+      await ensureSchema(env);
+      return getNode(env, key);
+    })
+    .then((node) => node ? proxyNodeFromNode(node) : null)
+    .then((value) => {
+      proxyNodeCache.set(key, { value, expires: Date.now() + PROXY_NODE_CACHE_TTL_MS });
+      return value;
+    })
+    .catch((err) => {
+      proxyNodeCache.delete(key);
+      throw err;
+    });
+
+  proxyNodeCache.set(key, { promise, expires: now + PROXY_NODE_CACHE_TTL_MS });
+  return promise;
+}
+
+function proxyNodeFromNode(node) {
+  return {
+    name: node.name,
+    targets: [...(node.targets || [])],
+    streamTarget: node.streamTarget || "",
+    secret: node.secret || "",
+    clientProfile: node.clientProfile || DEFAULT_CLIENT_PROFILE,
+    impersonate: node.impersonate !== false,
+      headerMode: node.headerMode || "dual",
+      streamMode: node.streamMode || "proxy",
+      streamStrategy: node.streamStrategy || "auto",
+      streamTimeoutMs: Number(node.streamTimeoutMs || DEFAULT_UPSTREAM_HEADER_TIMEOUT_MS),
+      directExternal: Boolean(node.directExternal),
+    cacheImage: node.cacheImage !== false,
+    enabled: node.enabled !== false,
+    keepaliveAt: node.keepaliveAt || "",
+    createdAt: Number(node.createdAt || 0)
+  };
+}
+
+function invalidateProxyNodeCache(...names) {
+  for (const name of names) {
+    const key = normalizeName(name || "");
+    if (key) proxyNodeCache.delete(key);
+  }
+}
+
+function isMissingSchemaError(err) {
+  return /no such table:\s*nodes|table\s+nodes\s+does not exist/i.test(errMessage(err));
 }
 
 async function saveNode(env, input) {
@@ -1878,8 +2335,10 @@ async function saveNode(env, input) {
       header_mode, stream_mode, direct_external, cache_image, tag, remark,
       icon, sort_order, enabled, auto_watch, renew_days, remind_before_days, keepalive_at,
       emby_user, emby_password, emby_user_id, emby_access_token, emby_auth_profile, emby_play_id,
+      stream_strategy, stream_timeout_ms, watch_window_start, watch_window_end, watch_daily_limit,
+      watch_content_type, watch_failure_backoff_min, watch_duration_min_sec, watch_duration_max_sec,
       created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(name) DO UPDATE SET
       display_name = excluded.display_name,
       targets = excluded.targets,
@@ -1906,6 +2365,15 @@ async function saveNode(env, input) {
       emby_access_token = excluded.emby_access_token,
       emby_auth_profile = excluded.emby_auth_profile,
       emby_play_id = excluded.emby_play_id,
+      stream_strategy = excluded.stream_strategy,
+      stream_timeout_ms = excluded.stream_timeout_ms,
+      watch_window_start = excluded.watch_window_start,
+      watch_window_end = excluded.watch_window_end,
+      watch_daily_limit = excluded.watch_daily_limit,
+      watch_content_type = excluded.watch_content_type,
+      watch_failure_backoff_min = excluded.watch_failure_backoff_min,
+      watch_duration_min_sec = excluded.watch_duration_min_sec,
+      watch_duration_max_sec = excluded.watch_duration_max_sec,
       updated_at = excluded.updated_at
   `).bind(
     node.name,
@@ -1934,6 +2402,15 @@ async function saveNode(env, input) {
     node.embyAccessToken,
     node.embyAuthProfile,
     node.embyPlayId,
+    node.streamStrategy,
+    node.streamTimeoutMs,
+    node.watchWindowStart,
+    node.watchWindowEnd,
+    node.watchDailyLimit,
+    node.watchContentType,
+    node.watchFailureBackoffMin,
+    node.watchDurationMinSec,
+    node.watchDurationMaxSec,
     current?.createdAt || now,
     now
   ).run();
@@ -1949,6 +2426,9 @@ async function saveNode(env, input) {
     ]);
   }
   await ensureKeepaliveState(env, node);
+  invalidateProxyNodeCache(oldName, node.name);
+  invalidateTargetHealth(oldName);
+  invalidateTargetHealth(node.name);
   invalidateNodeHostMapCache();
   return node;
 }
@@ -1972,6 +2452,8 @@ async function deleteNode(env, name) {
     env.DB.prepare(`DELETE FROM nodes WHERE name = ?`).bind(nodeName),
     env.DB.prepare(`DELETE FROM keepalive_state WHERE node = ?`).bind(nodeName)
   ]);
+  invalidateProxyNodeCache(nodeName);
+  invalidateTargetHealth(nodeName);
   invalidateNodeHostMapCache();
 }
 
@@ -1996,6 +2478,8 @@ function rowToNode(row) {
     impersonate: row.impersonate !== 0,
     headerMode: row.header_mode || "dual",
     streamMode: row.stream_mode || "proxy",
+    streamStrategy: row.stream_strategy || "auto",
+    streamTimeoutMs: Number(row.stream_timeout_ms || DEFAULT_UPSTREAM_HEADER_TIMEOUT_MS),
     directExternal: Boolean(row.direct_external),
     cacheImage: row.cache_image !== 0,
     tag: row.tag || "",
@@ -2013,6 +2497,13 @@ function rowToNode(row) {
     embyAccessToken: row.emby_access_token || "",
     embyAuthProfile: row.emby_auth_profile ? normalizeClientProfile(row.emby_auth_profile) : "",
     embyPlayId: row.emby_play_id || "",
+    watchWindowStart: Number(row.watch_window_start ?? 0),
+    watchWindowEnd: Number(row.watch_window_end ?? 24),
+    watchDailyLimit: Number(row.watch_daily_limit ?? 1),
+    watchContentType: row.watch_content_type || "mixed",
+    watchFailureBackoffMin: Number(row.watch_failure_backoff_min ?? 360),
+    watchDurationMinSec: Number(row.watch_duration_min_sec ?? SIMULATED_WATCH_DURATION_MIN_SEC),
+    watchDurationMaxSec: Number(row.watch_duration_max_sec ?? SIMULATED_WATCH_DURATION_MAX_SEC),
     createdAt: Number(row.created_at || 0),
     updatedAt: Number(row.updated_at || 0)
   };
@@ -2027,6 +2518,10 @@ function normalizeNode(input, current, now) {
   if (targets.length === 0) {
     throw new Error("node target is required");
   }
+  const watchWindowStart = clampInt(input.watchWindowStart ?? input.watch_window_start ?? current?.watchWindowStart ?? 0, 0, 23);
+  const watchWindowEnd = Math.max(watchWindowStart + 1, clampInt(input.watchWindowEnd ?? input.watch_window_end ?? current?.watchWindowEnd ?? 24, 1, 24));
+  const watchDurationMinSec = clampInt(input.watchDurationMinSec ?? input.watch_duration_min_sec ?? current?.watchDurationMinSec ?? SIMULATED_WATCH_DURATION_MIN_SEC, 60, 3600);
+  const watchDurationMaxSec = Math.max(watchDurationMinSec, clampInt(input.watchDurationMaxSec ?? input.watch_duration_max_sec ?? current?.watchDurationMaxSec ?? SIMULATED_WATCH_DURATION_MAX_SEC, 60, 3600));
   return {
     name,
     displayName: cleanString(input.displayName ?? input.display_name ?? current?.displayName ?? name),
@@ -2037,6 +2532,8 @@ function normalizeNode(input, current, now) {
     impersonate: boolDefault(input.impersonate ?? current?.impersonate, true),
     headerMode: enumValue(input.headerMode ?? input.header_mode ?? current?.headerMode, ["off", "realip_only", "dual", "strict"], "dual"),
     streamMode: enumValue(input.streamMode ?? input.stream_mode ?? current?.streamMode, ["proxy", "direct", "auto"], "proxy"),
+    streamStrategy: enumValue(input.streamStrategy ?? input.stream_strategy ?? current?.streamStrategy, ["auto", "priority"], "auto"),
+    streamTimeoutMs: clampInt(input.streamTimeoutMs ?? input.stream_timeout_ms ?? current?.streamTimeoutMs ?? DEFAULT_UPSTREAM_HEADER_TIMEOUT_MS, 500, 10000),
     directExternal: boolValue(input.directExternal ?? input.direct_external ?? current?.directExternal ?? false),
     cacheImage: boolValue(input.cacheImage ?? input.cache_image ?? current?.cacheImage ?? true),
     tag: cleanString(input.tag ?? current?.tag ?? ""),
@@ -2054,6 +2551,13 @@ function normalizeNode(input, current, now) {
     embyAccessToken: cleanString(input.embyAccessToken ?? input.emby_access_token ?? current?.embyAccessToken ?? ""),
     embyAuthProfile: cleanString(input.embyAuthProfile ?? input.emby_auth_profile ?? current?.embyAuthProfile ?? ""),
     embyPlayId: cleanString(input.embyPlayId ?? input.emby_play_id ?? current?.embyPlayId ?? ""),
+    watchWindowStart,
+    watchWindowEnd,
+    watchDailyLimit: clampInt(input.watchDailyLimit ?? input.watch_daily_limit ?? current?.watchDailyLimit ?? 1, 1, 20),
+    watchContentType: enumValue(input.watchContentType ?? input.watch_content_type ?? current?.watchContentType, ["mixed", "movie", "episode"], "mixed"),
+    watchFailureBackoffMin: clampInt(input.watchFailureBackoffMin ?? input.watch_failure_backoff_min ?? current?.watchFailureBackoffMin ?? 360, 10, 1440),
+    watchDurationMinSec,
+    watchDurationMaxSec,
     createdAt: current?.createdAt || now,
     updatedAt: now
   };
@@ -2071,10 +2575,173 @@ async function getStats(env) {
   return { day, today: rows.results || [], recent: recent.results || [] };
 }
 
-function recordProxyResponse(ctx, env, request, nodeName, path, response, kind) {
+async function getPerformanceMetrics(env, requestedHours = 24) {
+  const hours = [1, 6, 24, 168].includes(Number(requestedHours)) ? Number(requestedHours) : 24;
+  const since = Date.now() - hours * 60 * 60 * 1000;
+  const [metricRows, lineRows] = await Promise.all([
+    env.DB.prepare(`
+      SELECT * FROM performance_metrics WHERE bucket_ts >= ? ORDER BY bucket_ts ASC
+    `).bind(since).all(),
+    env.DB.prepare(`
+      SELECT node, kind, line_key, line_label,
+             SUM(attempts) AS attempts, SUM(successes) AS successes, SUM(failures) AS failures,
+             SUM(latency_ms_sum) AS latency_ms_sum, MAX(updated_at) AS updated_at
+      FROM line_performance WHERE bucket_ts >= ?
+      GROUP BY node, kind, line_key, line_label
+      ORDER BY attempts DESC
+    `).bind(since).all()
+  ]);
+  const rows = metricRows.results || [];
+  const byNode = new Map();
+  const summary = emptyPerformanceAggregate("all");
+  const timeline = new Map();
+  for (const row of rows) {
+    mergePerformanceAggregate(summary, row);
+    const node = row.node || "-";
+    if (!byNode.has(node)) byNode.set(node, emptyPerformanceAggregate(node));
+    mergePerformanceAggregate(byNode.get(node), row);
+    const bucket = Number(row.bucket_ts || 0);
+    if (!timeline.has(bucket)) timeline.set(bucket, emptyPerformanceAggregate(String(bucket)));
+    mergePerformanceAggregate(timeline.get(bucket), row);
+  }
+  return {
+    hours,
+    generatedAt: Date.now(),
+    summary: finishPerformanceAggregate(summary),
+    nodes: [...byNode.values()].map(finishPerformanceAggregate).sort((a, b) => b.requests - a.requests),
+    lines: (lineRows.results || []).map((row) => {
+      const attempts = Number(row.attempts || 0);
+      const successes = Number(row.successes || 0);
+      const failures = Number(row.failures || 0);
+      return {
+        node: row.node || "-",
+        kind: row.kind || "api",
+        key: row.line_key || "",
+        label: row.line_label || "-",
+        attempts,
+        successes,
+        failures,
+        successRate: attempts ? Number((successes * 100 / attempts).toFixed(1)) : 0,
+        avgMs: attempts ? Number((Number(row.latency_ms_sum || 0) / attempts).toFixed(1)) : 0,
+        updatedAt: Number(row.updated_at || 0)
+      };
+    }),
+    timeline: [...timeline.entries()].map(([bucket, item]) => ({ bucket, ...finishPerformanceAggregate(item) })).slice(-120)
+  };
+}
+
+function emptyPerformanceAggregate(name) {
+  return {
+    node: name,
+    requests: 0,
+    successes: 0,
+    errors: 0,
+    failovers: 0,
+    nodeMs: 0,
+    upstreamMs: 0,
+    rewriteMs: 0,
+    totalMs: 0,
+    maxMs: 0,
+    histogram: Array(7).fill(0)
+  };
+}
+
+function mergePerformanceAggregate(target, row) {
+  target.requests += Number(row.request_count || 0);
+  target.successes += Number(row.success_count || 0);
+  target.errors += Number(row.error_count || 0);
+  target.failovers += Number(row.failover_count || 0);
+  target.nodeMs += Number(row.node_ms_sum || 0);
+  target.upstreamMs += Number(row.upstream_ms_sum || 0);
+  target.rewriteMs += Number(row.rewrite_ms_sum || 0);
+  target.totalMs += Number(row.total_ms_sum || 0);
+  target.maxMs = Math.max(target.maxMs, Number(row.total_ms_max || 0));
+  ["b100", "b250", "b500", "b1000", "b2500", "b5000", "bslow"].forEach((key, index) => {
+    target.histogram[index] += Number(row[key] || 0);
+  });
+  return target;
+}
+
+function finishPerformanceAggregate(item) {
+  const requests = Math.max(0, Number(item.requests || 0));
+  const average = (value) => requests ? Number((Number(value || 0) / requests).toFixed(1)) : 0;
+  return {
+    node: item.node,
+    requests,
+    successes: Number(item.successes || 0),
+    errors: Number(item.errors || 0),
+    errorRate: requests ? Number((Number(item.errors || 0) * 100 / requests).toFixed(2)) : 0,
+    failovers: Number(item.failovers || 0),
+    avgNodeMs: average(item.nodeMs),
+    avgUpstreamMs: average(item.upstreamMs),
+    avgRewriteMs: average(item.rewriteMs),
+    avgTotalMs: average(item.totalMs),
+    p50Ms: histogramPercentile(item.histogram, 0.5),
+    p95Ms: histogramPercentile(item.histogram, 0.95),
+    maxMs: Number(Number(item.maxMs || 0).toFixed(1))
+  };
+}
+
+function histogramPercentile(histogram, percentile) {
+  const values = Array.isArray(histogram) ? histogram : [];
+  const total = values.reduce((sum, value) => sum + Number(value || 0), 0);
+  if (!total) return 0;
+  const target = Math.max(1, Math.ceil(total * percentile));
+  const limits = [100, 250, 500, 1000, 2500, 5000, 7500];
+  let cumulative = 0;
+  for (let index = 0; index < values.length; index++) {
+    cumulative += Number(values[index] || 0);
+    if (cumulative >= target) return limits[index];
+  }
+  return limits.at(-1);
+}
+
+async function cleanOldPerformanceMetrics(env) {
+  if (!env.DB) return;
+  const cutoff = Date.now() - PERFORMANCE_RETENTION_MS;
+  await env.DB.batch([
+    env.DB.prepare(`DELETE FROM performance_metrics WHERE bucket_ts < ?`).bind(cutoff),
+    env.DB.prepare(`DELETE FROM line_performance WHERE bucket_ts < ?`).bind(cutoff)
+  ]);
+}
+
+function recordProxyResponse(ctx, env, request, nodeName, path, response, kind, timing = null) {
   const bytes = kind === "playback" ? streamByteEstimate(response) : contentLength(response);
-  ctx.waitUntil(recordRequest(env, request, nodeName, path, response.status, bytes, kind));
+  ctx.waitUntil(recordRequest(env, request, nodeName, path, response.status, bytes, kind, timing));
   return response;
+}
+
+function completeProxyResponse(ctx, env, request, nodeName, path, response, kind, timing) {
+  const finished = withServerTiming(response, timing);
+  return recordProxyResponse(ctx, env, request, nodeName, path, finished, kind, timing);
+}
+
+function createProxyTiming() {
+  return { started: performanceNow(), node: 0, upstream: 0, rewrite: 0, attempts: 0, total: 0, targetOutcomes: [] };
+}
+
+function performanceNow() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+
+function withServerTiming(response, timing) {
+  const total = Math.max(0, performanceNow() - Number(timing?.started || 0));
+  if (timing) timing.total = total;
+  const entries = [
+    ["node", Number(timing?.node || 0)],
+    ["upstream", Number(timing?.upstream || 0)],
+    ["rewrite", Number(timing?.rewrite || 0)],
+    ["total", total]
+  ].filter(([, duration]) => Number.isFinite(duration) && duration >= 0)
+    .map(([name, duration]) => `${name};dur=${duration.toFixed(1)}`);
+  const headers = new Headers(response.headers);
+  const attempts = Math.max(0, Number(timing?.attempts || 0));
+  headers.set("Server-Timing", entries.concat(`attempts;desc=\"${attempts}\"`).join(", "));
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
 }
 
 function streamByteEstimate(response) {
@@ -2089,29 +2756,136 @@ function streamByteEstimate(response) {
   return contentLength(response);
 }
 
-async function recordRequest(env, request, nodeName, path, status, bytes, kind) {
+async function recordRequest(env, request, nodeName, path, status, bytes, kind, timing = null) {
   const now = Date.now();
   const day = beijingDay(now);
   const ip = request.headers.get("cf-connecting-ip") || "";
   const country = request.headers.get("cf-ipcountry") || "";
   const ua = request.headers.get("user-agent") || "";
-  await env.DB.batch([
-    env.DB.prepare(`
+  const statements = [env.DB.prepare(`
       INSERT INTO request_stats (node, day, kind, count, bytes, updated_at)
       VALUES (?, ?, ?, 1, ?, ?)
       ON CONFLICT(node, day, kind) DO UPDATE SET
         count = count + 1,
         bytes = bytes + excluded.bytes,
         updated_at = excluded.updated_at
-    `).bind(nodeName, day, kind, bytes || 0, now),
-    env.DB.prepare(`
+    `).bind(nodeName, day, kind, bytes || 0, now)];
+  if (timing) {
+    statements.push(performanceMetricStatement(env, nodeName, kind, status, timing, now));
+    for (const outcome of timing.targetOutcomes || []) {
+      statements.push(linePerformanceStatement(env, nodeName, outcome, now));
+    }
+  }
+  if (shouldRecordVisitorLog(kind, status, nodeName, ip, now)) {
+    statements.push(env.DB.prepare(`
       INSERT INTO visitor_logs (node, ts, ip, country, ua, method, path, status)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(nodeName, now, ip, country, ua.slice(0, 300), request.method, path.slice(0, 500), status)
-  ]);
+    `).bind(nodeName, now, ip, country, ua.slice(0, 300), request.method, path.slice(0, 500), status));
+  }
+  await env.DB.batch(statements);
   if (kind === "playback" && status < 400 && isKeepalivePlaybackPath(path)) {
     await markKeepalivePlayback(env, nodeName, now);
   }
+}
+
+function performanceMetricStatement(env, nodeName, kind, status, timing, now) {
+  const bucketTs = Math.floor(now / 60000) * 60000;
+  const total = Math.max(0, Number(timing?.total || 0));
+  const histogram = performanceHistogram(total);
+  const failovers = Math.max(0, Number(timing?.attempts || 0) - 1);
+  return env.DB.prepare(`
+    INSERT INTO performance_metrics (
+      node, bucket_ts, kind, request_count, success_count, error_count, failover_count,
+      node_ms_sum, upstream_ms_sum, rewrite_ms_sum, total_ms_sum, total_ms_max,
+      b100, b250, b500, b1000, b2500, b5000, bslow, updated_at
+    ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(node, bucket_ts, kind) DO UPDATE SET
+      request_count = request_count + 1,
+      success_count = success_count + excluded.success_count,
+      error_count = error_count + excluded.error_count,
+      failover_count = failover_count + excluded.failover_count,
+      node_ms_sum = node_ms_sum + excluded.node_ms_sum,
+      upstream_ms_sum = upstream_ms_sum + excluded.upstream_ms_sum,
+      rewrite_ms_sum = rewrite_ms_sum + excluded.rewrite_ms_sum,
+      total_ms_sum = total_ms_sum + excluded.total_ms_sum,
+      total_ms_max = MAX(total_ms_max, excluded.total_ms_max),
+      b100 = b100 + excluded.b100,
+      b250 = b250 + excluded.b250,
+      b500 = b500 + excluded.b500,
+      b1000 = b1000 + excluded.b1000,
+      b2500 = b2500 + excluded.b2500,
+      b5000 = b5000 + excluded.b5000,
+      bslow = bslow + excluded.bslow,
+      updated_at = excluded.updated_at
+  `).bind(
+    nodeName, bucketTs, kind,
+    Number(status) < 400 ? 1 : 0,
+    Number(status) >= 400 ? 1 : 0,
+    failovers,
+    Math.max(0, Number(timing?.node || 0)),
+    Math.max(0, Number(timing?.upstream || 0)),
+    Math.max(0, Number(timing?.rewrite || 0)),
+    total,
+    total,
+    ...histogram,
+    now
+  );
+}
+
+function performanceHistogram(totalMs) {
+  const limits = [100, 250, 500, 1000, 2500, 5000];
+  const buckets = Array(7).fill(0);
+  const index = limits.findIndex((limit) => totalMs < limit);
+  buckets[index < 0 ? 6 : index] = 1;
+  return buckets;
+}
+
+function linePerformanceStatement(env, nodeName, outcome, now) {
+  const bucketTs = Math.floor(now / 60000) * 60000;
+  const success = outcome.result === "success" ? 1 : 0;
+  const failure = success ? 0 : 1;
+  return env.DB.prepare(`
+    INSERT INTO line_performance (
+      node, bucket_ts, kind, line_key, line_label, attempts, successes, failures,
+      latency_ms_sum, last_latency_ms, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+    ON CONFLICT(node, bucket_ts, kind, line_key) DO UPDATE SET
+      line_label = excluded.line_label,
+      attempts = attempts + 1,
+      successes = successes + excluded.successes,
+      failures = failures + excluded.failures,
+      latency_ms_sum = latency_ms_sum + excluded.latency_ms_sum,
+      last_latency_ms = excluded.last_latency_ms,
+      updated_at = excluded.updated_at
+  `).bind(
+    nodeName,
+    bucketTs,
+    outcome.kind || "api",
+    outcome.key,
+    outcome.label,
+    success,
+    failure,
+    Math.max(0, Number(outcome.latencyMs || 0)),
+    Math.max(0, Number(outcome.latencyMs || 0)),
+    now
+  );
+}
+
+function shouldRecordVisitorLog(kind, status, nodeName, ip, now = Date.now()) {
+  if (kind !== "playback" || Number(status) >= 400) return true;
+  const key = `${normalizeName(nodeName)}\n${String(ip || "-")}`;
+  if (Number(playbackVisitorSampleCache.get(key) || 0) > now) return false;
+  playbackVisitorSampleCache.set(key, now + PLAYBACK_AUX_WRITE_INTERVAL_MS);
+  trimExpiryCache(playbackVisitorSampleCache, now, 2048);
+  return true;
+}
+
+function trimExpiryCache(cache, now, maxSize) {
+  if (cache.size <= maxSize) return;
+  for (const [key, expires] of cache) {
+    if (Number(expires || 0) <= now) cache.delete(key);
+  }
+  while (cache.size > maxSize) cache.delete(cache.keys().next().value);
 }
 
 function isKeepalivePlaybackPath(path) {
@@ -2161,15 +2935,25 @@ async function ensureKeepaliveState(env, node) {
 }
 
 async function markKeepalivePlayback(env, nodeName, ts) {
-  await ensureKeepaliveTable(env);
-  const node = await getNode(env, nodeName);
-  const anchor = parseKeepaliveAt(node?.keepaliveAt) || node?.createdAt || ts;
-  await env.DB.prepare(`
-    INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day, notify_count)
-    VALUES (?, ?, ?, '', 0)
-    ON CONFLICT(node) DO UPDATE SET
-      last_play_ts = MAX(last_play_ts, excluded.last_play_ts)
-  `).bind(normalizeName(nodeName), anchor, ts).run();
+  const key = normalizeName(nodeName);
+  const now = Date.now();
+  if (Number(playbackKeepaliveWriteCache.get(key) || 0) > now) return;
+  playbackKeepaliveWriteCache.set(key, now + PLAYBACK_AUX_WRITE_INTERVAL_MS);
+  trimExpiryCache(playbackKeepaliveWriteCache, now, 512);
+  try {
+    await ensureKeepaliveTable(env);
+    const node = await getProxyNode(env, nodeName);
+    const anchor = parseKeepaliveAt(node?.keepaliveAt) || node?.createdAt || ts;
+    await env.DB.prepare(`
+      INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day, notify_count)
+      VALUES (?, ?, ?, '', 0)
+      ON CONFLICT(node) DO UPDATE SET
+        last_play_ts = MAX(last_play_ts, excluded.last_play_ts)
+    `).bind(key, anchor, ts).run();
+  } catch (err) {
+    playbackKeepaliveWriteCache.delete(key);
+    throw err;
+  }
 }
 
 async function getKeepaliveStatuses(env) {
@@ -2280,9 +3064,9 @@ async function resetKeepalive(env, body, ctx = null) {
   return { ok: true, pending: true, ...started, node: name, displayName: node.displayName || name };
 }
 
-function randomSimulatedWatchDurationSec() {
-  const min = SIMULATED_WATCH_DURATION_MIN_SEC;
-  const max = SIMULATED_WATCH_DURATION_MAX_SEC;
+function randomSimulatedWatchDurationSec(node = null) {
+  const min = Math.max(60, Number(node?.watchDurationMinSec || SIMULATED_WATCH_DURATION_MIN_SEC));
+  const max = Math.max(min, Number(node?.watchDurationMaxSec || SIMULATED_WATCH_DURATION_MAX_SEC));
   return min + Math.floor(Math.random() * (max - min + 1));
 }
 
@@ -2499,10 +3283,14 @@ async function embyPickPlayItem(auth, node) {
     return item;
   }
 
+  const allowedTypes = node.watchContentType === "movie"
+    ? ["Movie"]
+    : node.watchContentType === "episode" ? ["Episode"] : ["Movie", "Episode"];
+  const includeTypes = allowedTypes.join(",");
   const queries = [
-    `/Users/${auth.userId}/Items/Resume?Limit=12&MediaTypes=Video&Fields=BasicSyncInfo,RunTimeTicks,UserData,MediaSources`,
-    `/Users/${auth.userId}/Items/Latest?Limit=20&IncludeItemTypes=Movie,Episode&Fields=BasicSyncInfo,RunTimeTicks,UserData`,
-    `/Users/${auth.userId}/Items?SortBy=DateCreated&SortOrder=Descending&IncludeItemTypes=Movie,Episode&Recursive=true&Limit=30&Fields=BasicSyncInfo,RunTimeTicks,UserData`
+    `/Users/${auth.userId}/Items/Resume?Limit=12&MediaTypes=Video&IncludeItemTypes=${includeTypes}&Fields=BasicSyncInfo,RunTimeTicks,UserData,MediaSources`,
+    `/Users/${auth.userId}/Items/Latest?Limit=20&IncludeItemTypes=${includeTypes}&Fields=BasicSyncInfo,RunTimeTicks,UserData`,
+    `/Users/${auth.userId}/Items?SortBy=DateCreated&SortOrder=Descending&IncludeItemTypes=${includeTypes}&Recursive=true&Limit=30&Fields=BasicSyncInfo,RunTimeTicks,UserData`
   ];
   const candidates = [];
   for (const path of queries) {
@@ -2511,7 +3299,7 @@ async function embyPickPlayItem(auth, node) {
       const items = Array.isArray(data) ? data : (data?.Items || []);
       for (const item of items) {
         if (!item?.Id) continue;
-        if (item.Type && !["Movie", "Episode", "Video"].includes(item.Type)) continue;
+        if (item.Type && !allowedTypes.includes(item.Type)) continue;
         candidates.push(item);
       }
       if (candidates.length >= 5) break;
@@ -2762,7 +3550,7 @@ async function startWatchSession(env, { node, source = "manual", note = "", rema
   if (!node.embyUser || !(node.embyPassword || node.embyAccessToken)) {
     throw new Error("节点未配置 Emby 账号密码，无法真实模拟观看");
   }
-  const targetDurationSec = randomSimulatedWatchDurationSec();
+  const targetDurationSec = randomSimulatedWatchDurationSec(node);
   await ensureWatchSessionsTable(env);
   const reservedAt = Date.now();
   let reservation;
@@ -3148,6 +3936,12 @@ async function runAutoSimulatedWatches(env) {
   const statuses = await getKeepaliveStatuses(env);
   const targets = statuses.filter((item) => item.enabled !== false && (item.status === "due" || item.status === "warn"));
   if (!targets.length) return { ok: true, skipped: true, reason: "no due nodes", count: 0 };
+  await ensureWatchSessionsTable(env);
+  const concurrency = Math.max(1, Math.min(10, Number(env.AUTO_WATCH_MAX_CONCURRENCY || DEFAULT_AUTO_WATCH_MAX_CONCURRENCY)));
+  const activeRow = await env.DB.prepare(`
+    SELECT COUNT(*) AS count FROM sim_watch_sessions WHERE status IN ('starting', 'running')
+  `).first();
+  let available = Math.max(0, concurrency - Number(activeRow?.count || 0));
   const results = [];
   for (const item of targets) {
     try {
@@ -3160,12 +3954,25 @@ async function runAutoSimulatedWatches(env) {
         results.push(await notifyKeepaliveDue(env, item, node));
         continue;
       }
-      if (await hasRecentAutoWatchFailure(env, item.node)) {
+      const window = autoWatchWindowDecision(node);
+      if (!window.eligible) {
+        results.push({ ok: true, node: item.node, skipped: true, reason: "outside watch window", scheduledMinute: window.scheduledMinute });
+        continue;
+      }
+      if (await autoWatchSuccessCountToday(env, item.node) >= node.watchDailyLimit) {
+        results.push({ ok: true, node: item.node, skipped: true, reason: "daily limit" });
+        continue;
+      }
+      if (await hasRecentAutoWatchFailure(env, item.node, node.watchFailureBackoffMin)) {
         results.push({ ok: true, node: item.node, skipped: true, reason: "failure backoff" });
         continue;
       }
       if (await hasRunningWatchSession(env, item.node)) {
         results.push({ ok: true, node: item.node, skipped: true, reason: "already running" });
+        continue;
+      }
+      if (available <= 0) {
+        results.push({ ok: true, node: item.node, skipped: true, reason: "concurrency limit" });
         continue;
       }
       const note = item.status === "due"
@@ -3178,6 +3985,7 @@ async function runAutoSimulatedWatches(env) {
         remainDays: item.remainDays,
         renewDays: item.renewDays
       });
+      available--;
       results.push({ ok: true, node: item.node, ...started });
     } catch (err) {
       const error = errMessage(err);
@@ -3186,6 +3994,37 @@ async function runAutoSimulatedWatches(env) {
     }
   }
   return { ok: results.every((item) => item.ok), count: results.length, results };
+}
+
+function autoWatchWindowDecision(node, now = Date.now()) {
+  const shifted = new Date(now + 8 * 60 * 60 * 1000);
+  const currentMinute = shifted.getUTCHours() * 60 + shifted.getUTCMinutes();
+  const start = Math.max(0, Math.min(23, Number(node?.watchWindowStart ?? 0))) * 60;
+  const end = Math.max(start + 60, Math.min(24, Number(node?.watchWindowEnd ?? 24)) * 60);
+  const span = Math.max(1, end - start);
+  const scheduledMinute = start + (parseInt(fnv1a(`${beijingDay(now)}|${normalizeName(node?.name || "node")}`), 16) % span);
+  return {
+    eligible: currentMinute >= scheduledMinute && currentMinute < end,
+    currentMinute,
+    scheduledMinute,
+    startMinute: start,
+    endMinute: end
+  };
+}
+
+function beijingDayStartMs(now = Date.now()) {
+  const shifted = new Date(now + 8 * 60 * 60 * 1000);
+  return Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate()) - 8 * 60 * 60 * 1000;
+}
+
+async function autoWatchSuccessCountToday(env, nodeName, now = Date.now()) {
+  await ensureWatchLogsTable(env);
+  const row = await env.DB.prepare(`
+    SELECT COUNT(*) AS count FROM watch_logs
+    WHERE node = ? AND source = 'auto' AND ts >= ?
+      AND item_id != '' AND title NOT LIKE '%失败%' AND note NOT LIKE '%失败%'
+  `).bind(normalizeName(nodeName), beijingDayStartMs(now)).first();
+  return Number(row?.count || 0);
 }
 
 function canNodeAutoWatch(node) {
@@ -3225,7 +4064,7 @@ async function notifyKeepaliveDue(env, item, node) {
   return { ok: true, node: item.node, reminded: !delivery?.skipped, skipped: Boolean(delivery?.skipped) };
 }
 
-async function hasRecentAutoWatchFailure(env, nodeName) {
+async function hasRecentAutoWatchFailure(env, nodeName, backoffMinutes = AUTO_WATCH_FAILURE_BACKOFF_MS / 60000) {
   await ensureWatchLogsTable(env);
   const row = await env.DB.prepare(`
     SELECT id FROM watch_logs
@@ -3233,7 +4072,10 @@ async function hasRecentAutoWatchFailure(env, nodeName) {
       AND (note LIKE '自动启动失败：%' OR note LIKE '进行中失败：%')
       AND ts >= ?
     ORDER BY ts DESC LIMIT 1
-  `).bind(normalizeName(nodeName), Date.now() - AUTO_WATCH_FAILURE_BACKOFF_MS).first();
+  `).bind(
+    normalizeName(nodeName),
+    Date.now() - Math.max(10, Math.min(1440, Number(backoffMinutes || 360))) * 60 * 1000
+  ).first();
   return Boolean(row?.id);
 }
 
@@ -3379,6 +4221,8 @@ async function pingTarget(target) {
     return { ok: false, error: "invalid target" };
   }
   const started = Date.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
   try {
     const base = new URL(target);
     const candidates = ["/emby/System/Info/Public", "/System/Info/Public", "/"];
@@ -3386,7 +4230,7 @@ async function pingTarget(target) {
     for (const path of candidates) {
       const u = new URL(base);
       u.pathname = path;
-      const res = await fetch(u.toString(), { method: "GET", redirect: "manual" });
+      const res = await fetch(u.toString(), { method: "GET", redirect: "manual", signal: controller.signal });
       lastStatus = res.status;
       if (res.status < 500) {
         return { ok: true, status: res.status, ms: Date.now() - started };
@@ -3395,7 +4239,39 @@ async function pingTarget(target) {
     return { ok: false, status: lastStatus, ms: Date.now() - started };
   } catch (err) {
     return { ok: false, error: errMessage(err), ms: Date.now() - started };
+  } finally {
+    clearTimeout(timeout);
   }
+}
+
+async function checkNodeStreamHealth(env, name) {
+  const node = await getNode(env, normalizeName(name || ""));
+  if (!node) return { ok: false, error: "node not found" };
+  const configured = splitTargets(node.streamTarget || node.targets);
+  if (!configured.length) return { ok: false, error: "node has no video target" };
+  const checked = await Promise.all(configured.map(async (target, index) => {
+    const result = await pingTarget(target);
+    const latency = Math.max(0, Number(result.ms || 0));
+    recordTargetOutcome(node.name, "/Videos/probe/stream.mp4", target, result.ok ? "success" : "failure", latency);
+    return {
+      index: index + 1,
+      target,
+      label: targetLineIdentity(target).label,
+      ok: Boolean(result.ok),
+      status: Number(result.status || 0),
+      ms: latency,
+      error: result.error || ""
+    };
+  }));
+  const ordered = orderTargetsByHealth(node.name, "/Videos/probe/stream.mp4", configured, Date.now(), node.streamStrategy);
+  return {
+    ok: checked.some((item) => item.ok),
+    node: node.name,
+    strategy: node.streamStrategy,
+    timeoutMs: node.streamTimeoutMs,
+    preferred: targetLineIdentity(ordered[0] || configured[0]).label,
+    lines: checked
+  };
 }
 
 async function pingTargetCompat(target) {
@@ -4581,6 +5457,10 @@ function intValue(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function clampInt(value, min, max) {
+  return Math.max(min, Math.min(max, intValue(value)));
+}
+
 function enumValue(value, allowed, fallback) {
   const s = String(value || "").trim().toLowerCase();
   return allowed.includes(s) ? s : fallback;
@@ -4595,7 +5475,7 @@ function trimSlash(path) {
 }
 
 function isRetryableStatus(status) {
-  return status >= 500 || status === 403 || status === 404 || status === 416;
+  return status >= 500 || status === 403 || status === 404 || status === 408 || status === 429;
 }
 
 function isRedirectStatus(status) {
@@ -4607,7 +5487,7 @@ function stripResponseHeaders(headers) {
     headers.delete(key);
   }
   headers.set("Access-Control-Allow-Origin", "*");
-  headers.set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Range, Content-Length, Content-Type, Location");
+  headers.set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Range, Content-Length, Content-Type, Location, Server-Timing");
 }
 
 function contentLength(response) {
@@ -4792,7 +5672,8 @@ body.theme-trust{
 
 *{box-sizing:border-box}
 html,body{margin:0;padding:0}
-html{scroll-behavior:smooth}
+html{scroll-behavior:smooth;background:var(--bg0)}
+html:has(body.theme-cyber){background:#0B0B0C}
 body{
   min-height:100vh;
   font-family:var(--font);
@@ -5117,6 +5998,8 @@ body.theme-cyber .emby-card:hover{
 .card-title b{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
 .card-title small{display:block;color:var(--muted);font-size:11px;margin-top:2px}
 .emby-card .card-body{display:grid;gap:8px;padding:12px 14px}
+.card-feature-actions{display:flex;gap:8px;flex-wrap:wrap;padding-top:4px}
+.card-feature-actions .btn{flex:1;min-width:110px}
 .emby-card .card-footer{
   display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;
   margin-top:auto;padding:12px 14px;border-top:1px dashed var(--line);
@@ -5229,6 +6112,10 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
   backdrop-filter:blur(22px) saturate(1.25);
 }
 .mobile-nav .side-link{min-height:36px;padding:0 12px;font-size:12px;flex:0 0 auto}
+.mobile-edge-bar{display:none}
+.mobile-edge-item{min-width:0;display:grid;gap:2px}
+.mobile-edge-item span{color:var(--muted);font-size:10px}
+.mobile-edge-item b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink);font-size:11px}
 .dns-status{display:flex;gap:6px;flex-wrap:wrap}
 .x{
   width:36px;height:36px;border:1px solid var(--line);border-radius:12px;
@@ -5250,7 +6137,13 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
 @media(max-width:980px){
   body{padding:12px 12px 88px}
   .app-shell{grid-template-columns:1fr}
-  .sidebar{position:relative;top:0;min-height:auto;border-radius:20px}
+  .sidebar{display:none}
+  .main-panel{padding-top:42px}
+  .mobile-edge-bar{
+    display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr) auto;gap:10px;
+    padding:9px 10px;border:1px solid var(--line);border-radius:12px;
+    background:var(--glass-strong);box-shadow:var(--shadow);backdrop-filter:blur(18px)
+  }
   .side-nav{display:none}
   .mobile-nav{display:flex}
   .stat-strip,.metrics,.chart-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
@@ -5392,7 +6285,7 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
       <nav class="side-nav">
         <button class="side-link active" data-page-tab="nodes" type="button"><span class="ico">▣</span>线路配置</button>
         <button class="side-link" data-page-tab="network" type="button"><span class="ico">⌁</span>测速与 DNS</button>
-        <button class="side-link" data-page-tab="dashboard" type="button"><span class="ico">◈</span>数据大屏</button>
+        <button class="side-link" data-page-tab="dashboard" type="button"><span class="ico">◈</span>性能与数据</button>
         <button class="side-link" data-page-tab="deploy" type="button"><span class="ico">⬆</span>代码更新</button>
       </nav>
       <div class="side-meta">
@@ -5407,6 +6300,11 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
     </aside>
 
     <div class="main-panel">
+      <div class="mobile-edge-bar" aria-label="边缘状态">
+        <div class="mobile-edge-item"><span>接入点</span><b id="mobileTraceEntry" class="mono">--</b></div>
+        <div class="mobile-edge-item"><span>出口</span><b id="mobileTraceEgress" class="mono">--</b></div>
+        <div class="mobile-edge-item"><span><i id="mobileRttDot" class="dot" style="display:inline-block;vertical-align:middle;margin-right:4px"></i>RTT</span><b id="mobileRttValue" class="mono">--</b></div>
+      </div>
       <header class="hero-bar glass">
         <div>
           <div class="section-kicker">控制台</div>
@@ -5458,11 +6356,14 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
                 <div class="field w6"><label>备注</label><input id="remark" placeholder="内部备注"></div>
               </div>
             </div>
-            <div class="form-section">
+            <div class="form-section" id="streamConfigSection">
               <div class="form-section-title"><b>上游线路</b><span>媒体服务器地址</span></div>
               <div class="form-grid node-form">
                 <div class="field full w12"><label>服务器线路</label><textarea id="targets" placeholder="https://media.example.com&#10;https://backup.example.com"></textarea></div>
-                <div class="field w12"><label>视频线路</label><input id="streamTarget" placeholder="可空，留空使用主线路"></div>
+                <div class="field w12"><label>独立视频线路（每行一条）</label><textarea id="streamTarget" placeholder="https://stream-a.example.com&#10;https://stream-b.example.com&#10;留空使用服务器线路"></textarea></div>
+                <div class="field w4"><label>视频选线策略</label><select id="streamStrategy"><option value="auto">自动健康与延迟优先</option><option value="priority">严格配置顺序，故障后切换</option></select></div>
+                <div class="field w4"><label>视频首包超时（毫秒）</label><input id="streamTimeoutMs" type="number" min="500" max="10000" step="100" value="2500"></div>
+                <div class="field w4"><label>线路诊断</label><button class="btn" id="testEditedStreamBtn" type="button">测试所有视频线路</button></div>
               </div>
             </div>
             <div class="form-section">
@@ -5479,7 +6380,7 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
                 </div>
               </div>
             </div>
-            <div class="form-section">
+            <div class="form-section" id="watchStrategySection">
               <div class="form-section-title"><b>观看保活</b><span>周期提醒 + 真实模拟账号</span></div>
               <div class="form-grid node-form">
                 <div class="option-row" style="grid-column:1/-1">
@@ -5489,10 +6390,17 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
                 <div class="field w3" style="grid-column:span 3"><label>提前提醒（天）</label><input id="remindBeforeDays" type="number" min="0" step="1" placeholder="3"></div>
                 <div class="field w3" style="grid-column:span 3"><label>起算日期</label><input id="keepaliveAt" placeholder="2026-07-07"></div>
                 <div class="field w3" style="grid-column:span 3"><label>指定条目 ID</label><input id="embyPlayId" placeholder="可空，自动选片"></div>
+                <div class="field w3"><label>内容类型</label><select id="watchContentType"><option value="mixed">电影和剧集</option><option value="movie">仅电影</option><option value="episode">仅剧集</option></select></div>
+                <div class="field w3"><label>随机窗口开始（时）</label><input id="watchWindowStart" type="number" min="0" max="23" step="1" value="0"></div>
+                <div class="field w3"><label>随机窗口结束（时）</label><input id="watchWindowEnd" type="number" min="1" max="24" step="1" value="24"></div>
+                <div class="field w3"><label>每日成功上限</label><input id="watchDailyLimit" type="number" min="1" max="20" step="1" value="1"></div>
+                <div class="field w4"><label>失败退避（分钟）</label><input id="watchFailureBackoffMin" type="number" min="10" max="1440" step="10" value="360"></div>
+                <div class="field w4"><label>最短观看（秒）</label><input id="watchDurationMinSec" type="number" min="60" max="3600" step="30" value="300"></div>
+                <div class="field w4"><label>最长观看（秒）</label><input id="watchDurationMaxSec" type="number" min="60" max="3600" step="30" value="390"></div>
                 <div class="field w6"><label>Emby 用户名</label><input id="embyUser" placeholder="真实模拟观看账号"></div>
                 <div class="field w6"><label>Emby 密码</label><input id="embyPassword" type="password" placeholder="保存后用于登录上游"></div>
               </div>
-              <div class="hint" style="margin-top:8px">勾选并填写 Emby 用户名、密码时自动观看；未勾选或账号密码不完整时只发送到期提醒。</div>
+              <div class="hint" style="margin-top:8px">自动任务在北京时间窗口内为每个节点生成稳定随机时刻，并受每日上限、全局并发和失败退避限制；手动“已观看”不受这些策略限制。</div>
             </div>
           </div>
         </section>
@@ -5634,14 +6542,36 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
           <div class="panel-head">
             <div>
               <div class="section-kicker">数据</div>
-              <h2>数据大屏</h2>
+              <h2>性能与数据</h2>
               <p>D1 请求统计、最近访问与 Cloudflare 边缘流量。</p>
             </div>
             <div class="toolbar-inline">
+              <select id="performanceHours" class="search-input" style="min-width:120px"><option value="1">最近 1 小时</option><option value="6">最近 6 小时</option><option value="24" selected>最近 24 小时</option><option value="168">最近 7 天</option></select>
+              <button class="btn" id="reloadPerformanceBtn">刷新性能</button>
               <button class="btn" id="closeDashboardBtn">返回线路</button>
             </div>
           </div>
           <div class="panel-body">
+            <div class="form-section-title" style="margin:4px 0 10px"><b>真实性能</b><span>来自 Worker 实际代理请求，不是浏览器模拟测速</span></div>
+            <div class="stat-strip" style="margin-bottom:14px">
+              <div class="stat-tile"><span>代理请求</span><b id="perfRequests">--</b><em id="perfWindow">最近 24 小时</em></div>
+              <div class="stat-tile"><span>P50 / P95</span><b id="perfPercentiles" style="font-size:18px">--</b><em>总处理耗时</em></div>
+              <div class="stat-tile"><span>平均上游</span><b id="perfUpstream">--</b><em>首包与重定向</em></div>
+              <div class="stat-tile"><span>错误 / 切线</span><b id="perfFailures" style="font-size:18px">--</b><em>真实请求累计</em></div>
+            </div>
+            <div class="table-wrapper" style="margin-bottom:12px">
+              <table>
+                <thead><tr><th>节点</th><th>请求</th><th>P50</th><th>P95</th><th>平均 D1</th><th>平均上游</th><th>错误率</th><th>切线</th></tr></thead>
+                <tbody id="performanceNodeRows"><tr><td colspan="8" style="text-align:center;color:var(--text-sec)">暂无性能数据</td></tr></tbody>
+              </table>
+            </div>
+            <div class="table-wrapper" style="margin-bottom:14px">
+              <table>
+                <thead><tr><th>节点</th><th>类型</th><th>实际线路</th><th>尝试</th><th>成功率</th><th>平均耗时</th><th>最近活动</th></tr></thead>
+                <tbody id="performanceLineRows"><tr><td colspan="7" style="text-align:center;color:var(--text-sec)">暂无线路数据</td></tr></tbody>
+              </table>
+            </div>
+            <div class="form-section-title" style="margin:4px 0 10px"><b>流量概览</b><span>Cloudflare 与 D1 汇总</span></div>
             <div class="stat-strip" style="margin-bottom:14px">
               <div class="stat-tile"><span>今天流量</span><b id="trafficToday">--</b><em>Cloudflare</em></div>
               <div class="stat-tile"><span>7 天</span><b id="traffic7d">--</b><em>Cloudflare</em></div>
@@ -5689,7 +6619,7 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
   <nav class="mobile-nav">
     <button class="side-link active" data-page-tab="nodes" type="button">线路</button>
     <button class="side-link" data-page-tab="network" type="button">网络</button>
-    <button class="side-link" data-page-tab="dashboard" type="button">数据</button>
+    <button class="side-link" data-page-tab="dashboard" type="button">性能</button>
     <button class="side-link" data-page-tab="deploy" type="button">更新</button>
   </nav>
 </div>
@@ -5699,6 +6629,7 @@ let nodes = [];
 let latencyMap = {};
 let stats = null;
 let analytics = null;
+let performanceData = null;
 let watchLogs = [];
 let activeDialogClose = null;
 let toastTimer = null;
@@ -5729,6 +6660,7 @@ function saveToken(){
   loadNodes({ quietAuth: true });
   loadWatchLogs({ quiet: true });
   loadStats();
+  loadPerformance();
   loadTrace();
 }
 function logout(){
@@ -5857,6 +6789,7 @@ function renderNodes(){
     const autoWatch = n.autoWatch && n.embyUser && n.embyPassword
       ? '<span class="chip ok">到期自动观看</span>'
       : '<span class="chip">仅到期提醒</span>';
+    const videoLines = String(n.streamTarget || "").split(/\\n+/).map(v => v.trim()).filter(Boolean);
     const lat = latencyMap[n.name];
     let latChip = '<span class="chip latency-chip pending" data-latency-for="' + attr(n.name) + '">未测速</span>';
     if (lat && lat.ms >= 0) {
@@ -5874,13 +6807,16 @@ function renderNodes(){
           latChip +
           '<span class="chip primary">' + esc(n.headerMode || "dual") + '</span>' +
           '<span class="chip">' + esc(n.streamMode || "proxy") + '</span>' +
+          '<span class="chip">视频 ' + (videoLines.length || (n.targets || []).length) + ' 线 · ' + esc(n.streamStrategy === "priority" ? "顺序" : "自动") + '</span>' +
           '<span class="chip">' + (n.impersonate === false ? "模拟关" : esc(CLIENT_LABELS[n.clientProfile] || n.clientProfile || "client")) + '</span>' +
           autoWatch +
           emby +
         '</div>' +
         infoRow("接入", '<span class="mono masked" data-secret="' + attr(url) + '">••••••••••••</span> <button class="btn small" data-act="reveal" data-name="' + attr(n.name) + '">显示</button>') +
         infoRow("上游", '<span class="masked" data-secret="' + attr((n.targets || []).join("\\n")) + '">' + esc(firstTarget ? "••••••••••••" : "未配置") + '</span>') +
+        infoRow("视频", (videoLines.length ? (videoLines.length + ' 条独立线路 · ' + Number(n.streamTimeoutMs || 2500) + 'ms 切换') : '跟随服务器线路') + ' <button class="btn small" data-act="stream" data-name="' + attr(n.name) + '">诊断</button>') +
         infoRow("保活", keep) +
+        '<div class="card-feature-actions"><button class="btn small" data-act="stream-edit" data-name="' + attr(n.name) + '">视频配置</button><button class="btn small" data-act="watch-edit" data-name="' + attr(n.name) + '">观看策略</button></div>' +
         (n.secret ? infoRow("密钥", '<span class="masked" data-secret="' + attr(n.secret) + '">••••••</span>') : '') +
       '</div>' +
       '<div class="card-footer"><div class="card-actions"><button class="btn small" data-act="up" data-name="' + attr(n.name) + '" ' + (index === 0 ? "disabled" : "") + '>上移</button><button class="btn small" data-act="down" data-name="' + attr(n.name) + '" ' + (index === list.length - 1 ? "disabled" : "") + '>下移</button></div><div class="card-actions"><button class="btn small" data-act="copy" data-name="' + attr(n.name) + '">复制</button><button class="btn small" data-act="edit" data-name="' + attr(n.name) + '">编辑</button><button class="btn small" data-act="ping" data-name="' + attr(n.name) + '">测速</button><button class="btn small primary" data-act="keepalive" data-name="' + attr(n.name) + '">已观看</button><button class="btn small danger" data-act="delete" data-name="' + attr(n.name) + '">删除</button></div></div>' +
@@ -5934,6 +6870,8 @@ async function saveNode(){
     icon: $("icon").value.trim() || DEFAULT_NODE_ICON_CLIENT,
     targets: $("targets").value.split(/\\n|[;,，；|]+/).map(v => v.trim()).filter(Boolean),
     streamTarget: $("streamTarget").value,
+    streamStrategy: $("streamStrategy").value,
+    streamTimeoutMs: Number($("streamTimeoutMs").value || 2500),
     secret: $("secret").value,
     clientProfile: $("clientProfile").value,
     impersonate: $("impersonate").checked,
@@ -5950,7 +6888,14 @@ async function saveNode(){
     keepaliveAt: $("keepaliveAt").value,
     embyUser: $("embyUser").value,
     embyPassword: $("embyPassword").value,
-    embyPlayId: $("embyPlayId").value
+    embyPlayId: $("embyPlayId").value,
+    watchContentType: $("watchContentType").value,
+    watchWindowStart: Number($("watchWindowStart").value || 0),
+    watchWindowEnd: Number($("watchWindowEnd").value || 24),
+    watchDailyLimit: Number($("watchDailyLimit").value || 1),
+    watchFailureBackoffMin: Number($("watchFailureBackoffMin").value || 360),
+    watchDurationMinSec: Number($("watchDurationMinSec").value || 300),
+    watchDurationMaxSec: Number($("watchDurationMaxSec").value || 390)
   };
   try {
     await api("/api/nodes", { method:"POST", body: JSON.stringify(body) });
@@ -6012,7 +6957,7 @@ function showNodeEditor(mode){
   if (mode === "create") {
     $("formTitle").textContent = "新建媒体线路";
   }
-  try { panel.scrollIntoView({ behavior: "smooth", block: "start" }); } catch {}
+  try { panel.scrollIntoView({ behavior: "instant", block: "start" }); } catch {}
 }
 function hideNodeEditor(){
   const panel = $("nodeEditorPanel");
@@ -6037,6 +6982,8 @@ function editNode(name){
   $("icon").value = n.icon || "";
   $("targets").value = (n.targets || []).join("\\n"); $("secret").value = n.secret || "";
   $("streamTarget").value = n.streamTarget || "";
+  $("streamStrategy").value = n.streamStrategy || "auto";
+  $("streamTimeoutMs").value = n.streamTimeoutMs || 2500;
   $("clientProfile").value = n.clientProfile || "yamby";
   $("impersonate").checked = n.impersonate !== false;
   $("headerMode").value = n.headerMode || "dual";
@@ -6051,8 +6998,22 @@ function editNode(name){
   $("embyUser").value = n.embyUser || "";
   $("embyPassword").value = n.embyPassword || "";
   $("embyPlayId").value = n.embyPlayId || "";
+  $("watchContentType").value = n.watchContentType || "mixed";
+  $("watchWindowStart").value = n.watchWindowStart ?? 0;
+  $("watchWindowEnd").value = n.watchWindowEnd ?? 24;
+  $("watchDailyLimit").value = n.watchDailyLimit || 1;
+  $("watchFailureBackoffMin").value = n.watchFailureBackoffMin || 360;
+  $("watchDurationMinSec").value = n.watchDurationMinSec || 300;
+  $("watchDurationMaxSec").value = n.watchDurationMaxSec || 390;
   $("tag").value = n.tag || ""; $("remark").value = n.remark || "";
   showNodeEditor("edit");
+}
+function editNodeSection(name, sectionId){
+  editNode(name);
+  requestAnimationFrame(() => {
+    const section = $(sectionId);
+    if (section) section.scrollIntoView({ behavior: "instant", block: "start" });
+  });
 }
 async function deleteNode(name){
   if (!await uiConfirm("删除后该线路配置将不可恢复。\\n节点：" + name, "删除节点")) return;
@@ -6078,6 +7039,25 @@ async function pingNode(name, options = {}){
     updateLatencyChip(name);
     if (!options.quiet) handleError(e);
   }
+}
+async function diagnoseStreamLines(name = ""){
+  try {
+    let data;
+    const saved = name || $("editingName")?.value || "";
+    if (saved) {
+      data = await api("/api/stream-health", { method:"POST", body: JSON.stringify({ name: saved }) });
+    } else {
+      const lines = $("streamTarget").value.split(/\\n|[;,，；|]+/).map(v => v.trim()).filter(Boolean);
+      if (!lines.length) return showToast("请先填写独立视频线路或保存节点");
+      const results = await Promise.all(lines.map(async (target, index) => {
+        const result = await api("/api/ping-node", { method:"POST", body: JSON.stringify({ target }) });
+        return { index:index + 1, target, label:target, ...result };
+      }));
+      data = { ok:results.some(item => item.ok), preferred:"未保存", lines:results };
+    }
+    const text = (data.lines || []).map((line) => "#" + line.index + " " + (line.label || line.target || "-") + " · " + (line.ok ? (Number(line.ms || 0) + "ms") : (line.error || "不可用"))).join("\\n");
+    await uiAlert("当前优先：" + (data.preferred || "-") + "\\n\\n" + (text || "没有可测试线路"), "视频线路诊断");
+  } catch(e){ handleError(e); }
 }
 function updateLatencyChip(name){
   const key = String(name || '');
@@ -6197,6 +7177,34 @@ async function loadStats(){
     renderDashboardCharts();
   }
   catch(e){ handleError(e); }
+}
+async function loadPerformance(){
+  try {
+    const hours = Number($("performanceHours")?.value || 24);
+    const data = await api("/api/performance?hours=" + hours);
+    performanceData = data.performance || null;
+    renderPerformance();
+  } catch(e){ handleError(e); }
+}
+function formatPerformanceMs(value){
+  const ms = Number(value || 0);
+  if (!ms) return "--";
+  return ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : Math.round(ms) + "ms";
+}
+function renderPerformance(){
+  const data = performanceData || {};
+  const summary = data.summary || {};
+  if ($("perfRequests")) $("perfRequests").textContent = Number(summary.requests || 0).toLocaleString();
+  if ($("perfWindow")) $("perfWindow").textContent = "最近 " + Number(data.hours || 24) + " 小时";
+  if ($("perfPercentiles")) $("perfPercentiles").textContent = formatPerformanceMs(summary.p50Ms) + " / " + formatPerformanceMs(summary.p95Ms);
+  if ($("perfUpstream")) $("perfUpstream").textContent = formatPerformanceMs(summary.avgUpstreamMs);
+  if ($("perfFailures")) $("perfFailures").textContent = Number(summary.errors || 0) + " / " + Number(summary.failovers || 0);
+  if ($("performanceNodeRows")) {
+    $("performanceNodeRows").innerHTML = (data.nodes || []).map((row) => '<tr><td>' + esc(row.node || "-") + '</td><td>' + Number(row.requests || 0).toLocaleString() + '</td><td>' + formatPerformanceMs(row.p50Ms) + '</td><td>' + formatPerformanceMs(row.p95Ms) + '</td><td>' + formatPerformanceMs(row.avgNodeMs) + '</td><td>' + formatPerformanceMs(row.avgUpstreamMs) + '</td><td>' + Number(row.errorRate || 0).toFixed(2) + '%</td><td>' + Number(row.failovers || 0) + '</td></tr>').join("") || '<tr><td colspan="8" style="text-align:center;color:var(--text-sec)">暂无性能数据</td></tr>';
+  }
+  if ($("performanceLineRows")) {
+    $("performanceLineRows").innerHTML = (data.lines || []).map((row) => '<tr><td>' + esc(row.node || "-") + '</td><td>' + esc(row.kind === "stream" ? "视频" : "API") + '</td><td class="mono">' + esc(row.label || "-") + '</td><td>' + Number(row.attempts || 0) + '</td><td>' + Number(row.successRate || 0).toFixed(1) + '%</td><td>' + formatPerformanceMs(row.avgMs) + '</td><td>' + (row.updatedAt ? esc(new Date(Number(row.updatedAt)).toLocaleString()) : "-") + '</td></tr>').join("") || '<tr><td colspan="7" style="text-align:center;color:var(--text-sec)">暂无线路数据</td></tr>';
+  }
 }
 async function loadAnalytics(){
   try {
@@ -6338,6 +7346,15 @@ function resetForm(options = {}){
   if ($("clientProfile")) $("clientProfile").value = "yamby";
   if ($("headerMode")) $("headerMode").value = "dual";
   if ($("streamMode")) $("streamMode").value = "proxy";
+  if ($("streamStrategy")) $("streamStrategy").value = "auto";
+  if ($("streamTimeoutMs")) $("streamTimeoutMs").value = "2500";
+  if ($("watchContentType")) $("watchContentType").value = "mixed";
+  if ($("watchWindowStart")) $("watchWindowStart").value = "0";
+  if ($("watchWindowEnd")) $("watchWindowEnd").value = "24";
+  if ($("watchDailyLimit")) $("watchDailyLimit").value = "1";
+  if ($("watchFailureBackoffMin")) $("watchFailureBackoffMin").value = "360";
+  if ($("watchDurationMinSec")) $("watchDurationMinSec").value = "300";
+  if ($("watchDurationMaxSec")) $("watchDurationMaxSec").value = "390";
   if ($("impersonate")) $("impersonate").checked = true;
   if ($("directExternal")) $("directExternal").checked = false;
   if ($("cacheImage")) $("cacheImage").checked = true;
@@ -6406,7 +7423,7 @@ function switchPage(page){
   const titles = { nodes: "线路配置", network: "测速与 DNS", dashboard: "数据大屏", deploy: "代码更新" };
   if ($("pageTitle")) $("pageTitle").textContent = titles[next] || "控制台";
   try {
-    if (next === "dashboard") { loadStats(); loadAnalytics(); }
+    if (next === "dashboard") { loadStats(); loadAnalytics(); loadPerformance(); }
     if (next === "network") loadDNS({ quiet: true });
     if (next === "nodes") loadWatchLogs({ quiet: true });
     else hideNodeEditor();
@@ -6423,10 +7440,16 @@ async function loadTrace(){
     const data = await api("/api/trace");
     const entry = data.entry || {};
     const egress = data.egress || {};
-    $("traceEntry").textContent = [entry.country, entry.colo, entry.city].filter(Boolean).join(" / ") || "--";
-    $("traceEgress").textContent = [egress.loc, egress.colo, egress.ip].filter(Boolean).join(" / ") || egress.error || (egress.status === "updating" ? "检测中..." : "--");
+    const entryText = [entry.country, entry.colo, entry.city].filter(Boolean).join(" / ") || "--";
+    const egressText = [egress.loc, egress.colo, egress.ip].filter(Boolean).join(" / ") || egress.error || (egress.status === "updating" ? "检测中..." : "--");
+    $("traceEntry").textContent = entryText;
+    $("traceEgress").textContent = egressText;
+    $("mobileTraceEntry").textContent = [entry.colo, entry.country].filter(Boolean).join(" / ") || "--";
+    $("mobileTraceEgress").textContent = egress.ip || [egress.colo, egress.loc].filter(Boolean).join(" / ") || egress.error || (egress.status === "updating" ? "检测中..." : "--");
     if (egress.status === "updating") setTimeout(loadTrace, 2200);
-  } catch(e) { $("traceEntry").textContent = "--"; $("traceEgress").textContent = "--"; }
+  } catch(e) {
+    for (const id of ["traceEntry", "traceEgress", "mobileTraceEntry", "mobileTraceEgress"]) $(id).textContent = "--";
+  }
 }
 async function measureRTT(){
   const started = performance.now();
@@ -6434,8 +7457,14 @@ async function measureRTT(){
     await fetch("/__client_rtt__?t=" + Date.now(), { cache: "no-store" });
     const ms = Math.round(performance.now() - started);
     $("rttValue").textContent = ms + "ms";
-    $("rttDot").style.background = ms < 180 ? "var(--ok)" : (ms < 450 ? "var(--warn)" : "var(--danger)");
-  } catch { $("rttValue").textContent = "--"; }
+    $("mobileRttValue").textContent = ms + "ms";
+    const color = ms < 180 ? "var(--ok)" : (ms < 450 ? "var(--warn)" : "var(--danger)");
+    $("rttDot").style.background = color;
+    $("mobileRttDot").style.background = color;
+  } catch {
+    $("rttValue").textContent = "--";
+    $("mobileRttValue").textContent = "--";
+  }
 }
 async function addCustomIPs(){
   const found = extractInputRecords($("customIps").value);
@@ -6707,6 +7736,9 @@ document.querySelectorAll("[data-theme]").forEach((btn) => {
 });
 applyTheme(localStorage.getItem("embyproxy_ui_theme") || "cyber");
 $("closeDashboardBtn").addEventListener("click", closeDashboard);
+$("reloadPerformanceBtn").addEventListener("click", loadPerformance);
+$("performanceHours").addEventListener("change", loadPerformance);
+$("testEditedStreamBtn").addEventListener("click", () => diagnoseStreamLines());
 $("testCustomBtn").addEventListener("click", addCustomIPs);
 $("fetchCustomApiBtn").addEventListener("click", fetchCustomApiAndTest);
 $("directCnameBtn").addEventListener("click", directSubmitCname);
@@ -6732,7 +7764,10 @@ $("nodeGrid").addEventListener("click", (event) => {
   const name = btn.dataset.name;
   if (btn.dataset.act === "copy") copyText(proxyURL(nodes.find(n => n.name === name) || {}));
   if (btn.dataset.act === "edit") editNode(name);
+  if (btn.dataset.act === "stream-edit") editNodeSection(name, "streamConfigSection");
+  if (btn.dataset.act === "watch-edit") editNodeSection(name, "watchStrategySection");
   if (btn.dataset.act === "ping") pingNode(name);
+  if (btn.dataset.act === "stream") diagnoseStreamLines(name);
   if (btn.dataset.act === "keepalive") markWatched(name);
   if (btn.dataset.act === "delete") deleteNode(name);
   if (btn.dataset.act === "up") moveNode(name, -1);

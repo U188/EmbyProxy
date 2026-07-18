@@ -33,17 +33,36 @@ assert.match(source, /item\.enabled !== false/, "disabled nodes must not be auto
 assert.match(source, /AUTO_WATCH_FAILURE_BACKOFF_MS/, "automatic failures must have retry backoff");
 assert.match(source, /auto_watch INTEGER DEFAULT 0/, "runtime schema must default automatic watching to off");
 assert.match(schema, /auto_watch INTEGER DEFAULT 0/, "D1 schema must persist the automatic watch switch");
+for (const column of [
+  "watch_window_start", "watch_window_end", "watch_daily_limit", "watch_content_type",
+  "watch_failure_backoff_min", "watch_duration_min_sec", "watch_duration_max_sec"
+]) {
+  assert.match(source, new RegExp(`${column} [A-Z]+`), `runtime schema must include ${column}`);
+  assert.match(schema, new RegExp(`${column} [A-Z]+`), `D1 schema must include ${column}`);
+}
+assert.match(source, /AUTO_WATCH_MAX_CONCURRENCY/, "automatic watching must enforce a global concurrency limit");
+assert.match(source, /autoWatchSuccessCountToday/, "automatic watching must enforce a daily success limit");
+assert.match(source, /IncludeItemTypes=\$\{includeTypes\}/, "automatic content selection must honor the configured media type");
+assert.match(source, /id="watchContentType"/, "the node editor must expose content selection");
+assert.match(source, /id="watchWindowStart"/, "the node editor must expose the random watch window");
 assert.match(source, /node\?\.autoWatch && node\.embyUser && node\.embyPassword/, "automatic watching must require the switch, username and password");
 assert.match(source, /notifyKeepaliveDue\(env, item, node\)/, "nodes without complete automatic-watch configuration must use reminders");
 assert.match(source, /last_notify_day = \?, notify_count = notify_count \+ 1/, "reminders must be deduplicated per day");
 assert.match(source, /id="autoWatch" type="checkbox"/, "the node editor must expose the automatic-watch switch");
 assert.doesNotMatch(source, /节点未配置 Emby 用户名\/密码，无法真实模拟观看/, "missing credentials must not be reported as an automatic-watch failure");
 
-const moduleURL = `data:text/javascript;base64,${Buffer.from(`${source}\nexport { canNodeAutoWatch, notifyKeepaliveDue };`).toString("base64")}`;
-const { canNodeAutoWatch, notifyKeepaliveDue } = await import(moduleURL);
+const moduleURL = `data:text/javascript;base64,${Buffer.from(`${source}\nexport { canNodeAutoWatch, notifyKeepaliveDue, autoWatchWindowDecision, randomSimulatedWatchDurationSec, beijingDayStartMs };`).toString("base64")}`;
+const { canNodeAutoWatch, notifyKeepaliveDue, autoWatchWindowDecision, randomSimulatedWatchDurationSec, beijingDayStartMs } = await import(moduleURL);
 assert.equal(canNodeAutoWatch({ autoWatch: false, embyUser: "alice", embyPassword: "pw" }), false);
 assert.equal(canNodeAutoWatch({ autoWatch: true, embyUser: "alice", embyPassword: "" }), false);
 assert.equal(canNodeAutoWatch({ autoWatch: true, embyUser: "alice", embyPassword: "pw" }), true);
+assert.equal(randomSimulatedWatchDurationSec({ watchDurationMinSec: 120, watchDurationMaxSec: 120 }), 120);
+const dayStart = beijingDayStartMs(Date.UTC(2026, 6, 18, 4, 0, 0));
+assert.equal(new Date(dayStart + 8 * 60 * 60 * 1000).getUTCHours(), 0);
+const windowNode = { name: "window-node", watchWindowStart: 8, watchWindowEnd: 10 };
+const initialWindow = autoWatchWindowDecision(windowNode, Date.UTC(2026, 6, 18, 0, 0, 0));
+const scheduledNow = dayStart + initialWindow.scheduledMinute * 60 * 1000;
+assert.equal(autoWatchWindowDecision(windowNode, scheduledNow).eligible, true);
 
 const updates = [];
 const reminderEnv = {

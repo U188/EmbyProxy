@@ -26,9 +26,19 @@ const pages = new Set([...html.matchAll(/data-page="([^"]+)"/g)].map((match) => 
 const tabs = new Set([...html.matchAll(/data-page-tab="([^"]+)"/g)].map((match) => match[1]));
 assert.deepEqual([...tabs].sort(), [...pages].sort(), "page tabs and page panels must match");
 
-for (const id of ["nodeGrid", "watchLogRows", "traceEntry", "traceEgress", "dialogBackdrop"]) {
+for (const id of ["nodeGrid", "watchLogRows", "traceEntry", "traceEgress", "mobileTraceEntry", "mobileTraceEgress", "mobileRttValue", "dialogBackdrop"]) {
   assert.ok(idSet.has(id), `required visible surface is missing: ${id}`);
 }
+for (const id of ["streamStrategy", "streamTimeoutMs", "watchContentType", "watchWindowStart", "performanceNodeRows", "performanceLineRows"]) {
+  assert.ok(idSet.has(id), `new operational control is missing: ${id}`);
+}
+for (const id of ["streamConfigSection", "watchStrategySection"]) {
+  assert.ok(idSet.has(id), `mobile shortcut target is missing: ${id}`);
+}
+assert.ok(html.indexOf('id="perfRequests"') < html.indexOf('id="trafficToday"'), "real performance must appear before legacy traffic cards");
+assert.match(html, /data-act="stream-edit"[\s\S]*?data-act="watch-edit"/, "node cards must expose video and watch shortcuts");
+assert.match(scripts[0], /editNodeSection\(name, "streamConfigSection"\)/, "video shortcut must open the video section");
+assert.match(scripts[0], /editNodeSection\(name, "watchStrategySection"\)/, "watch shortcut must open the watch section");
 assert.match(html, /id="nodeEditorPanel" hidden/, "node editor must start hidden");
 assert.match(html, /id="deployBody" hidden/, "deploy editor must start hidden");
 assert.doesNotMatch(html, /id="nodeGrid"[^>]*\shidden(?:\s|>)/, "node cards must not be hidden");
@@ -38,6 +48,8 @@ assert.match(
   /@media\(max-width:980px\)\{[\s\S]*?\.hero-bar>div:first-child\{display:none\}/,
   "mobile header content must stay collapsed"
 );
+assert.match(html, /@media\(max-width:980px\)\{[\s\S]*?\.sidebar\{display:none\}/, "mobile status sidebar must not consume the first viewport");
+assert.match(html, /@media\(max-width:980px\)\{[\s\S]*?\.mobile-edge-bar\{[\s\S]*?display:grid/, "mobile edge status must remain visible");
 assert.match(html, /\.hero-bar\{[\s\S]*?z-index:1000;[\s\S]*?overflow:visible/, "more menu parent must stay above page panels");
 assert.match(html, /\.icon-menu\[open\]\{z-index:1100\}/, "open more menu must create a top layer");
 assert.match(html, /class="network-workspace"/, "network results and DNS must use the dedicated workspace layout");
@@ -57,6 +69,9 @@ const apiRoutes = new Set(
 );
 for (const required of ["/api/nodes", "/api/watch-logs", "/api/keepalive/reset", "/api/ping-node"]) {
   assert.ok(apiRoutes.has(required), `required client API call is missing: ${required}`);
+}
+for (const required of ["/api/performance", "/api/stream-health"]) {
+  assert.ok(apiRoutes.has(required), `new operational API call is missing: ${required}`);
 }
 
 console.log(`admin checks passed: ${ids.length} ids, ${tabs.size} pages, ${apiRoutes.size} API calls`);

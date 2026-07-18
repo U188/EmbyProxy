@@ -25,6 +25,15 @@ CREATE TABLE IF NOT EXISTS nodes (
   emby_access_token TEXT DEFAULT '',
   emby_auth_profile TEXT DEFAULT '',
   emby_play_id TEXT DEFAULT '',
+  stream_strategy TEXT DEFAULT 'auto',
+  stream_timeout_ms INTEGER DEFAULT 2500,
+  watch_window_start INTEGER DEFAULT 0,
+  watch_window_end INTEGER DEFAULT 24,
+  watch_daily_limit INTEGER DEFAULT 1,
+  watch_content_type TEXT DEFAULT 'mixed',
+  watch_failure_backoff_min INTEGER DEFAULT 360,
+  watch_duration_min_sec INTEGER DEFAULT 300,
+  watch_duration_max_sec INTEGER DEFAULT 390,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -135,3 +144,48 @@ WHERE status IN ('starting', 'running')
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sim_watch_sessions_one_active_node
 ON sim_watch_sessions(node)
 WHERE status IN ('starting', 'running');
+
+CREATE TABLE IF NOT EXISTS performance_metrics (
+  node TEXT NOT NULL,
+  bucket_ts INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  request_count INTEGER DEFAULT 0,
+  success_count INTEGER DEFAULT 0,
+  error_count INTEGER DEFAULT 0,
+  failover_count INTEGER DEFAULT 0,
+  node_ms_sum REAL DEFAULT 0,
+  upstream_ms_sum REAL DEFAULT 0,
+  rewrite_ms_sum REAL DEFAULT 0,
+  total_ms_sum REAL DEFAULT 0,
+  total_ms_max REAL DEFAULT 0,
+  b100 INTEGER DEFAULT 0,
+  b250 INTEGER DEFAULT 0,
+  b500 INTEGER DEFAULT 0,
+  b1000 INTEGER DEFAULT 0,
+  b2500 INTEGER DEFAULT 0,
+  b5000 INTEGER DEFAULT 0,
+  bslow INTEGER DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (node, bucket_ts, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_performance_metrics_bucket ON performance_metrics(bucket_ts);
+
+CREATE TABLE IF NOT EXISTS line_performance (
+  node TEXT NOT NULL,
+  bucket_ts INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  line_key TEXT NOT NULL,
+  line_label TEXT DEFAULT '',
+  attempts INTEGER DEFAULT 0,
+  successes INTEGER DEFAULT 0,
+  failures INTEGER DEFAULT 0,
+  latency_ms_sum REAL DEFAULT 0,
+  last_latency_ms REAL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (node, bucket_ts, kind, line_key)
+);
+CREATE INDEX IF NOT EXISTS idx_line_performance_bucket ON line_performance(bucket_ts);
+
+INSERT INTO system_config (k, v, updated_at)
+VALUES ('system:schema_version', '0.5.2', 0)
+ON CONFLICT(k) DO UPDATE SET v = excluded.v, updated_at = excluded.updated_at;

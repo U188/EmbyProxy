@@ -2,16 +2,16 @@
 
 基于 Cloudflare Workers 和 D1 的 Emby 多线路代理。项目包含代理入口、节点管理后台、真实模拟观看、测速与动态 DNS、流量统计和 Telegram 通知。
 
-当前版本：`0.4.9`
+当前版本：`0.5.2`
 
 ## 功能
 
-- 多 Emby 节点分流，支持节点密钥、备用上游和独立视频线路
+- 多 Emby 节点分流，支持节点密钥、多个独立视频线路、自动择优和失败切换
 - 全代理、直连、自动播放模式及请求 Header 策略
 - Yamby、Hills Android、Hills Windows 客户端模拟
 - 后台管理节点、测速、排序、导入导出、优选 IP 和 Cloudflare DNS
-- D1 保存节点、访问统计、观看状态和最近 3 天模拟观看记录
-- 节点可选择到期自动观看；仅在开关启用且用户名、密码完整时真实开播，否则只提醒
+- D1 汇总每个节点和视频线路的真实 P50/P95、上游耗时、错误率及切换次数
+- 节点可配置随机观看窗口、每日次数、内容类型、失败退避和观看时长；账号不完整时只提醒
 - 模拟观看完成或失败后发送 Telegram 通知，支持定时日报和 Bot 菜单
 - 源码本地维护，部署前自动生成混淆后的 Worker 文件
 
@@ -28,6 +28,9 @@ worker/
   scripts/check-admin.mjs   # 管理后台静态回归检查
   scripts/check-security.mjs # 代理、缓存、Webhook 和配置安全检查
   scripts/check-watch-client.mjs # 模拟观看身份与状态机检查
+  scripts/check-performance.mjs # 代理性能与流式响应检查
+  scripts/check-setup.mjs   # 安装向导无副作用检查
+  scripts/setup.mjs         # Cloudflare 首次部署交互向导
   scripts/export-admin.mjs  # 生成本地后台预览
   scripts/run-wrangler.mjs  # 自动选择本机或模板 Wrangler 配置
 ```
@@ -42,14 +45,31 @@ worker/
 - 一个由 Cloudflare 托管的域名
 - 可选：Telegram Bot
 
-克隆并安装依赖：
+## 推荐：交互式安装
+
+首次部署只需克隆、安装依赖并运行向导：
 
 ```bash
 git clone https://github.com/U188/EmbyProxy.git
 cd EmbyProxy/worker
 npm install
-cp wrangler.toml wrangler.local.toml
+npm run setup
 ```
+
+向导会依次完成：
+
+1. 检查或启动 Wrangler 登录。
+2. 自动识别或询问 Account ID，选择已有 D1 或创建新 D1。
+3. 询问 Worker 名称、管理域名、调度域名和 Zone 信息。
+4. 生成权限为 `0600`、且被 Git 忽略的 `wrangler.local.toml`；覆盖前自动备份旧配置。
+5. 初始化/升级远程数据库，引导输入管理密码、Cloudflare 和 Telegram Secrets。
+6. 运行完整测试与混淆构建，部署后检查两个 `/api/health`。
+
+向导不会把 Token 或密码写入文件；Secret 由 Wrangler 直接提交到 Cloudflare。使用浏览器登录或提前设置 `CLOUDFLARE_API_TOKEN` 均可。浏览器登录模式选择已有 D1 时，需要从 Wrangler 显示的列表粘贴一次数据库名称和 UUID；创建新 D1 会自动读取。已有部署再次运行向导时可复用本机配置，只执行建表、Secret 更新或重新部署。
+
+以下章节是手工部署方法，也用于排查 Token 权限、D1、域名和 Telegram 配置问题。
+
+## 手工部署
 
 ## 1. 创建 Cloudflare API Token
 
@@ -128,6 +148,7 @@ cp wrangler.toml wrangler.local.toml
 name = "你的-worker-name"
 main = "dist/index.js"
 compatibility_date = "2026-07-06"
+account_id = "你的 Account ID"
 
 workers_dev = true
 routes = [
@@ -150,6 +171,7 @@ CF_DOMAIN = "admin.example.com"
 CF_DNS_DOMAIN = "media.example.com"
 CF_WORKER_NAME = "你的-worker-name"
 TG_REPORT_HOUR = "9"
+AUTO_WATCH_MAX_CONCURRENCY = "2"
 PREFERRED_IPS_URL = "https://example.com/ips.txt"
 ```
 
@@ -160,6 +182,7 @@ PREFERRED_IPS_URL = "https://example.com/ips.txt"
 - 管理域名使用 Worker Custom Domain；调度域名使用 `域名/*` Worker Route。
 - `crons = ["* * * * *"]` 必须保留。真实模拟观看依赖每分钟 Cron 上报进度和结束会话。
 - `TG_REPORT_HOUR` 按北京时间设置，默认每天 `9` 点发送日报。
+- `AUTO_WATCH_MAX_CONCURRENCY` 限制所有节点同时自动观看的会话数，建议保持 `2`。
 - `PREFERRED_IPS_URL` 可省略，代码内有默认数据源。
 
 Account ID 可在 Workers & Pages 概览查看；Zone ID 可在对应域名 Overview 页面查看。
@@ -279,7 +302,7 @@ curl https://media.example.com/api/health
 预期返回：
 
 ```json
-{"ok":true,"version":"0.4.9"}
+{"ok":true,"version":"0.5.2"}
 ```
 
 后台地址：
@@ -304,6 +327,17 @@ https://media.example.com/节点名/节点密钥/
 5. 配置 Emby 账号的节点点击“已观看”，确认开始弹窗。
 6. 等待约 5-7.5 分钟，确认 Emby 播放记录、网页记录和 TG 通知。
 
+## 性能与独立视频线路
+
+数据大屏的性能区域来自 Worker 真实代理请求，不是浏览器测速。系统按分钟汇总最近 7 天数据，展示请求量、P50/P95 总耗时、平均上游耗时、错误率、线路切换次数，以及每条视频线路的成功率和最近延迟。统计只保存线路主机名和哈希标识，不保存完整上游路径。
+
+节点的“独立视频线路”每行填写一个完整 `http://` 或 `https://` 地址。视频请求优先使用这些线路，普通 API 仍使用主上游。策略可选：
+
+- `自动择优`：根据本实例最近成功、失败和延迟动态排序，失败线路暂时降权。
+- `按填写顺序`：健康时保持配置顺序，失败时才切换备用线路。
+
+“视频线路诊断”会在 5 秒内并行探测各线路。视频响应头超时可按节点设置为 `500-10000ms`；多线路的 GET/HEAD 播放请求超时或收到 `5xx/429` 时自动尝试下一条线路。
+
 ## 真实模拟观看
 
 每个需要模拟观看的节点必须配置：
@@ -313,6 +347,7 @@ https://media.example.com/节点名/节点密钥/
 - Emby 密码
 - 可选：指定条目 ID；为空时自动选择可播放内容
 - 自动任务还需要周期天数和提前提醒天数
+- 自动任务可设置北京时间执行窗口、每天成功次数、电影/剧集筛选、失败退避及随机观看时长
 
 未勾选自动观看，或用户名、密码任一为空时，不会尝试登录 Emby，只发送到期提醒。提醒按节点每天最多发送一次。
 
@@ -325,7 +360,7 @@ https://media.example.com/节点名/节点密钥/
 5. 实际达到目标时长后发送 `Stopped` 和 PlayedItems。
 6. 写入最近 3 天观看记录并发送 TG 完成通知。
 
-同一节点已有运行中会话时不会重复启动。自动观看失败会写入失败记录并发送 TG 失败通知；仅提醒模式不会记录为观看失败。
+每个节点每天在配置窗口内选择一个确定性的随机分钟启动，不会因 Cron 重试反复变化。同一节点不会并发，所有节点还受 `AUTO_WATCH_MAX_CONCURRENCY` 全局限制；达到每日成功次数或处于失败退避期时跳过。自动观看失败会写入失败记录并发送 TG 失败通知；仅提醒模式不会记录为观看失败。
 
 ## 更新已有部署
 

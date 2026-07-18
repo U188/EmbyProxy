@@ -1,6 +1,7 @@
 name = "embyproxy"
 main = "dist/index.js"
 compatibility_date = "2026-07-06"
+account_id = "replace-with-account-id"
 
 workers_dev = true
 routes = [
@@ -23,6 +24,7 @@ CF_DOMAIN = "admin.example.com"
 CF_DNS_DOMAIN = "media.example.com"
 CF_WORKER_NAME = "embyproxy"
 TG_REPORT_HOUR = "9"
+AUTO_WATCH_MAX_CONCURRENCY = "2"
 PREFERRED_IPS_URL = "https://raw.githubusercontent.com/ZhiXuanWang/cf-speed-dns/refs/heads/main/ipTop10.html"
 
 # Set ADMIN_TOKEN, CF_API_TOKEN, TG_BOT_TOKEN and TG_CHAT_ID with wrangler secret.
