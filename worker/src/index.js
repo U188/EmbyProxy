@@ -17,6 +17,7 @@ const IDENTITY_KEY = "system:upstream_identity";
 const SCHEMA_VERSION_KEY = "system:schema_version";
 const SCHEMA_VERSION = "0.5.2";
 const LEGACY_DEFAULT_DEVICE_NAME = "OnePlus-PKG110";
+const LEGACY_HILLS_ANDROID_DEVICE_NAME = "diting";
 const SIMULATED_WATCH_DURATION_MIN_SEC = 300;
 // The minute cron can add almost 60 seconds before the stop event is sent.
 const SIMULATED_WATCH_DURATION_MAX_SEC = 390;
@@ -25,7 +26,7 @@ const DEFAULT_AUTO_WATCH_MAX_CONCURRENCY = 2;
 const PERFORMANCE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const CLIENT_PROFILES = [
   { id: "yamby", label: "Yamby Android", ua: "Yamby/2.0.4.6(Android", client: "Yamby", version: "2.0.4.6", device: "Android", authStyle: "yamby", idFormat: "uuid" },
-  { id: "hills_android", label: "Hills Android", ua: "Hills/1.7.2 (android; 15)", client: "Hills", version: "1.7.2", device: "diting", authStyle: "hills", idLength: 16 },
+  { id: "hills_android", label: "Hills Android", ua: "Hills/1.7.2 (android; 15)", client: "Hills", version: "1.7.2", device: "EmbyProxy Android", authStyle: "hills", idLength: 16 },
   { id: "hills_windows", label: "Hills Windows", ua: "Hills Windows/1.3.1 (windows; 19041.vb_release.191206-1406)", client: "Hills Windows", version: "1.3.1", device: "", authStyle: "hills", idLength: 32, devicePrefix: "DESKTOP-" }
 ];
 
@@ -925,13 +926,17 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
   if (node.impersonate !== false) {
     const identityState = await getIdentityState(env);
     const profile = node.clientProfile || DEFAULT_CLIENT_PROFILE;
+    const snapshot = profileSnapshot(profile, identityState, headers, targetURL);
     const resourceIdentity = isResourceIdentityRequest(request, targetURL);
     if (resourceIdentity) {
-      applyClientProfileToResourceURL(targetURL, headers, profile, identityState);
+      applyClientProfileToResourceURL(targetURL, headers, profile, identityState, snapshot);
     } else {
-      applyClientProfileToURL(targetURL, headers, profile, identityState);
+      applyClientProfileToURL(targetURL, headers, profile, identityState, snapshot);
     }
-    applyClientProfile(headers, profile, true, identityState, { hillsHeaders: resourceIdentity });
+    applyClientProfile(headers, profile, true, identityState, {
+      snapshot,
+      hillsHeaders: resourceIdentity || isAuthenticationIdentityRequest(targetURL)
+    });
   }
   if (mode === "strict") {
     headers.set("Origin", targetURL.origin);
@@ -997,7 +1002,7 @@ async function signedRawProxyURL(publicBase, raw, env, node) {
 }
 
 function applyClientProfile(headers, profile, overwrite, identityState, options = {}) {
-  const values = profileSnapshot(profile, identityState);
+  const values = options.snapshot || profileSnapshot(profile, identityState);
   const token = identityTokenFromHeaders(headers);
   rewriteIdentityHeaders(headers, values);
   setHeader(headers, "User-Agent", values.ua, overwrite);
@@ -1103,19 +1108,57 @@ function isPanURL(targetURL) {
   });
 }
 
-function profileSnapshot(profile, identityState) {
+function profileSnapshot(profile, identityState, headers = null, targetURL = null) {
   const item = getClientProfile(profile);
   const state = identityState?.profiles?.[item.id] || {};
+  const incoming = incomingDeviceIdentity(headers, targetURL);
   return {
     ...item,
-    device: state.deviceName || defaultProfileDeviceName(item),
-    deviceId: state.deviceId || stableDeviceID(item),
+    device: incoming.device || state.deviceName || defaultProfileDeviceName(item),
+    deviceId: incoming.deviceId || state.deviceId || stableDeviceID(item),
     authStyle: item.authStyle || "quoted"
   };
 }
 
-function applyClientProfileToURL(targetURL, headers, profile, identityState) {
-  const snap = profileSnapshot(profile, identityState);
+function incomingDeviceIdentity(headers, targetURL) {
+  const values = { device: "", deviceId: "" };
+  if (headers instanceof Headers) {
+    values.device = firstNonEmpty(headers.get("X-Emby-Device-Name"), headers.get("X-MediaBrowser-Device-Name"));
+    values.deviceId = firstNonEmpty(headers.get("X-Emby-Device-Id"), headers.get("X-MediaBrowser-Device-Id"));
+    for (const key of ["X-Emby-Authorization", "X-MediaBrowser-Authorization", "Authorization", "X-Authorization"]) {
+      const auth = headers.get(key) || "";
+      if (!values.device) values.device = embyAuthorizationField(auth, "Device");
+      if (!values.deviceId) values.deviceId = embyAuthorizationField(auth, "DeviceId");
+    }
+  }
+  if (targetURL?.searchParams) {
+    for (const [key, value] of targetURL.searchParams.entries()) {
+      const normalized = normalizeIdentityKey(key);
+      if (!values.device && ["device", "devicename", "xembydevicename", "xmediabrowserdevicename"].includes(normalized)) {
+        values.device = value;
+      }
+      if (!values.deviceId && ["deviceid", "xembydeviceid", "xmediabrowserdeviceid"].includes(normalized)) {
+        values.deviceId = value;
+      }
+      if (["authorization", "xauthorization", "xembyauthorization", "xmediabrowserauthorization"].includes(normalized)) {
+        if (!values.device) values.device = embyAuthorizationField(value, "Device");
+        if (!values.deviceId) values.deviceId = embyAuthorizationField(value, "DeviceId");
+      }
+    }
+  }
+  return {
+    device: sanitizeHeaderValue(values.device).trim().slice(0, 128),
+    deviceId: sanitizeHeaderValue(values.deviceId).trim().slice(0, 160)
+  };
+}
+
+function embyAuthorizationField(value, field) {
+  const match = String(value || "").match(new RegExp(`(?:^|[,\\s])${field}\\s*=\\s*("(?:\\\\.|[^"])*"|[^,\\s]+)`, "i"));
+  return match ? unquoteAuthField(match[1]) : "";
+}
+
+function applyClientProfileToURL(targetURL, headers, profile, identityState, snapshot = null) {
+  const snap = snapshot || profileSnapshot(profile, identityState, headers, targetURL);
   if (snap.authStyle === "yamby") {
     promoteYambyQueryAuth(targetURL, headers);
     promoteAuthorizationTokenFromHeaders(headers);
@@ -1129,8 +1172,8 @@ function applyClientProfileToURL(targetURL, headers, profile, identityState) {
   rewriteIdentityQuery(targetURL, snap);
 }
 
-function applyClientProfileToResourceURL(targetURL, headers, profile, identityState) {
-  const snap = profileSnapshot(profile, identityState);
+function applyClientProfileToResourceURL(targetURL, headers, profile, identityState, snapshot = null) {
+  const snap = snapshot || profileSnapshot(profile, identityState, headers, targetURL);
   if (snap.authStyle === "yamby") {
     promoteYambyQueryAuth(targetURL, headers);
     promoteAuthorizationTokenFromHeaders(headers);
@@ -1507,7 +1550,8 @@ function normalizeIdentityState(saved) {
 function normalizeDeviceState(profile, saved) {
   const raw = saved && typeof saved === "object" ? saved : {};
   let deviceName = cleanString(raw.deviceName || "");
-  if (!deviceName || deviceName === LEGACY_DEFAULT_DEVICE_NAME) {
+  const legacyHillsAndroid = profile.id === "hills_android" && deviceName.toLowerCase() === LEGACY_HILLS_ANDROID_DEVICE_NAME;
+  if (!deviceName || deviceName === LEGACY_DEFAULT_DEVICE_NAME || legacyHillsAndroid) {
     deviceName = defaultProfileDeviceName(profile);
   }
   let deviceId = cleanString(raw.deviceId || "").toLowerCase();
@@ -2153,6 +2197,11 @@ function isResourceIdentityRequest(request, targetURL) {
   return isPlaybackStreamRequest(request, targetURL) ||
     isImageRequest(path) ||
     normalizedEmbyAPIPath(path).includes("/additionalparts");
+}
+
+function isAuthenticationIdentityRequest(targetURL) {
+  const path = normalizedEmbyAPIPath(targetURL?.pathname || "/");
+  return path.includes("/users/authenticate") || path.startsWith("/quickconnect/");
 }
 
 function normalizedEmbyAPIPath(path) {

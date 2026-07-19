@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 const source = await readFile(new URL("../src/index.js", import.meta.url), "utf8");
-const moduleURL = `data:text/javascript;base64,${Buffer.from(`${source}\nexport { getProxyNode, invalidateProxyNodeCache, shouldRewriteBody, withServerTiming, orderTargetsByHealth, recordTargetOutcome, fetchWithHeaderTimeout, shouldRecordVisitorLog, readStreamTextLimited, readStreamBytesLimited, BodyLimitError, shouldUseDirectStream, performanceHistogram, histogramPercentile, targetHeaderTimeoutMs, trackTargetOutcome, saveNode, performanceMetricStatement, linePerformanceStatement };`).toString("base64")}`;
+const moduleURL = `data:text/javascript;base64,${Buffer.from(`${source}\nexport { getProxyNode, invalidateProxyNodeCache, shouldRewriteBody, withServerTiming, orderTargetsByHealth, recordTargetOutcome, fetchWithHeaderTimeout, shouldRecordVisitorLog, readStreamTextLimited, readStreamBytesLimited, BodyLimitError, shouldUseDirectStream, performanceHistogram, histogramPercentile, targetHeaderTimeoutMs, trackTargetOutcome, saveNode, performanceMetricStatement, linePerformanceStatement, profileSnapshot, normalizeDeviceState, getClientProfile, isAuthenticationIdentityRequest, buildHeaders };`).toString("base64")}`;
 const performanceModule = await import(moduleURL);
 const {
   default: worker,
@@ -24,7 +24,12 @@ const {
   trackTargetOutcome,
   saveNode,
   performanceMetricStatement,
-  linePerformanceStatement
+  linePerformanceStatement,
+  profileSnapshot,
+  normalizeDeviceState,
+  getClientProfile,
+  isAuthenticationIdentityRequest,
+  buildHeaders
 } = performanceModule;
 
 assert.doesNotMatch(
@@ -35,6 +40,41 @@ assert.doesNotMatch(
 assert.match(source, /schemaVersionIsCurrent\(env\)/, "admin cold starts must use a schema version fast path");
 assert.match(source, /env\.DB\.batch\(statements\.map/, "fallback schema migration must batch table creation");
 assert.match(source, /url\.pathname === "\/api\/health"[\s\S]*?return json\(\{ ok: true, version: BUILD_VERSION \}\)/, "health checks must not depend on D1");
+assert.doesNotMatch(source, /device:\s*"diting"/, "Hills Android must not use an unrelated hard-coded device name");
+
+const incomingHillsHeaders = new Headers({
+  "User-Agent": "Hills/1.7.2 (android; 15)",
+  "X-Emby-Authorization": 'MediaBrowser Client="Hills", Device="Pixel 9", DeviceId="real-device-123", Version="1.7.2"'
+});
+const incomingSnapshot = profileSnapshot("hills_android", {
+  profiles: { hills_android: { deviceName: "EmbyProxy Android", deviceId: "0123456789abcdef" } }
+}, incomingHillsHeaders, new URL("https://origin.example.com/Users/AuthenticateByName"));
+assert.equal(incomingSnapshot.device, "Pixel 9", "proxying must preserve the real client device name");
+assert.equal(incomingSnapshot.deviceId, "real-device-123", "proxying must preserve the real client device id");
+assert.equal(
+  normalizeDeviceState(getClientProfile("hills_android"), { deviceName: "diting", deviceId: "0123456789abcdef" }).deviceName,
+  "EmbyProxy Android",
+  "legacy Hills identity state must migrate away from diting"
+);
+assert.equal(isAuthenticationIdentityRequest(new URL("https://origin.example.com/Users/AuthenticateByName")), true);
+const identityDB = {
+  prepare() {
+    return {
+      bind() { return this; },
+      async first() { return null; },
+      async run() { return { success: true }; }
+    };
+  }
+};
+const loginTarget = new URL("https://origin.example.com/Users/AuthenticateByName");
+const loginHeaders = await buildHeaders(
+  new Request("https://proxy.example.com/zz/Users/AuthenticateByName", { method: "POST", headers: incomingHillsHeaders }),
+  loginTarget,
+  { name: "zz", targets: ["https://origin.example.com"], clientProfile: "hills_android", impersonate: true, headerMode: "off" },
+  { DB: identityDB }
+);
+assert.match(loginHeaders.get("X-Emby-Authorization") || "", /Device="Pixel 9"/);
+assert.match(loginHeaders.get("X-Emby-Authorization") || "", /DeviceId="real-device-123"/);
 
 let nodeReads = 0;
 const row = {
