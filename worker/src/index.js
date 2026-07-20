@@ -1,4 +1,4 @@
-const BUILD_VERSION = "0.5.12";
+const BUILD_VERSION = "0.5.13";
 const DEFAULT_MAX_REWRITE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_RETRY_BODY_BYTES = 16 * 1024 * 1024;
 const PROXY_NODE_CACHE_TTL_MS = 10000;
@@ -15,7 +15,7 @@ const DEFAULT_CLIENT_PROFILE = "yamby";
 const DEFAULT_NODE_ICON = "🎬";
 const IDENTITY_KEY = "system:upstream_identity";
 const SCHEMA_VERSION_KEY = "system:schema_version";
-const SCHEMA_VERSION = "0.5.12";
+const SCHEMA_VERSION = "0.5.13";
 const ANDROID_DEVICE_NAME = "OnePlus-PKG110";
 const SIMULATED_WATCH_DURATION_MIN_SEC = 300;
 // The minute cron can add almost 60 seconds before the stop event is sent.
@@ -1034,15 +1034,28 @@ async function buildOutboundRequest(request, targetURL, node, bodyBuffer, env, o
 async function fetchConfiguredTarget(request, targetURL, node, bodyBuffer, env, timeoutMs) {
   let response;
   let attempts = 0;
+  const credentialAuthentication = request.method === "POST" && isCredentialAuthenticationRequest(targetURL);
   for (const compatibilityRetry of [false, true]) {
     if (response) discardResponseBody(response);
     const outbound = await buildOutboundRequest(request, new URL(targetURL), node, bodyBuffer, env, {
       compatibilityRetry,
-      directMode: compatibilityRetry ? "retry-no-origin" : ""
+      directMode: compatibilityRetry ? "retry-no-origin" : "",
+      cleanAuthentication: credentialAuthentication && compatibilityRetry
     });
     attempts++;
     response = await fetchWithHeaderTimeout(outbound, timeoutMs);
-    if (!compatibilityRetry && ["GET", "HEAD"].includes(request.method) && [403, 500].includes(response.status)) {
+    const retrySafeRead = ["GET", "HEAD"].includes(request.method) && [403, 500].includes(response.status);
+    const retryRejectedAuthentication = credentialAuthentication && response.status === 403;
+    if (!compatibilityRetry && (retrySafeRead || retryRejectedAuthentication)) {
+      if (retryRejectedAuthentication) {
+        console.warn("authentication upstream rejected; retrying with clean client identity", {
+          node: node.name,
+          status: response.status,
+          server: response.headers.get("server") || "",
+          cfRay: response.headers.get("cf-ray") || "",
+          contentType: response.headers.get("content-type") || ""
+        });
+      }
       continue;
     }
     return { response, attempts };
@@ -1077,6 +1090,7 @@ function upstreamHeaderTimeoutMs(env) {
 async function buildHeaders(request, targetURL, node, env, options = {}) {
   const headers = new Headers(request.headers);
   const clientIP = headers.get("cf-connecting-ip") || "";
+  const cleanAuthentication = Boolean(options.cleanAuthentication && isCredentialAuthenticationRequest(targetURL));
   stripHopByHop(headers);
   stripCloudflareForwardingHeaders(headers);
   if (options.rawExternal && !isConfiguredNodeOrigin(node, targetURL)) {
@@ -1094,7 +1108,7 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
   }
 
   const mode = node.headerMode || "dual";
-  if (mode === "realip_only" || mode === "dual" || mode === "strict") {
+  if (!cleanAuthentication && (mode === "realip_only" || mode === "dual" || mode === "strict")) {
     if (clientIP) {
       headers.set("X-Real-IP", clientIP);
       headers.set("X-Forwarded-For", clientIP);
@@ -1102,7 +1116,7 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
     headers.set("X-Forwarded-Proto", "https");
   }
 
-  if (node.impersonate !== false) {
+  if (node.impersonate !== false && !cleanAuthentication) {
     const identityState = await getIdentityState(env);
     const profile = node.clientProfile || DEFAULT_CLIENT_PROFILE;
     const snapshot = profileSnapshot(profile, identityState);
@@ -1120,7 +1134,10 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
   if (options.compatibilityRetry) {
     deleteHeaders(headers, ["Origin", "Referer", "X-Real-IP", "X-Forwarded-For", "X-Forwarded-Proto"]);
   }
-  if (mode === "strict") {
+  if (cleanAuthentication) {
+    sanitizeAuthenticationRetryHeaders(headers);
+  }
+  if (mode === "strict" && !cleanAuthentication) {
     headers.set("Origin", targetURL.origin);
     headers.set("Referer", targetURL.origin + "/");
   }
@@ -2358,6 +2375,29 @@ function isResourceIdentityRequest(request, targetURL) {
 function isAuthenticationIdentityRequest(targetURL) {
   const path = normalizedEmbyAPIPath(targetURL?.pathname || "/");
   return path.includes("/users/authenticate") || path.startsWith("/quickconnect/");
+}
+
+function isCredentialAuthenticationRequest(targetURL) {
+  const path = normalizedEmbyAPIPath(targetURL?.pathname || "/");
+  return path.includes("/users/authenticate");
+}
+
+function sanitizeAuthenticationRetryHeaders(headers) {
+  const allowed = new Set([
+    "accept", "accept-encoding", "accept-language", "content-type", "user-agent",
+    "x-emby-authorization", "x-mediabrowser-authorization",
+    "x-emby-client", "x-mediabrowser-client",
+    "x-emby-client-version", "x-mediabrowser-client-version",
+    "x-emby-device-name", "x-mediabrowser-device-name",
+    "x-emby-device-id", "x-mediabrowser-device-id",
+    "x-emby-language", "x-mediabrowser-language",
+    "x-emby-token", "x-mediabrowser-token"
+  ]);
+  for (const key of [...headers.keys()]) {
+    if (!allowed.has(key.toLowerCase())) {
+      headers.delete(key);
+    }
+  }
 }
 
 function normalizedEmbyAPIPath(path) {
@@ -6824,7 +6864,7 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
               <div class="form-grid node-form">
                 <div class="field w4"><label>模拟客户端</label><select id="clientProfile">${clientProfileOptionsHTML()}</select></div>
                 <div class="field w4"><label>Header</label><select id="headerMode"><option value="off">保守 off</option><option value="realip_only">严格 realip_only</option><option value="dual">兼容 dual</option><option value="strict">强力 strict</option></select></div>
-                <div class="field w4"><label>播放方式</label><select id="streamMode"><option value="proxy">中转播放（默认）</option><option value="direct">固定直连</option><option value="auto">条件直连（鉴权兼容时）</option></select></div>
+                <div class="field w4"><label>播放方式</label><select id="streamMode"><option value="proxy">中转播放（默认）</option><option value="direct">媒体流直连</option><option value="auto">媒体流条件直连</option></select></div>
                 <div class="option-row">
                   <label class="check"><input id="impersonate" type="checkbox" checked>启用模拟客户端</label>
                   <label class="check"><input id="directExternal" type="checkbox">条件直连时允许外部直链</label>
@@ -7244,7 +7284,7 @@ function renderNodes(){
     const routeDetail = route.ts
       ? relativeTimeClient(route.ts) + (route.status ? " · HTTP " + route.status : "") + (routeMode === "direct" ? " · 不代表客户端已播成功" : "")
       : "出现中转响应或直连重定向后显示";
-    const configuredMode = n.streamMode === "direct" ? "固定直连" : (n.streamMode === "auto" ? "条件直连" : "固定中转");
+    const configuredMode = n.streamMode === "direct" ? "媒体流直连" : (n.streamMode === "auto" ? "媒体流条件直连" : "固定中转");
     const recentStatusText = route.status ? ("HTTP " + route.status) : "暂无记录";
     const lineStrategyDetail = n.streamStrategy === "priority"
       ? "按配置顺序使用，当前线路失败后切换"

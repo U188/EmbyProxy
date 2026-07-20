@@ -99,6 +99,27 @@ assert.match(loginHeaders.get("User-Agent") || "", /^Hills\//);
 assert.match(loginHeaders.get("X-Emby-Authorization") || "", /Client="Hills"/);
 assert.match(loginHeaders.get("X-Emby-Authorization") || "", /Device="OnePlus-PKG110"/);
 assert.match(loginHeaders.get("X-Emby-Authorization") || "", /DeviceId="0123456789abcdef"/);
+const cleanLoginHeaders = await buildHeaders(
+  new Request("https://proxy.example.com/zz/Users/AuthenticateByName", {
+    method: "POST",
+    headers: {
+      ...Object.fromEntries(incomingYambyHeaders),
+      "CF-Connecting-IP": "203.0.113.8",
+      "Cookie": "worker_session=wrong-origin",
+      "Origin": "https://proxy.example.com"
+    }
+  }),
+  new URL(loginTarget),
+  { name: "zz", targets: ["https://origin.example.com"], clientProfile: "hills_android", impersonate: true, headerMode: "dual" },
+  { DB: identityDB },
+  { compatibilityRetry: true, directMode: "retry-no-origin", cleanAuthentication: true }
+);
+assert.match(cleanLoginHeaders.get("User-Agent") || "", /^Yamby\//, "clean login retry must preserve the inbound client identity");
+assert.match(cleanLoginHeaders.get("X-Emby-Authorization") || "", /Client=Yamby/, "clean login retry must preserve inbound Emby authorization");
+assert.equal(cleanLoginHeaders.get("X-Forwarded-For"), null, "clean login retry must not forward the client IP");
+assert.equal(cleanLoginHeaders.get("X-Real-IP"), null, "clean login retry must not send a conflicting real IP");
+assert.equal(cleanLoginHeaders.get("Cookie"), null, "clean login retry must not leak Worker-origin cookies upstream");
+assert.equal(cleanLoginHeaders.get("Origin"), null, "clean login retry must not send the Worker origin upstream");
 
 const forwardedRequest = new Request("https://proxy.example.com/zz/System/Info/Public", {
   headers: {
@@ -772,6 +793,13 @@ const compatibilityCalls = [];
 const originalFetchForCompatibility = globalThis.fetch;
 globalThis.fetch = async (request) => {
   compatibilityCalls.push(request);
+  const credentialAuthentication = new URL(request.url).pathname.toLowerCase().includes("/users/authenticate");
+  if (credentialAuthentication) {
+    const authAttempts = compatibilityCalls.filter((item) => new URL(item.url).pathname.toLowerCase().includes("/users/authenticate")).length;
+    return authAttempts === 1
+      ? new Response("upstream authentication rejected", { status: 403, headers: { "Server": "cloudflare", "CF-Ray": "upstream-ray" } })
+      : new Response("authenticated", { status: 200 });
+  }
   const getAttempts = compatibilityCalls.filter((item) => item.method === "GET").length;
   return request.method === "POST" || getAttempts === 1
     ? new Response("upstream compatibility failure", { status: 500 })
@@ -797,6 +825,33 @@ try {
   assert.match(compatibilityCalls[1].headers.get("User-Agent") || "", /^Hills\//);
   assert.equal(compatibilityCalls[1].headers.get("X-Forwarded-For"), null);
   assert.equal(compatibilityCalls[1].headers.get("CF-Ray"), null);
+  const authenticationBody = JSON.stringify({ Username: "demo", Pw: "secret" });
+  const authentication = await fetchConfiguredTarget(
+    new Request("https://proxy.example.com/zz/Users/AuthenticateByName", {
+      method: "POST",
+      headers: {
+        ...Object.fromEntries(incomingYambyHeaders),
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": "203.0.113.9",
+        "Cookie": "worker_session=wrong-origin"
+      },
+      body: authenticationBody
+    }),
+    new URL("https://origin.example.com/Users/AuthenticateByName"),
+    { name: "zz", targets: ["https://origin.example.com"], clientProfile: "hills_android", impersonate: true, headerMode: "dual" },
+    new TextEncoder().encode(authenticationBody).buffer,
+    { DB: identityDB },
+    0
+  );
+  assert.equal(authentication.response.status, 200);
+  assert.equal(authentication.attempts, 2, "a rejected credential login must receive one clean compatibility retry");
+  const authenticationCalls = compatibilityCalls.filter((item) => new URL(item.url).pathname.toLowerCase().includes("/users/authenticate"));
+  assert.equal(authenticationCalls.length, 2);
+  assert.match(authenticationCalls[0].headers.get("User-Agent") || "", /^Hills\//, "the normal login attempt must retain configured impersonation");
+  assert.match(authenticationCalls[1].headers.get("User-Agent") || "", /^Yamby\//, "the clean retry must restore the inbound client identity");
+  assert.match(authenticationCalls[1].headers.get("X-Emby-Authorization") || "", /Client=Yamby/);
+  assert.equal(authenticationCalls[1].headers.get("X-Forwarded-For"), null);
+  assert.equal(authenticationCalls[1].headers.get("Cookie"), null);
   const nonIdempotent = await fetchConfiguredTarget(
     new Request("https://proxy.example.com/zz/Sessions/Playing", { method: "POST", body: "{}" }),
     new URL("https://origin.example.com/Sessions/Playing"),

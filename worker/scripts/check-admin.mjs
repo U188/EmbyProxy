@@ -72,7 +72,7 @@ assert.match(scripts[0], /拖动直连回退/, "range fallback redirects must be
 assert.match(scripts[0], /中转响应/, "proxied response headers must not be presented as completed playback");
 assert.match(html, /不读取视频正文测速/, "the admin must state that playback bodies are not sampled for speed");
 assert.doesNotMatch(html, /上游读取吞吐|个读取样本|近 1 小时均速/, "retired playback speed metrics must not remain visible");
-assert.match(html, /条件直连（鉴权兼容时）/, "conditional direct mode must describe its actual decision rule");
+assert.match(html, /媒体流条件直连/, "conditional direct mode must be scoped to media streams");
 assert.match(html, /多条中转线路按响应耗时和近期失败状态选择/, "the playback editor must explain health-based line selection");
 assert.doesNotMatch(html, /<option value="auto">自动<\/option>|自动模式允许直链|自动判断/, "ambiguous direct-mode copy must be removed");
 assert.match(scripts[0], /sessionStorage\.getItem\(tokenKey\)/, "admin credentials must be scoped to the current tab");

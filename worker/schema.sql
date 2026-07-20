@@ -202,5 +202,5 @@ CREATE INDEX IF NOT EXISTS idx_line_performance_bucket ON line_performance(bucke
 CREATE INDEX IF NOT EXISTS idx_line_performance_node_kind_updated ON line_performance(node, kind, updated_at);
 
 INSERT INTO system_config (k, v, updated_at)
-VALUES ('system:schema_version', '0.5.12', 0)
+VALUES ('system:schema_version', '0.5.13', 0)
 ON CONFLICT(k) DO NOTHING;
