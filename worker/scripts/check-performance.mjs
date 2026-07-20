@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 const source = await readFile(new URL("../src/index.js", import.meta.url), "utf8");
-const moduleURL = `data:text/javascript;base64,${Buffer.from(`${source}\nexport { getProxyNode, invalidateProxyNodeCache, shouldRewriteBody, withServerTiming, orderTargetsByHealth, recordTargetOutcome, fetchWithHeaderTimeout, shouldRecordVisitorLog, readStreamTextLimited, readStreamBytesLimited, BodyLimitError, shouldUseDirectStream, performanceHistogram, histogramPercentile, targetHeaderTimeoutMs, trackTargetOutcome, saveNode, performanceMetricStatement, linePerformanceStatement, profileSnapshot, normalizeDeviceState, getClientProfile, isAuthenticationIdentityRequest, buildHeaders };`).toString("base64")}`;
+const schema = await readFile(new URL("../schema.sql", import.meta.url), "utf8");
+const moduleURL = `data:text/javascript;base64,${Buffer.from(`${source}\nexport { getProxyNode, invalidateProxyNodeCache, shouldRewriteBody, withServerTiming, orderTargetsByHealth, recordTargetOutcome, fetchWithHeaderTimeout, fetchConfiguredTarget, shouldRecordVisitorLog, readStreamTextLimited, readStreamBytesLimited, BodyLimitError, shouldUseDirectStream, performanceHistogram, histogramPercentile, targetHeaderTimeoutMs, trackTargetOutcome, saveNode, performanceMetricStatement, linePerformanceStatement, profileSnapshot, normalizeDeviceState, getClientProfile, isAuthenticationIdentityRequest, buildHeaders, logClientIdentity, playbackRouteResult, markPlaybackRoute, pingTarget, pingTargetCompat, replaceDNSRecordsSafely, recoverStaleWatchSessions };`).toString("base64")}`;
 const performanceModule = await import(moduleURL);
 const {
   default: worker,
@@ -13,6 +14,7 @@ const {
   orderTargetsByHealth,
   recordTargetOutcome,
   fetchWithHeaderTimeout,
+  fetchConfiguredTarget,
   shouldRecordVisitorLog,
   readStreamTextLimited,
   readStreamBytesLimited,
@@ -29,7 +31,14 @@ const {
   normalizeDeviceState,
   getClientProfile,
   isAuthenticationIdentityRequest,
-  buildHeaders
+  buildHeaders,
+  logClientIdentity,
+  playbackRouteResult,
+  markPlaybackRoute,
+  pingTarget,
+  pingTargetCompat,
+  replaceDNSRecordsSafely,
+  recoverStaleWatchSessions
 } = performanceModule;
 
 assert.doesNotMatch(
@@ -41,40 +50,127 @@ assert.match(source, /schemaVersionIsCurrent\(env\)/, "admin cold starts must us
 assert.match(source, /env\.DB\.batch\(statements\.map/, "fallback schema migration must batch table creation");
 assert.match(source, /url\.pathname === "\/api\/health"[\s\S]*?return json\(\{ ok: true, version: BUILD_VERSION \}\)/, "health checks must not depend on D1");
 assert.doesNotMatch(source, /device:\s*"diting"/, "Hills Android must not use an unrelated hard-coded device name");
+for (const column of ["outbound_profile", "outbound_ua", "outbound_device"]) {
+  assert.match(source, new RegExp(`${column} TEXT DEFAULT ''`), `runtime visitor logs must include ${column}`);
+  assert.match(schema, new RegExp(`${column} TEXT DEFAULT ''`), `D1 schema must include ${column}`);
+}
+assert.match(source, /INSERT INTO visitor_logs \([\s\S]*?outbound_profile, outbound_ua, outbound_device/, "visitor logs must persist the outbound identity snapshot");
+assert.match(source, /CREATE TABLE IF NOT EXISTS playback_route_state/, "runtime schema must persist the latest actual playback route");
+assert.match(schema, /CREATE TABLE IF NOT EXISTS playback_route_state/, "D1 schema must persist the latest actual playback route");
+assert.match(source, /playbackRoute: routes\.get\(node\.name\) \|\| null/, "node cards must receive their latest actual playback route");
+assert.match(source, /excluded\.ts - playback_route_state\.ts >= \$\{PLAYBACK_AUX_WRITE_INTERVAL_MS\}/, "D1 must enforce playback route write throttling across isolates");
 
-const incomingHillsHeaders = new Headers({
-  "User-Agent": "Hills/1.7.2 (android; 15)",
-  "X-Emby-Authorization": 'MediaBrowser Client="Hills", Device="Pixel 9", DeviceId="real-device-123", Version="1.7.2"'
+const incomingYambyHeaders = new Headers({
+  "User-Agent": "Yamby/2.0.4.6(Android",
+  "X-Emby-Authorization": 'Emby Client=Yamby,Device=Pixel 9,DeviceId=real-device-123,Version=2.0.4.6'
 });
 const incomingSnapshot = profileSnapshot("hills_android", {
-  profiles: { hills_android: { deviceName: "EmbyProxy Android", deviceId: "0123456789abcdef" } }
-}, incomingHillsHeaders, new URL("https://origin.example.com/Users/AuthenticateByName"));
-assert.equal(incomingSnapshot.device, "Pixel 9", "proxying must preserve the real client device name");
-assert.equal(incomingSnapshot.deviceId, "real-device-123", "proxying must preserve the real client device id");
+  profiles: { hills_android: { deviceName: "stale-device-name", deviceId: "0123456789abcdef" } }
+}, incomingYambyHeaders, new URL("https://origin.example.com/Users/AuthenticateByName"));
+assert.equal(incomingSnapshot.device, "OnePlus-PKG110", "the selected profile must control the simulated device name");
+assert.equal(incomingSnapshot.deviceId, "0123456789abcdef", "the selected profile must control the simulated device id");
+assert.equal(getClientProfile("yamby").device, "OnePlus-PKG110", "Yamby Android must use the expected device name");
+assert.equal(getClientProfile("hills_android").device, "OnePlus-PKG110", "Hills Android must use the expected device name");
 assert.equal(
-  normalizeDeviceState(getClientProfile("hills_android"), { deviceName: "diting", deviceId: "0123456789abcdef" }).deviceName,
-  "EmbyProxy Android",
-  "legacy Hills identity state must migrate away from diting"
+  normalizeDeviceState(getClientProfile("hills_android"), { deviceName: "Pixel 9", deviceId: "0123456789abcdef" }).deviceName,
+  "OnePlus-PKG110",
+  "saved Hills Android identity must normalize to the configured simulated device"
 );
 assert.equal(isAuthenticationIdentityRequest(new URL("https://origin.example.com/Users/AuthenticateByName")), true);
 const identityDB = {
   prepare() {
     return {
       bind() { return this; },
-      async first() { return null; },
+      async first() {
+        return { v: JSON.stringify({ profiles: { hills_android: { deviceName: "OnePlus-PKG110", deviceId: "0123456789abcdef" } } }) };
+      },
       async run() { return { success: true }; }
     };
   }
 };
 const loginTarget = new URL("https://origin.example.com/Users/AuthenticateByName");
 const loginHeaders = await buildHeaders(
-  new Request("https://proxy.example.com/zz/Users/AuthenticateByName", { method: "POST", headers: incomingHillsHeaders }),
+  new Request("https://proxy.example.com/zz/Users/AuthenticateByName", { method: "POST", headers: incomingYambyHeaders }),
   loginTarget,
   { name: "zz", targets: ["https://origin.example.com"], clientProfile: "hills_android", impersonate: true, headerMode: "off" },
   { DB: identityDB }
 );
-assert.match(loginHeaders.get("X-Emby-Authorization") || "", /Device="Pixel 9"/);
-assert.match(loginHeaders.get("X-Emby-Authorization") || "", /DeviceId="real-device-123"/);
+assert.match(loginHeaders.get("User-Agent") || "", /^Hills\//);
+assert.match(loginHeaders.get("X-Emby-Authorization") || "", /Client="Hills"/);
+assert.match(loginHeaders.get("X-Emby-Authorization") || "", /Device="OnePlus-PKG110"/);
+assert.match(loginHeaders.get("X-Emby-Authorization") || "", /DeviceId="0123456789abcdef"/);
+
+const forwardedRequest = new Request("https://proxy.example.com/zz/System/Info/Public", {
+  headers: {
+    "CF-Connecting-IP": "203.0.113.8",
+    "CF-Ray": "test-ray",
+    "CDN-Loop": "cloudflare; loops=1",
+    "Origin": "https://client.example.com"
+  }
+});
+const forwardedTarget = new URL("https://origin.example.com/System/Info/Public");
+const normalForwardedHeaders = await buildHeaders(
+  forwardedRequest,
+  new URL(forwardedTarget),
+  { name: "zz", targets: ["https://origin.example.com"], clientProfile: "hills_android", impersonate: true, headerMode: "dual" },
+  { DB: identityDB }
+);
+assert.equal(normalForwardedHeaders.get("CF-Ray"), null, "Cloudflare internal headers must not leak upstream");
+assert.equal(normalForwardedHeaders.get("CDN-Loop"), null, "Cloudflare loop headers must not leak upstream");
+assert.equal(normalForwardedHeaders.get("X-Forwarded-For"), "203.0.113.8", "normal dual mode must retain the derived client IP");
+const compatibilityHeaders = await buildHeaders(
+  forwardedRequest,
+  new URL(forwardedTarget),
+  { name: "zz", targets: ["https://origin.example.com"], clientProfile: "hills_android", impersonate: true, headerMode: "dual" },
+  { DB: identityDB },
+  { compatibilityRetry: true, directMode: "retry-no-origin" }
+);
+assert.match(compatibilityHeaders.get("User-Agent") || "", /^Hills\//, "compatibility retries must preserve the selected Hills identity");
+assert.equal(compatibilityHeaders.get("X-Forwarded-For"), null, "compatibility retries must remove forwarded client identity");
+assert.equal(compatibilityHeaders.get("Origin"), null, "compatibility retries must remove origin restrictions");
+
+const yambySnapshot = profileSnapshot("yamby", {
+  profiles: { yamby: { deviceName: "OnePlus-PKG110", deviceId: "12345678-1234-4234-8234-123456789abc" } }
+});
+assert.equal(yambySnapshot.client, "Yamby");
+assert.equal(yambySnapshot.device, "OnePlus-PKG110");
+assert.equal(yambySnapshot.deviceId, "12345678-1234-4234-8234-123456789abc");
+
+const loggedHills = logClientIdentity({ clientProfile: "hills_android", impersonate: true }, {
+  profiles: { hills_android: { deviceName: "stale-device-name", deviceId: "0123456789abcdef" } }
+}, "Yamby/2.0.4.6(Android");
+assert.deepEqual(loggedHills, {
+  profile: "hills_android",
+  ua: "Hills/1.7.2 (android; 15)",
+  device: "OnePlus-PKG110"
+}, "logs must distinguish inbound Yamby from the selected outbound Hills identity");
+assert.deepEqual(
+  logClientIdentity({ clientProfile: "hills_android", impersonate: false }, null, "Yamby/2.0.4.6(Android"),
+  { profile: "disabled", ua: "Yamby/2.0.4.6(Android", device: "" },
+  "disabled impersonation must be explicit in visitor logs"
+);
+
+assert.deepEqual(playbackRouteResult("direct", 302, 1000), { mode: "direct", ts: 1000, status: 302 });
+assert.deepEqual(playbackRouteResult("playback", 206, 2000), { mode: "proxy", ts: 2000, status: 206 });
+assert.equal(playbackRouteResult("playback", 502, 3000), null, "failed playback must not replace the last successful route");
+assert.equal(playbackRouteResult("request", 200, 4000), null, "ordinary API traffic must not replace the playback route");
+const routeWrites = [];
+const routeEnv = {
+  DB: {
+    prepare(sql) {
+      return {
+        bind(...args) {
+          return { async run() { routeWrites.push({ sql, args }); } };
+        }
+      };
+    }
+  }
+};
+await markPlaybackRoute(routeEnv, "route-card-test", "direct", 1000, 302);
+await markPlaybackRoute(routeEnv, "route-card-test", "direct", 2000, 302);
+await markPlaybackRoute(routeEnv, "route-card-test", "proxy", 3000, 206);
+assert.equal(routeWrites.length, 2, "the same route must be throttled while a mode change is written immediately");
+assert.deepEqual(routeWrites.map((item) => item.args[1]), ["direct", "proxy"]);
 
 let nodeReads = 0;
 const row = {
@@ -354,6 +450,276 @@ assert.deepEqual(
 assert.match(source, /CREATE TABLE IF NOT EXISTS performance_metrics/, "runtime schema must persist performance aggregates");
 assert.match(source, /CREATE TABLE IF NOT EXISTS line_performance/, "runtime schema must persist line outcomes");
 assert.match(source, /failover_count = failover_count \+ excluded\.failover_count/, "performance metrics must count real failovers");
+for (const column of ["transfer_count", "transfer_bytes", "transfer_ms_sum", "last_bps"]) {
+  assert.match(source, new RegExp(`${column} (?:INTEGER|REAL) DEFAULT 0`), `runtime schema must include ${column}`);
+  assert.match(schema, new RegExp(`${column} (?:INTEGER|REAL) DEFAULT 0`), `D1 schema must include ${column}`);
+}
+assert.match(schema, /INSERT INTO system_config[\s\S]*?ON CONFLICT\(k\) DO NOTHING/, "offline schema setup must not skip runtime migrations on an existing database");
+assert.doesNotMatch(
+  source.match(/async function ensureWatchSessionsTable[\s\S]*?\n}/)?.[0] || "",
+  /CREATE TABLE|PRAGMA|CREATE INDEX|UPDATE sim_watch_sessions/,
+  "watch-session hot paths must not repeat schema discovery or migration writes"
+);
+assert.doesNotMatch(
+  source.match(/async function keepaliveStatusMap[\s\S]*?\n}/)?.[0] || "",
+  /ensureKeepaliveTable|CREATE TABLE/,
+  "keepalive reads must not execute schema DDL on every request"
+);
+assert.match(
+  source,
+  /if \(oldName && oldName !== node\.name\) \{[\s\S]*?await env\.DB\.batch\(\[\s*upsertNode,[\s\S]*?DELETE FROM nodes WHERE name = \?[\s\S]*?\]\);/,
+  "node rename must write the replacement, migrate dependent state, and delete the old row in one D1 batch"
+);
+assert.match(
+  source,
+  /INSERT INTO line_performance[\s\S]*?SELECT \?, bucket_ts[\s\S]*?ON CONFLICT\(node, bucket_ts, kind, line_key\) DO UPDATE SET/,
+  "node rename must merge conflicting performance buckets instead of losing history"
+);
+assert.match(
+  source.match(/async function deleteNode[\s\S]*?\n}/)?.[0] || "",
+  /UPDATE sim_watch_sessions[\s\S]*?status IN \('starting', 'running', 'notify_pending'\)/,
+  "deleting a node must terminate all active or pending simulated sessions"
+);
+assert.match(
+  source,
+  /if \(isRetryableStatus\(upstream\.status\)\) \{[\s\S]*?recordTargetOutcome\([^\n]+"failure"[\s\S]*?if \(targets\.length > 1\)/,
+  "a retryable status must be recorded as a failure even when no backup line exists"
+);
+
+assert.doesNotMatch(source, /response\.body\.tee\(|measureProxyStream|recordStreamTransfer|updateStreamSpeedSample/, "playback responses must not be read or wrapped for throughput sampling");
+
+const originalFetchForHealth = globalThis.fetch;
+let healthCalls = 0;
+const healthRequests = [];
+globalThis.fetch = async (input, init = {}) => {
+  const request = new Request(input, init);
+  healthCalls++;
+  healthRequests.push({ method: request.method, path: new URL(request.url).pathname });
+  return new Response("forbidden", { status: 403 });
+};
+try {
+  const denied = await pingTarget("https://denied.example.com");
+  assert.equal(denied.ok, false, "403 probes must not mark a video line healthy");
+  assert.equal(denied.status, 403);
+  assert.equal(healthCalls, 3, "a denied public endpoint must not prevent trying compatible paths");
+  assert.equal((await pingTargetCompat("https://denied.example.com")).ms, -1, "card latency must reject HTTP errors");
+  assert.equal(healthCalls, 6, "card latency must reuse all compatible Emby health paths");
+  assert.deepEqual(
+    healthRequests.slice(3),
+    [
+      { method: "GET", path: "/emby/System/Info/Public" },
+      { method: "GET", path: "/System/Info/Public" },
+      { method: "GET", path: "/" }
+    ],
+    "card latency must use GET health probes instead of a short HEAD request"
+  );
+} finally {
+  globalThis.fetch = originalFetchForHealth;
+}
+
+const staleWrites = [];
+await recoverStaleWatchSessions({
+  DB: {
+    prepare(sql) {
+      return {
+        bind(...args) {
+          return { async run() { staleWrites.push({ sql, args }); return { success: true }; } };
+        }
+      };
+    }
+  }
+}, 123456, "stale-node");
+assert.equal(staleWrites.length, 1);
+assert.match(staleWrites[0].sql, /status = 'starting' AND next_tick_at <= \?/);
+assert.deepEqual(staleWrites[0].args, [123456, 123456, "stale-node"]);
+
+const dnsCalls = [];
+const originalFetchForDNS = globalThis.fetch;
+globalThis.fetch = async (url, init = {}) => {
+  const body = init.body ? JSON.parse(init.body) : null;
+  dnsCalls.push({ url: String(url), method: init.method || "GET", body });
+  if (init.method === "POST") {
+    return Response.json({ success: false, errors: [{ message: "create failed" }] });
+  }
+  return Response.json({ success: true, result: { id: "old-id", ...(body || {}) } });
+};
+try {
+  const replaced = await replaceDNSRecordsSafely(
+    { CF_API_TOKEN: "test", CF_ZONE_ID: "zone" },
+    "media.example.com",
+    [{ id: "old-id", type: "A", content: "1.1.1.1", proxied: false, ttl: 60 }],
+    [{ type: "A", content: "2.2.2.2" }, { type: "A", content: "3.3.3.3" }],
+    60
+  );
+  assert.equal(replaced.ok, false);
+} finally {
+  globalThis.fetch = originalFetchForDNS;
+}
+assert.deepEqual(dnsCalls.map((call) => call.method), ["PUT", "POST", "PUT"], "a failed staged DNS replacement must restore the original record");
+assert.equal(dnsCalls.at(-1).body.content, "1.1.1.1");
+
+const seekProxyRow = {
+  ...row,
+  name: "seek-proxy-node",
+  targets: JSON.stringify(["https://seek-primary.example.com", "https://seek-backup.example.com"]),
+  stream_target: "https://seek-primary.example.com\nhttps://seek-backup.example.com",
+  stream_strategy: "auto",
+  stream_mode: "proxy",
+  secret: "",
+  impersonate: 0,
+  cache_image: 0
+};
+const seekProxyWaits = [];
+const seekProxyCalls = [];
+const seekProxyEnv = {
+  DB: {
+    prepare(sql) {
+      return {
+        sql,
+        bind() { return this; },
+        async first() { return /SELECT \* FROM nodes/.test(sql) ? seekProxyRow : null; },
+        async all() { return { results: [] }; },
+        async run() { return { success: true }; }
+      };
+    },
+    async batch() { return []; }
+  }
+};
+const originalFetchForSeek = globalThis.fetch;
+globalThis.fetch = async (request) => {
+  seekProxyCalls.push(new URL(request.url).host);
+  const range = request.headers.get("Range") || "bytes=0-1048575";
+  const [start, end] = range.replace("bytes=", "").split("-").map(Number);
+  const length = end - start + 1;
+  if (seekProxyCalls.length === 1) {
+    return new Response(new ReadableStream({ cancel() {} }), {
+      status: 206,
+      headers: {
+        "Content-Type": "video/mp4",
+        "Content-Range": `bytes ${start}-${end}/4194304`,
+        "Content-Length": String(length),
+        "Accept-Ranges": "bytes"
+      }
+    });
+  }
+  return new Response("xyz", {
+    status: 206,
+    headers: {
+      "Content-Type": "video/mp4",
+      "Content-Range": `bytes ${start}-${start + 2}/4194304`,
+      "Content-Length": "3",
+      "Accept-Ranges": "bytes"
+    }
+  });
+};
+try {
+  invalidateProxyNodeCache(seekProxyRow.name);
+  const seekCtx = { waitUntil(promise) { seekProxyWaits.push(Promise.resolve(promise)); } };
+  const firstSeekResponse = await worker.fetch(
+    new Request(`https://proxy.example.com/${seekProxyRow.name}/Videos/1/stream.mp4?PlaySessionId=same-session`, {
+      headers: { Range: "bytes=0-1048575" }
+    }),
+    seekProxyEnv,
+    seekCtx
+  );
+  const firstSeekReader = firstSeekResponse.body.getReader();
+  const firstSeekRead = firstSeekReader.read();
+  await firstSeekReader.cancel("seek to new offset");
+  const cancelledSeekRead = await firstSeekRead;
+  assert.equal(Number(cancelledSeekRead.value?.byteLength || 0), 0, "the cancelled range must not deliver stale media bytes");
+  const secondSeekResponse = await worker.fetch(
+    new Request(`https://proxy.example.com/${seekProxyRow.name}/Videos/1/stream.mp4?PlaySessionId=same-session`, {
+      headers: { Range: "bytes=2097152-3145727" }
+    }),
+    seekProxyEnv,
+    seekCtx
+  );
+  assert.equal(secondSeekResponse.status, 206);
+  assert.equal(secondSeekResponse.headers.get("Content-Range"), "bytes 2097152-2097154/4194304");
+  assert.equal(await secondSeekResponse.text(), "xyz");
+  await Promise.all(seekProxyWaits);
+} finally {
+  globalThis.fetch = originalFetchForSeek;
+}
+assert.deepEqual(
+  seekProxyCalls,
+  ["seek-primary.example.com", "seek-primary.example.com"],
+  "cancelling an old range for seeking must not switch the new range to an unmeasured relay"
+);
+
+const rangeFallbackRow = {
+  ...row,
+  name: "range-fallback-node",
+  targets: JSON.stringify(["https://range-origin.example.com"]),
+  stream_target: "",
+  stream_strategy: "auto",
+  stream_mode: "proxy",
+  secret: "",
+  impersonate: 0,
+  cache_image: 0
+};
+const rangeFallbackWaits = [];
+let rangeFallbackCancels = 0;
+const rangeFallbackEnv = {
+  DB: {
+    prepare(sql) {
+      return {
+        sql,
+        bind() { return this; },
+        async first() { return /SELECT \* FROM nodes/.test(sql) ? rangeFallbackRow : null; },
+        async all() { return { results: [] }; },
+        async run() { return { success: true }; }
+      };
+    },
+    async batch() { return []; }
+  }
+};
+const originalFetchForRangeFallback = globalThis.fetch;
+globalThis.fetch = async (request) => {
+  const url = new URL(request.url);
+  if (url.host === "range-origin.example.com") {
+    return Response.redirect("https://signed-cdn.example.com/video.mp4?signature=test", 302);
+  }
+  assert.equal(url.host, "signed-cdn.example.com");
+  assert.equal(request.headers.get("Range"), currentFallbackRange);
+  return new Response(new ReadableStream({ cancel() { rangeFallbackCancels++; } }), {
+    status: 200,
+    headers: {
+      "Content-Type": "video/mp4",
+      "Content-Length": "4194304",
+      "Accept-Ranges": "bytes"
+    }
+  });
+};
+let currentFallbackRange = "bytes=2097152-3145727";
+try {
+  invalidateProxyNodeCache(rangeFallbackRow.name);
+  const fallbackCtx = { waitUntil(promise) { rangeFallbackWaits.push(Promise.resolve(promise)); } };
+  const fallbackResponse = await worker.fetch(
+    new Request(`https://proxy.example.com/${rangeFallbackRow.name}/Videos/1/stream.mp4`, {
+      headers: { Range: currentFallbackRange }
+    }),
+    rangeFallbackEnv,
+    fallbackCtx
+  );
+  assert.equal(fallbackResponse.status, 307, "an external CDN that ignores a non-zero Range must fall back to direct seek");
+  assert.equal(fallbackResponse.headers.get("Location"), "https://signed-cdn.example.com/video.mp4?signature=test");
+  assert.equal(rangeFallbackCancels, 1, "the useless full-file CDN response must be cancelled");
+
+  currentFallbackRange = "bytes=0-1048575";
+  const initialResponse = await worker.fetch(
+    new Request(`https://proxy.example.com/${rangeFallbackRow.name}/Videos/1/stream.mp4`, {
+      headers: { Range: currentFallbackRange }
+    }),
+    rangeFallbackEnv,
+    fallbackCtx
+  );
+  assert.equal(initialResponse.status, 200, "an initial range may remain proxied when the CDN returns the full stream");
+  await initialResponse.body?.cancel();
+  await Promise.all(rangeFallbackWaits);
+} finally {
+  globalThis.fetch = originalFetchForRangeFallback;
+}
 
 function bindingCheckedDB() {
   return {
@@ -388,7 +754,6 @@ linePerformanceStatement(bindingEnv, "binding-check", {
   result: "success",
   latencyMs: 80
 }, Date.now());
-
 const originalFetchForTimeout = globalThis.fetch;
 globalThis.fetch = (request) => new Promise((resolve, reject) => {
   request.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
@@ -402,6 +767,101 @@ try {
 } finally {
   globalThis.fetch = originalFetchForTimeout;
 }
+
+const compatibilityCalls = [];
+const originalFetchForCompatibility = globalThis.fetch;
+globalThis.fetch = async (request) => {
+  compatibilityCalls.push(request);
+  const getAttempts = compatibilityCalls.filter((item) => item.method === "GET").length;
+  return request.method === "POST" || getAttempts === 1
+    ? new Response("upstream compatibility failure", { status: 500 })
+    : new Response("recovered", { status: 200 });
+};
+try {
+  const compatible = await fetchConfiguredTarget(
+    new Request("https://proxy.example.com/zz/System/Info/Public", {
+      headers: { "CF-Connecting-IP": "203.0.113.9", "CF-Ray": "test-ray" }
+    }),
+    new URL("https://origin.example.com/System/Info/Public"),
+    { name: "zz", targets: ["https://origin.example.com"], clientProfile: "hills_android", impersonate: true, headerMode: "dual" },
+    undefined,
+    { DB: identityDB },
+    0
+  );
+  assert.equal(compatible.response.status, 200);
+  assert.equal(compatible.attempts, 2, "403/500 responses must receive one sanitized compatibility retry");
+  const hillsQuery = new URL(compatibilityCalls[0].url).searchParams;
+  assert.match(hillsQuery.get("X-Emby-Authorization") || "", /Device="OnePlus-PKG110"/);
+  assert.equal(hillsQuery.has("X-Emby-Device-Name"), false, "Hills identity must not duplicate the device name outside its authorization value");
+  assert.equal(hillsQuery.has("X-Emby-Device-Id"), false, "Hills identity must not duplicate the device id outside its authorization value");
+  assert.match(compatibilityCalls[1].headers.get("User-Agent") || "", /^Hills\//);
+  assert.equal(compatibilityCalls[1].headers.get("X-Forwarded-For"), null);
+  assert.equal(compatibilityCalls[1].headers.get("CF-Ray"), null);
+  const nonIdempotent = await fetchConfiguredTarget(
+    new Request("https://proxy.example.com/zz/Sessions/Playing", { method: "POST", body: "{}" }),
+    new URL("https://origin.example.com/Sessions/Playing"),
+    { name: "zz", targets: ["https://origin.example.com"], clientProfile: "hills_android", impersonate: true, headerMode: "dual" },
+    new TextEncoder().encode("{}").buffer,
+    { DB: identityDB },
+    0
+  );
+  assert.equal(nonIdempotent.response.status, 500);
+  assert.equal(nonIdempotent.attempts, 1, "a 500 response must not replay a non-idempotent request");
+} finally {
+  globalThis.fetch = originalFetchForCompatibility;
+}
+
+const singleFailureRow = {
+  ...row,
+  name: "single-failure-node",
+  targets: JSON.stringify(["https://single-failure.example.com"]),
+  stream_target: "",
+  stream_mode: "proxy",
+  secret: "",
+  impersonate: 0,
+  cache_image: 0
+};
+const singleFailureStatements = [];
+const singleFailureWaits = [];
+const singleFailureEnv = {
+  DB: {
+    prepare(sql) {
+      return {
+        sql,
+        args: [],
+        bind(...args) { this.args = args; return this; },
+        async first() { return /SELECT \* FROM nodes/.test(sql) ? singleFailureRow : null; },
+        async all() { return { results: [] }; },
+        async run() { return { success: true }; }
+      };
+    },
+    async batch(statements) {
+      singleFailureStatements.push(...statements);
+      return statements.map(() => ({ success: true }));
+    }
+  }
+};
+const originalFetchForSingleFailure = globalThis.fetch;
+globalThis.fetch = async () => new Response("failed", { status: 500 });
+try {
+  invalidateProxyNodeCache(singleFailureRow.name);
+  const response = await worker.fetch(
+    new Request(`https://proxy.example.com/${singleFailureRow.name}/Videos/1/stream.mp4`),
+    singleFailureEnv,
+    { waitUntil(promise) { singleFailureWaits.push(Promise.resolve(promise)); } }
+  );
+  assert.equal(response.status, 500);
+  await response.text();
+  await Promise.all(singleFailureWaits);
+} finally {
+  globalThis.fetch = originalFetchForSingleFailure;
+}
+const singleFailureLine = singleFailureStatements.find((statement) => /INSERT INTO line_performance/.test(statement.sql));
+assert.ok(singleFailureLine, "single-line failures must be persisted in line performance");
+assert.equal(singleFailureLine.args[5], 0, "a terminal 500 must not increment line successes");
+assert.equal(singleFailureLine.args[6], 1, "a terminal 500 must increment line failures");
+const singleFailureMetric = singleFailureStatements.find((statement) => /INSERT INTO performance_metrics/.test(statement.sql));
+assert.equal(singleFailureMetric.args[5], 0, "a compatibility retry on the same line must not count as a failover");
 
 let failoverNodeReads = 0;
 const failoverRow = {

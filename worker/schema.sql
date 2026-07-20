@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS visitor_logs (
   ip TEXT DEFAULT '',
   country TEXT DEFAULT '',
   ua TEXT DEFAULT '',
+  outbound_profile TEXT DEFAULT '',
+  outbound_ua TEXT DEFAULT '',
+  outbound_device TEXT DEFAULT '',
   method TEXT DEFAULT '',
   path TEXT DEFAULT '',
   status INTEGER DEFAULT 0
@@ -72,6 +75,13 @@ CREATE TABLE IF NOT EXISTS keepalive_state (
   last_play_ts INTEGER DEFAULT 0,
   last_notify_day TEXT DEFAULT '',
   notify_count INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS playback_route_state (
+  node TEXT PRIMARY KEY,
+  mode TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  status INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS watch_logs (
@@ -181,11 +191,16 @@ CREATE TABLE IF NOT EXISTS line_performance (
   failures INTEGER DEFAULT 0,
   latency_ms_sum REAL DEFAULT 0,
   last_latency_ms REAL DEFAULT 0,
+  transfer_count INTEGER DEFAULT 0,
+  transfer_bytes INTEGER DEFAULT 0,
+  transfer_ms_sum REAL DEFAULT 0,
+  last_bps REAL DEFAULT 0,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (node, bucket_ts, kind, line_key)
 );
 CREATE INDEX IF NOT EXISTS idx_line_performance_bucket ON line_performance(bucket_ts);
+CREATE INDEX IF NOT EXISTS idx_line_performance_node_kind_updated ON line_performance(node, kind, updated_at);
 
 INSERT INTO system_config (k, v, updated_at)
-VALUES ('system:schema_version', '0.5.2', 0)
-ON CONFLICT(k) DO UPDATE SET v = excluded.v, updated_at = excluded.updated_at;
+VALUES ('system:schema_version', '0.5.12', 0)
+ON CONFLICT(k) DO NOTHING;

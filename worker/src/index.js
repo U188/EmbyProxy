@@ -1,4 +1,4 @@
-const BUILD_VERSION = "0.5.2";
+const BUILD_VERSION = "0.5.12";
 const DEFAULT_MAX_REWRITE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_RETRY_BODY_BYTES = 16 * 1024 * 1024;
 const PROXY_NODE_CACHE_TTL_MS = 10000;
@@ -15,9 +15,8 @@ const DEFAULT_CLIENT_PROFILE = "yamby";
 const DEFAULT_NODE_ICON = "🎬";
 const IDENTITY_KEY = "system:upstream_identity";
 const SCHEMA_VERSION_KEY = "system:schema_version";
-const SCHEMA_VERSION = "0.5.2";
-const LEGACY_DEFAULT_DEVICE_NAME = "OnePlus-PKG110";
-const LEGACY_HILLS_ANDROID_DEVICE_NAME = "diting";
+const SCHEMA_VERSION = "0.5.12";
+const ANDROID_DEVICE_NAME = "OnePlus-PKG110";
 const SIMULATED_WATCH_DURATION_MIN_SEC = 300;
 // The minute cron can add almost 60 seconds before the stop event is sent.
 const SIMULATED_WATCH_DURATION_MAX_SEC = 390;
@@ -25,8 +24,8 @@ const AUTO_WATCH_FAILURE_BACKOFF_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_AUTO_WATCH_MAX_CONCURRENCY = 2;
 const PERFORMANCE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const CLIENT_PROFILES = [
-  { id: "yamby", label: "Yamby Android", ua: "Yamby/2.0.4.6(Android", client: "Yamby", version: "2.0.4.6", device: "Android", authStyle: "yamby", idFormat: "uuid" },
-  { id: "hills_android", label: "Hills Android", ua: "Hills/1.7.2 (android; 15)", client: "Hills", version: "1.7.2", device: "EmbyProxy Android", authStyle: "hills", idLength: 16 },
+  { id: "yamby", label: "Yamby Android", ua: "Yamby/2.0.4.6(Android", client: "Yamby", version: "2.0.4.6", device: ANDROID_DEVICE_NAME, authStyle: "yamby", idFormat: "uuid" },
+  { id: "hills_android", label: "Hills Android", ua: "Hills/1.7.2 (android; 15)", client: "Hills", version: "1.7.2", device: ANDROID_DEVICE_NAME, authStyle: "hills", idLength: 16 },
   { id: "hills_windows", label: "Hills Windows", ua: "Hills Windows/1.3.1 (windows; 19041.vb_release.191206-1406)", client: "Hills Windows", version: "1.3.1", device: "", authStyle: "hills", idLength: 32, devicePrefix: "DESKTOP-" }
 ];
 
@@ -39,6 +38,7 @@ const proxyNodeCache = new Map();
 const targetHealthCache = new Map();
 const playbackVisitorSampleCache = new Map();
 const playbackKeepaliveWriteCache = new Map();
+const playbackRouteWriteCache = new Map();
 
 export default {
   async fetch(request, env, ctx) {
@@ -50,26 +50,32 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    // 每分钟：推进进行中的真实模拟观看会话（进度心跳）
-    ctx.waitUntil(processWatchSessions(env));
-    // 整点附近额外做清理 / 自动开播 / 日报
-    const minute = new Date(Date.now() + 8 * 60 * 60 * 1000).getUTCMinutes();
-    if (minute === 0) {
-      ctx.waitUntil(cleanOldVisitorLogs(env));
-      ctx.waitUntil(cleanOldWatchLogs(env));
-      ctx.waitUntil(cleanOldWatchSessions(env));
-      ctx.waitUntil(cleanOldPerformanceMetrics(env));
-      ctx.waitUntil(runAutoSimulatedWatches(env));
-      ctx.waitUntil(sendTelegramDailyIfDue(env));
-    } else if (minute % 10 === 0) {
-      // 每 10 分钟也检查一次到期节点，尽快开播
-      ctx.waitUntil(runAutoSimulatedWatches(env));
-    }
+    ctx.waitUntil(runScheduledTasks(env));
   }
 };
 
+async function runScheduledTasks(env, now = Date.now()) {
+  await ensureSchema(env);
+  const minute = new Date(now + 8 * 60 * 60 * 1000).getUTCMinutes();
+  const tasks = [processWatchSessions(env, now)];
+  if (minute === 0) {
+    tasks.push(
+      cleanOldVisitorLogs(env),
+      cleanOldWatchLogs(env),
+      cleanOldWatchSessions(env),
+      cleanOldPerformanceMetrics(env),
+      runAutoSimulatedWatches(env),
+      sendTelegramDailyIfDue(env)
+    );
+  } else if (minute % 10 === 0) {
+    tasks.push(runAutoSimulatedWatches(env));
+  }
+  return Promise.all(tasks);
+}
+
 async function handleFetch(request, env, ctx) {
   const url = new URL(request.url);
+  const surface = requestSurface(url, env);
 
   if (url.pathname === "/favicon.ico") {
     return new Response(null, { status: 204 });
@@ -81,9 +87,12 @@ async function handleFetch(request, env, ctx) {
     });
   }
   if (url.pathname === "/" || url.pathname === "/admin" || url.pathname === "/admin/") {
-    return html(adminHTML(env));
+    if (!surface.admin) return text("Not found", 404);
+    const nonce = randomHex(32);
+    return adminPage(adminHTML(env, nonce), nonce);
   }
   if (url.pathname === "/api/tg-webhook" && request.method === "POST") {
+    if (!surface.admin) return text("Not found", 404);
     await ensureSchema(env);
     return handleTelegramWebhook(request, env);
   }
@@ -91,11 +100,23 @@ async function handleFetch(request, env, ctx) {
     return json({ ok: true, version: BUILD_VERSION });
   }
   if (url.pathname.startsWith("/api/")) {
+    if (!surface.admin) return json({ ok: false, error: "API not found" }, 404);
     await ensureSchema(env);
     return handleAPI(request, env, ctx);
   }
 
+  if (!surface.proxy) return text("Not found", 404);
   return handleProxy(request, env, ctx);
+}
+
+function requestSurface(url, env = {}) {
+  const host = cleanString(url?.hostname).toLowerCase().replace(/\.$/, "");
+  const adminHost = cleanString(env.CF_DOMAIN).toLowerCase().replace(/\.$/, "");
+  const dispatchHost = cleanString(env.CF_DNS_DOMAIN).toLowerCase().replace(/\.$/, "");
+  const local = host === "localhost" || host === "127.0.0.1" || host === "::1";
+  const separated = Boolean(adminHost && dispatchHost && adminHost !== dispatchHost);
+  if (local || !separated) return { admin: true, proxy: true };
+  return { admin: host === adminHost, proxy: host === dispatchHost };
 }
 
 async function ensureSchema(env) {
@@ -176,6 +197,9 @@ async function initializeSchema(env) {
       ip TEXT DEFAULT '',
       country TEXT DEFAULT '',
       ua TEXT DEFAULT '',
+      outbound_profile TEXT DEFAULT '',
+      outbound_ua TEXT DEFAULT '',
+      outbound_device TEXT DEFAULT '',
       method TEXT DEFAULT '',
       path TEXT DEFAULT '',
       status INTEGER DEFAULT 0
@@ -186,6 +210,12 @@ async function initializeSchema(env) {
       last_play_ts INTEGER DEFAULT 0,
       last_notify_day TEXT DEFAULT '',
       notify_count INTEGER DEFAULT 0
+    )`,
+    `CREATE TABLE IF NOT EXISTS playback_route_state (
+      node TEXT PRIMARY KEY,
+      mode TEXT NOT NULL,
+      ts INTEGER NOT NULL,
+      status INTEGER DEFAULT 0
     )`,
     `CREATE TABLE IF NOT EXISTS watch_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -227,7 +257,6 @@ async function initializeSchema(env) {
       remain_days INTEGER DEFAULT 0,
       renew_days INTEGER DEFAULT 0
     )`,
-    `CREATE INDEX IF NOT EXISTS idx_sim_watch_sessions_status_next ON sim_watch_sessions(status, next_tick_at)`,
     `CREATE TABLE IF NOT EXISTS performance_metrics (
       node TEXT NOT NULL,
       bucket_ts INTEGER NOT NULL,
@@ -262,6 +291,10 @@ async function initializeSchema(env) {
       failures INTEGER DEFAULT 0,
       latency_ms_sum REAL DEFAULT 0,
       last_latency_ms REAL DEFAULT 0,
+      transfer_count INTEGER DEFAULT 0,
+      transfer_bytes INTEGER DEFAULT 0,
+      transfer_ms_sum REAL DEFAULT 0,
+      last_bps REAL DEFAULT 0,
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (node, bucket_ts, kind, line_key)
     )`,
@@ -284,7 +317,8 @@ async function initializeSchema(env) {
     `CREATE INDEX IF NOT EXISTS idx_watch_logs_ts ON watch_logs(ts)`,
     `CREATE INDEX IF NOT EXISTS idx_watch_logs_node_ts ON watch_logs(node, ts)`,
     `CREATE INDEX IF NOT EXISTS idx_performance_metrics_bucket ON performance_metrics(bucket_ts)`,
-    `CREATE INDEX IF NOT EXISTS idx_line_performance_bucket ON line_performance(bucket_ts)`
+    `CREATE INDEX IF NOT EXISTS idx_line_performance_bucket ON line_performance(bucket_ts)`,
+    `CREATE INDEX IF NOT EXISTS idx_line_performance_node_kind_updated ON line_performance(node, kind, updated_at)`
   ];
   if (typeof env.DB.batch === "function") {
     await env.DB.batch(statements.map((statement) => env.DB.prepare(statement)));
@@ -335,6 +369,9 @@ async function initializeSchema(env) {
     ip: "TEXT DEFAULT ''",
     country: "TEXT DEFAULT ''",
     ua: "TEXT DEFAULT ''",
+    outbound_profile: "TEXT DEFAULT ''",
+    outbound_ua: "TEXT DEFAULT ''",
+    outbound_device: "TEXT DEFAULT ''",
     method: "TEXT DEFAULT ''",
     path: "TEXT DEFAULT ''",
     status: "INTEGER DEFAULT 0"
@@ -342,6 +379,12 @@ async function initializeSchema(env) {
   await ensureColumns(env, "request_stats", {
     bytes: "INTEGER DEFAULT 0",
     updated_at: "INTEGER NOT NULL DEFAULT 0"
+  });
+  await ensureColumns(env, "line_performance", {
+    transfer_count: "INTEGER DEFAULT 0",
+    transfer_bytes: "INTEGER DEFAULT 0",
+    transfer_ms_sum: "REAL DEFAULT 0",
+    last_bps: "REAL DEFAULT 0"
   });
   await ensureColumns(env, "watch_logs", {
     display_name: "TEXT DEFAULT ''",
@@ -353,6 +396,46 @@ async function initializeSchema(env) {
     title: "TEXT DEFAULT ''",
     item_id: "TEXT DEFAULT ''"
   });
+  await ensureColumns(env, "sim_watch_sessions", {
+    display_name: "TEXT DEFAULT ''",
+    source: "TEXT DEFAULT 'manual'",
+    note: "TEXT DEFAULT ''",
+    title: "TEXT DEFAULT ''",
+    item_id: "TEXT DEFAULT ''",
+    media_source_id: "TEXT DEFAULT ''",
+    play_session_id: "TEXT DEFAULT ''",
+    base_url: "TEXT DEFAULT ''",
+    access_token: "TEXT DEFAULT ''",
+    user_id: "TEXT DEFAULT ''",
+    device_id: "TEXT DEFAULT ''",
+    device_name: "TEXT DEFAULT ''",
+    client_profile: "TEXT DEFAULT ''",
+    target_duration_sec: "INTEGER DEFAULT 300",
+    last_tick_at: "INTEGER DEFAULT 0",
+    next_tick_at: "INTEGER DEFAULT 0",
+    tick_count: "INTEGER DEFAULT 0",
+    status: "TEXT DEFAULT 'running'",
+    error: "TEXT DEFAULT ''",
+    notify_attempts: "INTEGER DEFAULT 0",
+    remain_days: "INTEGER DEFAULT 0",
+    renew_days: "INTEGER DEFAULT 0"
+  });
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_sim_watch_sessions_status_next ON sim_watch_sessions(status, next_tick_at)`).run();
+  await env.DB.prepare(`
+    UPDATE sim_watch_sessions
+    SET status = 'failed', error = 'duplicate active session removed during migration', access_token = ''
+    WHERE status IN ('starting', 'running')
+      AND id NOT IN (
+        SELECT MAX(id) FROM sim_watch_sessions
+        WHERE status IN ('starting', 'running')
+        GROUP BY node
+      )
+  `).run();
+  await env.DB.prepare(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_sim_watch_sessions_one_active_node
+    ON sim_watch_sessions(node)
+    WHERE status IN ('starting', 'running')
+  `).run();
   await env.DB.prepare(`
     INSERT INTO system_config (k, v, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(k) DO UPDATE SET v = excluded.v, updated_at = excluded.updated_at
@@ -543,68 +626,101 @@ async function handleProxy(request, env, ctx) {
       const shouldRedirect = shouldUseDirectStream(node, request, route.path);
       if (shouldRedirect) {
         trackTargetOutcome(timing, target, "success", 0, route.path);
-        return completeProxyResponse(ctx, env, request, node.name, route.path, Response.redirect(targetURL.toString(), 302), "direct", timing);
+        return completeProxyResponse(ctx, env, request, node, route.path, Response.redirect(targetURL.toString(), 302), "direct", timing);
       }
 
-      const outbound = await buildOutboundRequest(request, targetURL, node, bodyBuffer, env);
       const cacheableImage = node.cacheImage && request.method === "GET" && isImageRequest(route.path) && !hasSensitiveRequestAuth(request);
       const imageCacheKey = cacheableImage ? new Request(inboundURL.toString(), { method: "GET" }) : null;
       if (cacheableImage) {
         const cached = await caches.default.match(imageCacheKey);
         if (cached) {
-          return completeProxyResponse(ctx, env, request, node.name, route.path, cached, "image", timing);
+          return completeProxyResponse(ctx, env, request, node, route.path, cached, "image", timing);
         }
       }
 
       const upstreamStarted = performanceNow();
-      timing.attempts++;
-      const upstream = await fetchWithHeaderTimeout(
-        outbound,
+      const fetched = await fetchConfiguredTarget(
+        request,
+        targetURL,
+        node,
+        bodyBuffer,
+        env,
         targets.length > 1 && ["GET", "HEAD"].includes(request.method) ? targetHeaderTimeoutMs(node, route.path, env) : 0
       );
+      // Compatibility retries stay on the same line and must not count as failovers.
+      timing.attempts++;
+      const upstream = fetched.response;
       timing.upstream += performanceNow() - upstreamStarted;
-      if (isRetryableStatus(upstream.status) && targets.length > 1) {
+      if (isRetryableStatus(upstream.status)) {
         recordTargetOutcome(node.name, route.path, target, "failure", performanceNow() - targetStarted);
         trackTargetOutcome(timing, target, "failure", performanceNow() - targetStarted, route.path);
         outcomeRecorded = true;
-        discardResponseBody(lastResponse);
-        lastResponse = upstream;
-        lastResponseURL = targetURL;
-        continue;
+        if (targets.length > 1) {
+          discardResponseBody(lastResponse);
+          lastResponse = upstream;
+          lastResponseURL = targetURL;
+          continue;
+        }
       }
 
       const redirectStarted = performanceNow();
       const streamRedirect = await followProxyStreamRedirect(request, upstream, targetURL, node, bodyBuffer, env);
       timing.upstream += performanceNow() - redirectStarted;
       if (streamRedirect) {
-        if (isRetryableStatus(streamRedirect.upstream.status) && targets.length > 1) {
-          recordTargetOutcome(node.name, route.path, target, "failure", performanceNow() - targetStarted);
-          trackTargetOutcome(timing, target, "failure", performanceNow() - targetStarted, route.path);
-          outcomeRecorded = true;
-          discardResponseBody(lastResponse);
-          lastResponse = streamRedirect.upstream;
-          lastResponseURL = streamRedirect.targetURL;
-          continue;
+        if (streamRedirect.directRangeFallbackURL) {
+          if (!outcomeRecorded) {
+            recordTargetOutcome(node.name, route.path, target, "success", performanceNow() - targetStarted);
+            trackTargetOutcome(timing, target, "success", performanceNow() - targetStarted, route.path);
+            outcomeRecorded = true;
+          }
+          discardResponseBody(streamRedirect.upstream);
+          return completeProxyResponse(
+            ctx,
+            env,
+            request,
+            node,
+            route.path,
+            Response.redirect(streamRedirect.directRangeFallbackURL, 307),
+            "direct",
+            timing
+          );
         }
-        recordTargetOutcome(node.name, route.path, target, "success", performanceNow() - targetStarted);
-        trackTargetOutcome(timing, target, "success", performanceNow() - targetStarted, route.path);
-        outcomeRecorded = true;
+        if (isRetryableStatus(streamRedirect.upstream.status)) {
+          if (!outcomeRecorded) {
+            recordTargetOutcome(node.name, route.path, target, "failure", performanceNow() - targetStarted);
+            trackTargetOutcome(timing, target, "failure", performanceNow() - targetStarted, route.path);
+            outcomeRecorded = true;
+          }
+          if (targets.length > 1) {
+            discardResponseBody(lastResponse);
+            lastResponse = streamRedirect.upstream;
+            lastResponseURL = streamRedirect.targetURL;
+            continue;
+          }
+        }
+        if (!outcomeRecorded) {
+          recordTargetOutcome(node.name, route.path, target, "success", performanceNow() - targetStarted);
+          trackTargetOutcome(timing, target, "success", performanceNow() - targetStarted, route.path);
+          outcomeRecorded = true;
+        }
         discardResponseBody(lastResponse);
         lastResponse = undefined;
         const response = await timedFinishProxyResponse(streamRedirect.upstream, request, node, streamRedirect.targetURL, inboundURL, env, timing);
-        return completeProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request), timing);
+        return completeProxyResponse(ctx, env, request, node, route.path, response, requestKind(route.path, response, request), timing);
       }
 
-      recordTargetOutcome(node.name, route.path, target, "success", performanceNow() - targetStarted);
-      trackTargetOutcome(timing, target, "success", performanceNow() - targetStarted, route.path);
-      outcomeRecorded = true;
+      if (!outcomeRecorded) {
+        recordTargetOutcome(node.name, route.path, target, "success", performanceNow() - targetStarted);
+        trackTargetOutcome(timing, target, "success", performanceNow() - targetStarted, route.path);
+        outcomeRecorded = true;
+      }
       discardResponseBody(lastResponse);
       lastResponse = undefined;
       const response = await timedFinishProxyResponse(upstream, request, node, targetURL, inboundURL, env, timing);
       if (cacheableImage && response.ok) {
         ctx.waitUntil(caches.default.put(imageCacheKey, response.clone()));
       }
-      return completeProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request), timing);
+      return completeProxyResponse(ctx, env, request, node, route.path, response, requestKind(route.path, response, request), timing);
     } catch (err) {
       if (!outcomeRecorded) {
         recordTargetOutcome(node.name, route.path, target, "failure", performanceNow() - targetStarted);
@@ -616,14 +732,14 @@ async function handleProxy(request, env, ctx) {
 
   if (lastResponse) {
     const response = await timedFinishProxyResponse(lastResponse, request, node, lastResponseURL || buildTargetURL(targets[0], route.path, inboundURL.search), inboundURL, env, timing);
-    return completeProxyResponse(ctx, env, request, node.name, route.path, response, requestKind(route.path, response, request), timing);
+    return completeProxyResponse(ctx, env, request, node, route.path, response, requestKind(route.path, response, request), timing);
   }
   const exhausted = text("Line failover exhausted. Last Error: " + lastError, 502);
   return completeProxyResponse(
     ctx,
     env,
     request,
-    node.name,
+    node,
     route.path,
     exhausted,
     requestKind(route.path, exhausted, request),
@@ -680,11 +796,30 @@ function orderTargetsByHealth(nodeName, path, targets, now = Date.now(), strateg
   return targets.map((target, index) => {
     const health = targetHealthCache.get(targetHealthKey(nodeName, kind, target)) || {};
     let group = 1;
-    if (Number(health.failureUntil || 0) > now) group = 2;
-    else if (strategy === "auto" && Number(health.successUntil || 0) > now) group = 0;
-    return { target, index, group, latency: Number(health.latency || Number.MAX_SAFE_INTEGER) };
-  }).sort((a, b) => a.group - b.group || (strategy === "auto" ? a.latency - b.latency : 0) || a.index - b.index)
+    if (Number(health.failureUntil || 0) > now) group = 4;
+    else if (strategy === "auto" && kind !== "stream" && Number(health.successUntil || 0) > now) group = 0;
+    return {
+      target,
+      index,
+      group,
+      latency: Number(health.latency || Number.MAX_SAFE_INTEGER)
+    };
+  }).sort((a, b) => a.group - b.group ||
+      (strategy === "auto" ? a.latency - b.latency : 0) ||
+      a.index - b.index)
     .map((item) => item.target);
+}
+
+function configuredTargetForURL(node, targetURL) {
+  const configured = splitTargets(node?.streamTarget || node?.targets || []);
+  const matching = configured.find((target) => {
+    try {
+      return new URL(target).origin === targetURL.origin;
+    } catch {
+      return false;
+    }
+  });
+  return matching || targetURL.origin;
 }
 
 function targetHeaderTimeoutMs(node, path, env) {
@@ -715,7 +850,10 @@ function trackTargetOutcome(timing, target, result, latencyMs, path) {
     latencyMs: Math.max(0, Number(latencyMs || 0))
   };
   timing.targetOutcomes = [...(timing.targetOutcomes || []), item];
-  if (item.result === "success") timing.selectedLine = item.label;
+  if (item.result === "success") {
+    timing.selectedLine = item.label;
+    timing.selectedTarget = target;
+  }
 }
 
 function recordTargetOutcome(nodeName, path, target, result, latencyMs, now = Date.now()) {
@@ -795,8 +933,11 @@ async function handleRawProxy(request, env, ctx, node, routePath, bodyBuffer, in
   timing.upstream += performanceNow() - upstreamStarted;
   const finalUpstream = streamRedirect?.upstream || upstream;
   const finalURL = streamRedirect?.targetURL || targetURL;
+  if (isPlaybackStreamRequest(request, finalURL) && finalUpstream.status >= 200 && finalUpstream.status < 400) {
+    timing.selectedTarget = configuredTargetForURL(node, finalURL);
+  }
   const response = await timedFinishProxyResponse(finalUpstream, request, node, finalURL, inboundURL, env, timing);
-  return completeProxyResponse(ctx, env, request, node.name, finalURL.pathname, response, requestKind(finalURL.pathname, response, request), timing);
+  return completeProxyResponse(ctx, env, request, node, finalURL.pathname, response, requestKind(finalURL.pathname, response, request), timing);
 }
 
 async function fetchRawWithRetries(request, targetURL, node, bodyBuffer, env) {
@@ -809,7 +950,11 @@ async function fetchRawWithRetries(request, targetURL, node, bodyBuffer, env) {
         // Ignore body cleanup errors on retry.
       }
     }
-    const outbound = await buildOutboundRequest(request, targetURL, node, bodyBuffer, env, { directMode, rawExternal: true });
+    const outbound = await buildOutboundRequest(request, new URL(targetURL), node, bodyBuffer, env, {
+      directMode,
+      rawExternal: true,
+      compatibilityRetry: directMode !== "normal"
+    });
     last = await fetch(outbound);
     if (last.status !== 403 || !bodyCanRetry(bodyBuffer)) {
       return last;
@@ -849,10 +994,24 @@ async function followProxyStreamRedirect(request, upstream, targetURL, node, bod
     currentURL = nextURL;
     currentResponse = await fetchRawWithRetries(request, currentURL, node, bodyBuffer, env);
     if (!isRedirectStatus(currentResponse.status)) {
-      return { upstream: currentResponse, targetURL: currentURL };
+      return {
+        upstream: currentResponse,
+        targetURL: currentURL,
+        directRangeFallbackURL: shouldDirectRangeFallback(request, currentResponse, targetURL, currentURL)
+          ? currentURL.toString()
+          : ""
+      };
     }
   }
   return { upstream: currentResponse, targetURL: currentURL };
+}
+
+function shouldDirectRangeFallback(request, response, initialURL, finalURL) {
+  if (!request || request.method !== "GET" || !response || !initialURL || !finalURL) return false;
+  if (initialURL.origin === finalURL.origin) return false;
+  const match = String(request.headers.get("range") || "").trim().match(/^bytes=(\d+)-/i);
+  if (!match || Number(match[1]) <= 0) return false;
+  return response.status === 200 && !response.headers.get("content-range");
 }
 
 function bodyCanRetry(bodyBuffer) {
@@ -870,6 +1029,25 @@ async function buildOutboundRequest(request, targetURL, node, bodyBuffer, env, o
     init.body = bodyBuffer;
   }
   return new Request(targetURL.toString(), init);
+}
+
+async function fetchConfiguredTarget(request, targetURL, node, bodyBuffer, env, timeoutMs) {
+  let response;
+  let attempts = 0;
+  for (const compatibilityRetry of [false, true]) {
+    if (response) discardResponseBody(response);
+    const outbound = await buildOutboundRequest(request, new URL(targetURL), node, bodyBuffer, env, {
+      compatibilityRetry,
+      directMode: compatibilityRetry ? "retry-no-origin" : ""
+    });
+    attempts++;
+    response = await fetchWithHeaderTimeout(outbound, timeoutMs);
+    if (!compatibilityRetry && ["GET", "HEAD"].includes(request.method) && [403, 500].includes(response.status)) {
+      continue;
+    }
+    return { response, attempts };
+  }
+  return { response, attempts };
 }
 
 async function fetchWithHeaderTimeout(request, timeoutMs) {
@@ -898,7 +1076,9 @@ function upstreamHeaderTimeoutMs(env) {
 
 async function buildHeaders(request, targetURL, node, env, options = {}) {
   const headers = new Headers(request.headers);
+  const clientIP = headers.get("cf-connecting-ip") || "";
   stripHopByHop(headers);
+  stripCloudflareForwardingHeaders(headers);
   if (options.rawExternal && !isConfiguredNodeOrigin(node, targetURL)) {
     deleteHeaders(headers, [
       "Authorization", "Cookie", "X-Emby-Token", "X-MediaBrowser-Token",
@@ -913,7 +1093,6 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
     headers.set("Accept-Encoding", "identity");
   }
 
-  const clientIP = request.headers.get("cf-connecting-ip") || "";
   const mode = node.headerMode || "dual";
   if (mode === "realip_only" || mode === "dual" || mode === "strict") {
     if (clientIP) {
@@ -926,7 +1105,7 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
   if (node.impersonate !== false) {
     const identityState = await getIdentityState(env);
     const profile = node.clientProfile || DEFAULT_CLIENT_PROFILE;
-    const snapshot = profileSnapshot(profile, identityState, headers, targetURL);
+    const snapshot = profileSnapshot(profile, identityState);
     const resourceIdentity = isResourceIdentityRequest(request, targetURL);
     if (resourceIdentity) {
       applyClientProfileToResourceURL(targetURL, headers, profile, identityState, snapshot);
@@ -938,6 +1117,9 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
       hillsHeaders: resourceIdentity || isAuthenticationIdentityRequest(targetURL)
     });
   }
+  if (options.compatibilityRetry) {
+    deleteHeaders(headers, ["Origin", "Referer", "X-Real-IP", "X-Forwarded-For", "X-Forwarded-Proto"]);
+  }
   if (mode === "strict") {
     headers.set("Origin", targetURL.origin);
     headers.set("Referer", targetURL.origin + "/");
@@ -946,6 +1128,15 @@ async function buildHeaders(request, targetURL, node, env, options = {}) {
     applyDirectAdapterHeaders(headers, targetURL, options.directMode);
   }
   return headers;
+}
+
+function stripCloudflareForwardingHeaders(headers) {
+  for (const key of [...headers.keys()]) {
+    const normalized = key.toLowerCase();
+    if (normalized.startsWith("cf-") || normalized === "cdn-loop" || normalized === "true-client-ip") {
+      headers.delete(key);
+    }
+  }
 }
 
 function hasSensitiveRequestAuth(request) {
@@ -1108,57 +1299,19 @@ function isPanURL(targetURL) {
   });
 }
 
-function profileSnapshot(profile, identityState, headers = null, targetURL = null) {
+function profileSnapshot(profile, identityState) {
   const item = getClientProfile(profile);
   const state = identityState?.profiles?.[item.id] || {};
-  const incoming = incomingDeviceIdentity(headers, targetURL);
   return {
     ...item,
-    device: incoming.device || state.deviceName || defaultProfileDeviceName(item),
-    deviceId: incoming.deviceId || state.deviceId || stableDeviceID(item),
+    device: isAndroidClientProfile(item) ? ANDROID_DEVICE_NAME : state.deviceName || defaultProfileDeviceName(item),
+    deviceId: state.deviceId || stableDeviceID(item),
     authStyle: item.authStyle || "quoted"
   };
 }
 
-function incomingDeviceIdentity(headers, targetURL) {
-  const values = { device: "", deviceId: "" };
-  if (headers instanceof Headers) {
-    values.device = firstNonEmpty(headers.get("X-Emby-Device-Name"), headers.get("X-MediaBrowser-Device-Name"));
-    values.deviceId = firstNonEmpty(headers.get("X-Emby-Device-Id"), headers.get("X-MediaBrowser-Device-Id"));
-    for (const key of ["X-Emby-Authorization", "X-MediaBrowser-Authorization", "Authorization", "X-Authorization"]) {
-      const auth = headers.get(key) || "";
-      if (!values.device) values.device = embyAuthorizationField(auth, "Device");
-      if (!values.deviceId) values.deviceId = embyAuthorizationField(auth, "DeviceId");
-    }
-  }
-  if (targetURL?.searchParams) {
-    for (const [key, value] of targetURL.searchParams.entries()) {
-      const normalized = normalizeIdentityKey(key);
-      if (!values.device && ["device", "devicename", "xembydevicename", "xmediabrowserdevicename"].includes(normalized)) {
-        values.device = value;
-      }
-      if (!values.deviceId && ["deviceid", "xembydeviceid", "xmediabrowserdeviceid"].includes(normalized)) {
-        values.deviceId = value;
-      }
-      if (["authorization", "xauthorization", "xembyauthorization", "xmediabrowserauthorization"].includes(normalized)) {
-        if (!values.device) values.device = embyAuthorizationField(value, "Device");
-        if (!values.deviceId) values.deviceId = embyAuthorizationField(value, "DeviceId");
-      }
-    }
-  }
-  return {
-    device: sanitizeHeaderValue(values.device).trim().slice(0, 128),
-    deviceId: sanitizeHeaderValue(values.deviceId).trim().slice(0, 160)
-  };
-}
-
-function embyAuthorizationField(value, field) {
-  const match = String(value || "").match(new RegExp(`(?:^|[,\\s])${field}\\s*=\\s*("(?:\\\\.|[^"])*"|[^,\\s]+)`, "i"));
-  return match ? unquoteAuthField(match[1]) : "";
-}
-
 function applyClientProfileToURL(targetURL, headers, profile, identityState, snapshot = null) {
-  const snap = snapshot || profileSnapshot(profile, identityState, headers, targetURL);
+  const snap = snapshot || profileSnapshot(profile, identityState);
   if (snap.authStyle === "yamby") {
     promoteYambyQueryAuth(targetURL, headers);
     promoteAuthorizationTokenFromHeaders(headers);
@@ -1173,7 +1326,7 @@ function applyClientProfileToURL(targetURL, headers, profile, identityState, sna
 }
 
 function applyClientProfileToResourceURL(targetURL, headers, profile, identityState, snapshot = null) {
-  const snap = snapshot || profileSnapshot(profile, identityState, headers, targetURL);
+  const snap = snapshot || profileSnapshot(profile, identityState);
   if (snap.authStyle === "yamby") {
     promoteYambyQueryAuth(targetURL, headers);
     promoteAuthorizationTokenFromHeaders(headers);
@@ -1296,8 +1449,6 @@ function applyHillsQueryIdentityToURL(targetURL, headers, snap) {
   removeHillsQueryIdentity(params);
   params.set("X-Emby-Authorization", rewriteMediaBrowserAuthorization("Emby", snap));
   params.set("X-Emby-Client", snap.client);
-  params.set("X-Emby-Device-Name", snap.device);
-  params.set("X-Emby-Device-Id", snap.deviceId);
   params.set("X-Emby-Client-Version", snap.version);
   params.set("X-Emby-Language", hillsLanguageForURL(targetURL));
   if (token) {
@@ -1550,8 +1701,9 @@ function normalizeIdentityState(saved) {
 function normalizeDeviceState(profile, saved) {
   const raw = saved && typeof saved === "object" ? saved : {};
   let deviceName = cleanString(raw.deviceName || "");
-  const legacyHillsAndroid = profile.id === "hills_android" && deviceName.toLowerCase() === LEGACY_HILLS_ANDROID_DEVICE_NAME;
-  if (!deviceName || deviceName === LEGACY_DEFAULT_DEVICE_NAME || legacyHillsAndroid) {
+  if (isAndroidClientProfile(profile)) {
+    deviceName = ANDROID_DEVICE_NAME;
+  } else if (!deviceName) {
     deviceName = defaultProfileDeviceName(profile);
   }
   let deviceId = cleanString(raw.deviceId || "").toLowerCase();
@@ -1559,6 +1711,10 @@ function normalizeDeviceState(profile, saved) {
     deviceId = randomDeviceID(profile);
   }
   return { deviceName, deviceId };
+}
+
+function isAndroidClientProfile(profile) {
+  return profile?.id === "yamby" || profile?.id === "hills_android";
 }
 
 function defaultProfileDeviceName(profile) {
@@ -1569,7 +1725,7 @@ function defaultProfileDeviceName(profile) {
   if (profile.devicePrefix) {
     return profile.devicePrefix + randomHex(6).toUpperCase();
   }
-  return LEGACY_DEFAULT_DEVICE_NAME;
+  return ANDROID_DEVICE_NAME;
 }
 
 function validDeviceID(profile, value) {
@@ -2283,8 +2439,15 @@ async function listNodes(env) {
 
 async function listNodesWithKeepalive(env) {
   const nodes = await listNodes(env);
-  const statuses = await keepaliveStatusMap(env, nodes);
-  return nodes.map((node) => ({ ...node, keepalive: statuses.get(node.name) || null }));
+  const [statuses, routes] = await Promise.all([
+    keepaliveStatusMap(env, nodes),
+    playbackRouteStateMap(env)
+  ]);
+  return nodes.map((node) => ({
+    ...node,
+    keepalive: statuses.get(node.name) || null,
+    playbackRoute: routes.get(node.name) || null
+  }));
 }
 
 async function getNode(env, name) {
@@ -2348,7 +2511,7 @@ function invalidateProxyNodeCache(...names) {
 }
 
 function isMissingSchemaError(err) {
-  return /no such table:\s*nodes|table\s+nodes\s+does not exist/i.test(errMessage(err));
+  return /no such table:|table\s+\w+\s+does not exist|no column named|has no column named/i.test(errMessage(err));
 }
 
 async function saveNode(env, input) {
@@ -2378,7 +2541,7 @@ async function saveNode(env, input) {
       node.embyAuthProfile = "";
     }
   }
-  await env.DB.prepare(`
+  const upsertNode = env.DB.prepare(`
     INSERT INTO nodes (
       name, display_name, targets, stream_target, secret, client_profile, impersonate,
       header_mode, stream_mode, direct_external, cache_image, tag, remark,
@@ -2462,17 +2625,53 @@ async function saveNode(env, input) {
     node.watchDurationMaxSec,
     current?.createdAt || now,
     now
-  ).run();
+  );
   if (oldName && oldName !== node.name) {
     await env.DB.batch([
-      env.DB.prepare(`DELETE FROM nodes WHERE name = ?`).bind(oldName),
+      upsertNode,
       env.DB.prepare(`DELETE FROM keepalive_state WHERE node = ?`).bind(node.name),
       env.DB.prepare(`UPDATE keepalive_state SET node = ? WHERE node = ?`).bind(node.name, oldName),
+      env.DB.prepare(`DELETE FROM playback_route_state WHERE node = ?`).bind(node.name),
+      env.DB.prepare(`UPDATE playback_route_state SET node = ? WHERE node = ?`).bind(node.name, oldName),
+      env.DB.prepare(`
+        INSERT INTO line_performance (
+          node, bucket_ts, kind, line_key, line_label, attempts, successes, failures,
+          latency_ms_sum, last_latency_ms, transfer_count, transfer_bytes,
+          transfer_ms_sum, last_bps, updated_at
+        )
+        SELECT ?, bucket_ts, kind, line_key, line_label, attempts, successes, failures,
+               latency_ms_sum, last_latency_ms, transfer_count, transfer_bytes,
+               transfer_ms_sum, last_bps, updated_at
+        FROM line_performance WHERE node = ?
+        ON CONFLICT(node, bucket_ts, kind, line_key) DO UPDATE SET
+          attempts = attempts + excluded.attempts,
+          successes = successes + excluded.successes,
+          failures = failures + excluded.failures,
+          latency_ms_sum = latency_ms_sum + excluded.latency_ms_sum,
+          last_latency_ms = CASE WHEN excluded.updated_at >= updated_at THEN excluded.last_latency_ms ELSE last_latency_ms END,
+          transfer_count = transfer_count + excluded.transfer_count,
+          transfer_bytes = transfer_bytes + excluded.transfer_bytes,
+          transfer_ms_sum = transfer_ms_sum + excluded.transfer_ms_sum,
+          last_bps = CASE WHEN excluded.updated_at >= updated_at THEN excluded.last_bps ELSE last_bps END,
+          updated_at = MAX(updated_at, excluded.updated_at)
+      `).bind(node.name, oldName),
+      env.DB.prepare(`DELETE FROM line_performance WHERE node = ?`).bind(oldName),
+      env.DB.prepare(`
+        UPDATE sim_watch_sessions
+        SET status = 'failed', error = 'replaced by renamed node', access_token = ''
+        WHERE node = ? AND status IN ('starting', 'running')
+      `).bind(node.name),
       env.DB.prepare(`
         UPDATE sim_watch_sessions SET node = ?, display_name = ?
         WHERE node = ? AND status IN ('starting', 'running', 'notify_pending')
-      `).bind(node.name, node.displayName || node.name, oldName)
+      `).bind(node.name, node.displayName || node.name, oldName),
+      env.DB.prepare(`UPDATE visitor_logs SET node = ? WHERE node = ?`).bind(node.name, oldName),
+      env.DB.prepare(`UPDATE watch_logs SET node = ?, display_name = ? WHERE node = ?`)
+        .bind(node.name, node.displayName || node.name, oldName),
+      env.DB.prepare(`DELETE FROM nodes WHERE name = ?`).bind(oldName)
     ]);
+  } else {
+    await upsertNode.run();
   }
   await ensureKeepaliveState(env, node);
   invalidateProxyNodeCache(oldName, node.name);
@@ -2499,7 +2698,13 @@ async function deleteNode(env, name) {
   const nodeName = normalizeName(name);
   await env.DB.batch([
     env.DB.prepare(`DELETE FROM nodes WHERE name = ?`).bind(nodeName),
-    env.DB.prepare(`DELETE FROM keepalive_state WHERE node = ?`).bind(nodeName)
+    env.DB.prepare(`DELETE FROM keepalive_state WHERE node = ?`).bind(nodeName),
+    env.DB.prepare(`DELETE FROM playback_route_state WHERE node = ?`).bind(nodeName),
+    env.DB.prepare(`
+      UPDATE sim_watch_sessions
+      SET status = 'failed', error = 'node deleted', access_token = '', next_tick_at = ?
+      WHERE node = ? AND status IN ('starting', 'running', 'notify_pending')
+    `).bind(Date.now(), nodeName)
   ]);
   invalidateProxyNodeCache(nodeName);
   invalidateTargetHealth(nodeName);
@@ -2618,7 +2823,7 @@ async function getStats(env) {
     SELECT node, kind, count, bytes FROM request_stats WHERE day = ? ORDER BY count DESC
   `).bind(day).all();
   const recent = await env.DB.prepare(`
-    SELECT node, ts, ip, country, ua, method, path, status
+    SELECT node, ts, ip, country, ua, outbound_profile, outbound_ua, outbound_device, method, path, status
     FROM visitor_logs ORDER BY ts DESC LIMIT 30
   `).all();
   return { day, today: rows.results || [], recent: recent.results || [] };
@@ -2754,15 +2959,15 @@ async function cleanOldPerformanceMetrics(env) {
   ]);
 }
 
-function recordProxyResponse(ctx, env, request, nodeName, path, response, kind, timing = null) {
+function recordProxyResponse(ctx, env, request, node, path, response, kind, timing = null) {
   const bytes = kind === "playback" ? streamByteEstimate(response) : contentLength(response);
-  ctx.waitUntil(recordRequest(env, request, nodeName, path, response.status, bytes, kind, timing));
+  ctx.waitUntil(recordRequest(env, request, node, path, response.status, bytes, kind, timing));
   return response;
 }
 
-function completeProxyResponse(ctx, env, request, nodeName, path, response, kind, timing) {
+function completeProxyResponse(ctx, env, request, node, path, response, kind, timing) {
   const finished = withServerTiming(response, timing);
-  return recordProxyResponse(ctx, env, request, nodeName, path, finished, kind, timing);
+  return recordProxyResponse(ctx, env, request, node, path, finished, kind, timing);
 }
 
 function createProxyTiming() {
@@ -2805,9 +3010,10 @@ function streamByteEstimate(response) {
   return contentLength(response);
 }
 
-async function recordRequest(env, request, nodeName, path, status, bytes, kind, timing = null) {
+async function recordRequest(env, request, node, path, status, bytes, kind, timing = null) {
   const now = Date.now();
   const day = beijingDay(now);
+  const nodeName = node?.name || "";
   const ip = request.headers.get("cf-connecting-ip") || "";
   const country = request.headers.get("cf-ipcountry") || "";
   const ua = request.headers.get("user-agent") || "";
@@ -2826,15 +3032,119 @@ async function recordRequest(env, request, nodeName, path, status, bytes, kind, 
     }
   }
   if (shouldRecordVisitorLog(kind, status, nodeName, ip, now)) {
+    let identityState = null;
+    if (node?.impersonate !== false) {
+      try {
+        identityState = await getIdentityState(env);
+      } catch {
+        // Logging still records the configured profile when identity storage is unavailable.
+      }
+    }
+    const outbound = logClientIdentity(node, identityState, ua);
     statements.push(env.DB.prepare(`
-      INSERT INTO visitor_logs (node, ts, ip, country, ua, method, path, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(nodeName, now, ip, country, ua.slice(0, 300), request.method, path.slice(0, 500), status));
+      INSERT INTO visitor_logs (
+        node, ts, ip, country, ua, outbound_profile, outbound_ua, outbound_device, method, path, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      nodeName, now, ip, country, ua.slice(0, 300),
+      outbound.profile, outbound.ua.slice(0, 300), outbound.device.slice(0, 128),
+      request.method, path.slice(0, 500), status
+    ));
   }
   await env.DB.batch(statements);
+  const route = playbackRouteResult(kind, status, now);
+  if (route) {
+    await markPlaybackRoute(env, nodeName, route.mode, route.ts, route.status);
+  }
   if (kind === "playback" && status < 400 && isKeepalivePlaybackPath(path)) {
     await markKeepalivePlayback(env, nodeName, now);
   }
+}
+
+function playbackRouteResult(kind, status, ts = Date.now()) {
+  const code = Number(status || 0);
+  if (code < 200 || code >= 400) return null;
+  if (kind === "direct") return { mode: "direct", ts, status: code };
+  if (kind === "playback") return { mode: "proxy", ts, status: code };
+  return null;
+}
+
+async function markPlaybackRoute(env, nodeName, mode, ts, status) {
+  const node = normalizeName(nodeName);
+  const routeMode = mode === "direct" ? "direct" : "proxy";
+  if (!node) return;
+  const now = Date.now();
+  const cached = playbackRouteWriteCache.get(node);
+  if (cached?.mode === routeMode && Number(cached.expires || 0) > now) return;
+  const statement = () => env.DB.prepare(`
+    INSERT INTO playback_route_state (node, mode, ts, status)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(node) DO UPDATE SET
+      mode = excluded.mode,
+      ts = excluded.ts,
+      status = excluded.status
+    WHERE playback_route_state.mode != excluded.mode
+       OR excluded.ts - playback_route_state.ts >= ${PLAYBACK_AUX_WRITE_INTERVAL_MS}
+  `).bind(node, routeMode, ts, status);
+  try {
+    await statement().run();
+  } catch (err) {
+    if (!isMissingSchemaError(err)) throw err;
+    await ensurePlaybackRouteTable(env);
+    await statement().run();
+  }
+  playbackRouteWriteCache.set(node, { mode: routeMode, expires: now + PLAYBACK_AUX_WRITE_INTERVAL_MS });
+  trimPlaybackRouteWriteCache(now);
+}
+
+function trimPlaybackRouteWriteCache(now = Date.now()) {
+  if (playbackRouteWriteCache.size <= 512) return;
+  for (const [key, value] of playbackRouteWriteCache) {
+    if (Number(value?.expires || 0) <= now) playbackRouteWriteCache.delete(key);
+  }
+  while (playbackRouteWriteCache.size > 512) {
+    playbackRouteWriteCache.delete(playbackRouteWriteCache.keys().next().value);
+  }
+}
+
+async function ensurePlaybackRouteTable(env) {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS playback_route_state (
+      node TEXT PRIMARY KEY,
+      mode TEXT NOT NULL,
+      ts INTEGER NOT NULL,
+      status INTEGER DEFAULT 0
+    )
+  `).run();
+}
+
+async function playbackRouteStateMap(env) {
+  let rows;
+  try {
+    rows = await env.DB.prepare(`SELECT node, mode, ts, status FROM playback_route_state`).all();
+  } catch (err) {
+    if (!isMissingSchemaError(err)) throw err;
+    await ensurePlaybackRouteTable(env);
+    rows = await env.DB.prepare(`SELECT node, mode, ts, status FROM playback_route_state`).all();
+  }
+  return new Map((rows.results || []).map((row) => [row.node, {
+    mode: row.mode === "direct" ? "direct" : "proxy",
+    ts: Number(row.ts || 0),
+    status: Number(row.status || 0)
+  }]));
+}
+
+function logClientIdentity(node, identityState, inboundUA = "") {
+  if (node?.impersonate === false) {
+    return { profile: "disabled", ua: cleanString(inboundUA).slice(0, 300), device: "" };
+  }
+  const profile = getClientProfile(node?.clientProfile || DEFAULT_CLIENT_PROFILE);
+  const snapshot = profileSnapshot(profile.id, identityState);
+  return {
+    profile: profile.id,
+    ua: cleanString(snapshot.ua).slice(0, 300),
+    device: cleanString(snapshot.device).slice(0, 128)
+  };
 }
 
 function performanceMetricStatement(env, nodeName, kind, status, timing, now) {
@@ -2905,7 +3215,7 @@ function linePerformanceStatement(env, nodeName, outcome, now) {
       failures = failures + excluded.failures,
       latency_ms_sum = latency_ms_sum + excluded.latency_ms_sum,
       last_latency_ms = excluded.last_latency_ms,
-      updated_at = excluded.updated_at
+      updated_at = MAX(updated_at, excluded.updated_at)
   `).bind(
     nodeName,
     bucketTs,
@@ -2973,7 +3283,6 @@ async function ensureKeepaliveState(env, node) {
   if (!node?.name || !node.renewDays) {
     return;
   }
-  await ensureKeepaliveTable(env);
   const anchor = parseKeepaliveAt(node.keepaliveAt) || node.createdAt || Date.now();
   await env.DB.prepare(`
     INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day, notify_count)
@@ -2989,17 +3298,22 @@ async function markKeepalivePlayback(env, nodeName, ts) {
   if (Number(playbackKeepaliveWriteCache.get(key) || 0) > now) return;
   playbackKeepaliveWriteCache.set(key, now + PLAYBACK_AUX_WRITE_INTERVAL_MS);
   trimExpiryCache(playbackKeepaliveWriteCache, now, 512);
+  const node = await getProxyNode(env, nodeName);
+  const anchor = parseKeepaliveAt(node?.keepaliveAt) || node?.createdAt || ts;
+  const statement = () => env.DB.prepare(`
+    INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day, notify_count)
+    VALUES (?, ?, ?, '', 0)
+    ON CONFLICT(node) DO UPDATE SET
+      last_play_ts = MAX(last_play_ts, excluded.last_play_ts)
+  `).bind(key, anchor, ts);
   try {
-    await ensureKeepaliveTable(env);
-    const node = await getProxyNode(env, nodeName);
-    const anchor = parseKeepaliveAt(node?.keepaliveAt) || node?.createdAt || ts;
-    await env.DB.prepare(`
-      INSERT INTO keepalive_state (node, anchor_ts, last_play_ts, last_notify_day, notify_count)
-      VALUES (?, ?, ?, '', 0)
-      ON CONFLICT(node) DO UPDATE SET
-        last_play_ts = MAX(last_play_ts, excluded.last_play_ts)
-    `).bind(key, anchor, ts).run();
+    await statement().run();
   } catch (err) {
+    if (isMissingSchemaError(err)) {
+      await ensureKeepaliveTable(env);
+      await statement().run();
+      return;
+    }
     playbackKeepaliveWriteCache.delete(key);
     throw err;
   }
@@ -3010,7 +3324,6 @@ async function getKeepaliveStatuses(env) {
 }
 
 async function keepaliveStatusMap(env, nodes) {
-  await ensureKeepaliveTable(env);
   const rows = await env.DB.prepare(`SELECT * FROM keepalive_state`).all();
   const state = new Map((rows.results || []).map((row) => [row.node, row]));
   const now = Date.now();
@@ -3496,75 +3809,7 @@ async function embyPlayItem(auth, item, durationSec) {
 
 
 async function ensureWatchSessionsTable(env) {
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS sim_watch_sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      node TEXT NOT NULL,
-      display_name TEXT DEFAULT '',
-      source TEXT DEFAULT 'manual',
-      note TEXT DEFAULT '',
-      title TEXT DEFAULT '',
-      item_id TEXT DEFAULT '',
-      media_source_id TEXT DEFAULT '',
-      play_session_id TEXT DEFAULT '',
-      base_url TEXT DEFAULT '',
-      access_token TEXT DEFAULT '',
-      user_id TEXT DEFAULT '',
-      device_id TEXT DEFAULT '',
-      device_name TEXT DEFAULT '',
-      client_profile TEXT DEFAULT '',
-      target_duration_sec INTEGER DEFAULT 300,
-      started_at INTEGER NOT NULL,
-      last_tick_at INTEGER DEFAULT 0,
-      next_tick_at INTEGER DEFAULT 0,
-      tick_count INTEGER DEFAULT 0,
-      status TEXT DEFAULT 'running',
-      error TEXT DEFAULT '',
-      notify_attempts INTEGER DEFAULT 0,
-      remain_days INTEGER DEFAULT 0,
-      renew_days INTEGER DEFAULT 0
-    )
-  `).run();
-  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_sim_watch_sessions_status_next ON sim_watch_sessions(status, next_tick_at)`).run();
-  await ensureColumns(env, "sim_watch_sessions", {
-    display_name: "TEXT DEFAULT ''",
-    source: "TEXT DEFAULT 'manual'",
-    note: "TEXT DEFAULT ''",
-    title: "TEXT DEFAULT ''",
-    item_id: "TEXT DEFAULT ''",
-    media_source_id: "TEXT DEFAULT ''",
-    play_session_id: "TEXT DEFAULT ''",
-    base_url: "TEXT DEFAULT ''",
-    access_token: "TEXT DEFAULT ''",
-    user_id: "TEXT DEFAULT ''",
-    device_id: "TEXT DEFAULT ''",
-    device_name: "TEXT DEFAULT ''",
-    client_profile: "TEXT DEFAULT ''",
-    target_duration_sec: "INTEGER DEFAULT 300",
-    last_tick_at: "INTEGER DEFAULT 0",
-    next_tick_at: "INTEGER DEFAULT 0",
-    tick_count: "INTEGER DEFAULT 0",
-    status: "TEXT DEFAULT 'running'",
-    error: "TEXT DEFAULT ''",
-    notify_attempts: "INTEGER DEFAULT 0",
-    remain_days: "INTEGER DEFAULT 0",
-    renew_days: "INTEGER DEFAULT 0"
-  });
-  await env.DB.prepare(`
-    UPDATE sim_watch_sessions
-    SET status = 'failed', error = 'duplicate active session removed during migration'
-    WHERE status IN ('starting', 'running')
-      AND id NOT IN (
-        SELECT MAX(id) FROM sim_watch_sessions
-        WHERE status IN ('starting', 'running')
-        GROUP BY node
-      )
-  `).run();
-  await env.DB.prepare(`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_sim_watch_sessions_one_active_node
-    ON sim_watch_sessions(node)
-    WHERE status IN ('starting', 'running')
-  `).run();
+  await ensureSchema(env);
 }
 
 async function cleanOldWatchSessions(env) {
@@ -3572,6 +3817,19 @@ async function cleanOldWatchSessions(env) {
   await ensureWatchSessionsTable(env);
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
   await env.DB.prepare(`DELETE FROM sim_watch_sessions WHERE started_at < ? AND status != 'running'`).bind(cutoff).run();
+}
+
+async function recoverStaleWatchSessions(env, now = Date.now(), nodeName = "") {
+  const node = normalizeName(nodeName || "");
+  const whereNode = node ? " AND node = ?" : "";
+  const statement = env.DB.prepare(`
+    UPDATE sim_watch_sessions
+    SET status = 'failed', error = 'startup reservation expired', access_token = '', last_tick_at = ?
+    WHERE status = 'starting' AND next_tick_at <= ?${whereNode}
+  `);
+  return node
+    ? statement.bind(now, now, node).run()
+    : statement.bind(now, now).run();
 }
 
 function authFromSession(row) {
@@ -3602,6 +3860,7 @@ async function startWatchSession(env, { node, source = "manual", note = "", rema
   const targetDurationSec = randomSimulatedWatchDurationSec(node);
   await ensureWatchSessionsTable(env);
   const reservedAt = Date.now();
+  await recoverStaleWatchSessions(env, reservedAt, node.name);
   let reservation;
   try {
     reservation = await env.DB.prepare(`
@@ -3689,16 +3948,16 @@ async function startWatchSession(env, { node, source = "manual", note = "", rema
         await embyPostSession(auth, "/Sessions/Playing/Stopped", buildPlayingPayload(auth, item, sessionMeta, 0, { stop: true }));
       } catch {}
     }
-    await env.DB.prepare(`UPDATE sim_watch_sessions SET status = 'failed', error = ?, last_tick_at = ? WHERE id = ?`)
+    await env.DB.prepare(`UPDATE sim_watch_sessions SET status = 'failed', error = ?, access_token = '', last_tick_at = ? WHERE id = ?`)
       .bind(errMessage(err).slice(0, 500), Date.now(), sessionId).run();
     throw err;
   }
 }
 
-async function processWatchSessions(env) {
+async function processWatchSessions(env, now = Date.now()) {
   if (!env.DB) return { ok: false, skipped: true };
   await ensureWatchSessionsTable(env);
-  const now = Date.now();
+  await recoverStaleWatchSessions(env, now);
   const rows = await env.DB.prepare(`
     SELECT * FROM sim_watch_sessions
     WHERE status IN ('running', 'notify_pending') AND next_tick_at <= ?
@@ -3729,7 +3988,7 @@ async function processWatchSessions(env) {
           }, embyTicks(elapsedSec), { stop: true })
         );
       } catch {}
-      await env.DB.prepare(`UPDATE sim_watch_sessions SET status = 'failed', error = ?, last_tick_at = ? WHERE id = ?`)
+      await env.DB.prepare(`UPDATE sim_watch_sessions SET status = 'failed', error = ?, access_token = '', last_tick_at = ? WHERE id = ?`)
         .bind(error.slice(0, 500), now, row.id).run();
       try {
         await insertWatchLog(env, {
@@ -3806,7 +4065,7 @@ async function tickWatchSession(env, row, now = Date.now()) {
     await env.DB.prepare(`
       UPDATE sim_watch_sessions
       SET status = 'notify_pending', last_tick_at = ?, next_tick_at = ?, tick_count = tick_count + 1,
-          notify_attempts = 0, error = ''
+          notify_attempts = 0, error = '', access_token = ''
       WHERE id = ?
     `).bind(endedAt, endedAt, row.id).run();
     return retryWatchCompletionNotification(env, {
@@ -4156,33 +4415,7 @@ async function recordAutoWatchFailure(env, item, error) {
 }
 
 async function ensureWatchLogsTable(env) {
-  await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS watch_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      node TEXT NOT NULL,
-      display_name TEXT DEFAULT '',
-      ts INTEGER NOT NULL,
-      source TEXT DEFAULT 'manual',
-      note TEXT DEFAULT '',
-      duration_sec INTEGER DEFAULT 0,
-      started_at INTEGER DEFAULT 0,
-      ended_at INTEGER DEFAULT 0,
-      title TEXT DEFAULT '',
-      item_id TEXT DEFAULT ''
-    )
-  `).run();
-  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_watch_logs_ts ON watch_logs(ts)`).run();
-  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_watch_logs_node_ts ON watch_logs(node, ts)`).run();
-  await ensureColumns(env, "watch_logs", {
-    display_name: "TEXT DEFAULT ''",
-    source: "TEXT DEFAULT 'manual'",
-    note: "TEXT DEFAULT ''",
-    duration_sec: "INTEGER DEFAULT 0",
-    started_at: "INTEGER DEFAULT 0",
-    ended_at: "INTEGER DEFAULT 0",
-    title: "TEXT DEFAULT ''",
-    item_id: "TEXT DEFAULT ''"
-  });
+  await ensureSchema(env);
 }
 
 async function insertWatchLog(env, entry) {
@@ -4281,11 +4514,12 @@ async function pingTarget(target) {
       u.pathname = path;
       const res = await fetch(u.toString(), { method: "GET", redirect: "manual", signal: controller.signal });
       lastStatus = res.status;
-      if (res.status < 500) {
+      discardResponseBody(res);
+      if (res.status >= 200 && res.status < 400) {
         return { ok: true, status: res.status, ms: Date.now() - started };
       }
     }
-    return { ok: false, status: lastStatus, ms: Date.now() - started };
+    return { ok: false, status: lastStatus, error: lastStatus ? `HTTP ${lastStatus}` : "unreachable", ms: Date.now() - started };
   } catch (err) {
     return { ok: false, error: errMessage(err), ms: Date.now() - started };
   } finally {
@@ -4324,19 +4558,10 @@ async function checkNodeStreamHealth(env, name) {
 }
 
 async function pingTargetCompat(target) {
-  if (!target || !/^https?:\/\//i.test(target)) {
-    return { ms: -1 };
-  }
-  const started = Date.now();
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 2000);
-    await fetch(target.replace(/\/+$/, "") + "/", { method: "HEAD", signal: controller.signal });
-    clearTimeout(timeout);
-    return { ms: Date.now() - started };
-  } catch {
-    return { ms: -1 };
-  }
+  const result = await pingTarget(target);
+  return result.ok
+    ? { ms: result.ms, status: result.status }
+    : { ms: -1, status: result.status || 0, error: result.error || "unreachable" };
 }
 
 async function getTraceInfo(request, env, ctx) {
@@ -4486,7 +4711,10 @@ async function getAnalytics(env) {
       timestamp: new Date(Number(row.ts || 0)).toISOString(),
       ip: row.ip,
       country: row.country,
-      ua: row.ua
+      ua: row.ua,
+      outboundProfile: row.outbound_profile || "",
+      outboundUa: row.outbound_ua || "",
+      outboundDevice: row.outbound_device || ""
     })),
     trafficToday: trafficLabel(trafficToday),
     traffic7d: trafficLabel(traffic7d),
@@ -4550,24 +4778,25 @@ async function updateDNSRecords(env, body) {
   if (!current.ok) {
     return current;
   }
-  const sameType = current.records.filter((r) => r.type === type);
-  for (const record of sameType) {
-    await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records/${record.id}`, { method: "DELETE" });
+  const addressRecords = current.records.filter((record) => ["A", "AAAA", "CNAME"].includes(record.type));
+  const relevant = addressRecords.filter((record) =>
+    record.type === type || (type === "CNAME" && ["A", "AAAA"].includes(record.type)) || record.type === "CNAME"
+  );
+  if (relevant.some(isWorkerManagedDNSRecord)) {
+    return { ok: false, error: "当前域名包含 Worker 托管记录，不能由 DNS 工具覆盖。" };
   }
-
-  const created = [];
-  for (const content of values) {
-    const data = await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records`, {
-      method: "POST",
-      body: JSON.stringify({ type, name, content, proxied: false, ttl: 1 })
-    });
-    if (!data.success) {
-      return { ok: false, error: cfErrors(data), created };
-    }
-    created.push(data.result);
+  const replaced = await replaceDNSRecordsSafely(
+    env,
+    name,
+    relevant,
+    values.map((content) => ({ type, content })),
+    1
+  );
+  if (!replaced.ok) {
+    return replaced;
   }
-  await recordDNSHistory(env, name, type, sameType.map((r) => r.content).join(","), values.join(","));
-  return { ok: true, name, type, created };
+  await recordDNSHistory(env, name, type, relevant.map((r) => r.content).join(","), values.join(","));
+  return { ok: true, name, type, created: replaced.records };
 }
 
 async function getDNSRecordsCompat(env) {
@@ -4589,7 +4818,8 @@ async function updateDNSRecordsCompat(env, body) {
   if (!current.ok) {
     return { success: false, ok: false, error: current.error };
   }
-  const workerManaged = current.records.some(isWorkerManagedDNSRecord);
+  const relevant = current.records.filter((record) => ["A", "AAAA", "CNAME"].includes(record.type));
+  const workerManaged = relevant.some(isWorkerManagedDNSRecord);
   if (workerManaged) {
     return {
       success: false,
@@ -4602,23 +4832,112 @@ async function updateDNSRecordsCompat(env, body) {
   if (cnameValues.length && ips.length > 1) {
     return { success: false, ok: false, error: "CNAME 记录不能和 A/AAAA 或多个 CNAME 同名共存，请只提交一个 CNAME。" };
   }
-  for (const record of current.records.filter((r) => ["A", "AAAA", "CNAME"].includes(r.type))) {
-    await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records/${record.id}`, { method: "DELETE" });
+  const replaced = await replaceDNSRecordsSafely(
+    env,
+    name,
+    relevant,
+    ips.map((content) => ({ type: dnsTypeFor(content), content })),
+    60
+  );
+  if (!replaced.ok) {
+    return { success: false, ...replaced };
   }
-  const created = [];
-  for (const content of ips) {
-    const type = dnsTypeFor(content);
-    const data = await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records`, {
-      method: "POST",
-      body: JSON.stringify({ type, name, content, proxied: false, ttl: 60 })
-    });
-    if (!data.success) {
-      return { success: false, ok: false, error: cfErrors(data), created };
+  await recordDNSHistory(env, name, "mixed", relevant.map((r) => r.content).join(","), ips.join(","));
+  return { success: true, ok: true, name, message: "DNS 更新成功", created: replaced.records };
+}
+
+function dnsRecordKey(record) {
+  const type = cleanString(record?.type).toUpperCase();
+  let content = cleanDNSValue(record?.content || "");
+  if (type === "CNAME") content = content.toLowerCase().replace(/\.$/, "");
+  return `${type}\n${content}`;
+}
+
+async function replaceDNSRecordsSafely(env, name, currentRecords, desiredRecords, ttl) {
+  const current = (currentRecords || []).filter((record) => record?.id);
+  const desired = [...new Map((desiredRecords || []).map((record) => [dnsRecordKey(record), {
+    type: cleanString(record.type).toUpperCase(),
+    content: cleanDNSValue(record.content)
+  }])).values()];
+  if (!desired.length) return { ok: false, error: "missing DNS values", records: [] };
+
+  const desiredKeys = new Set(desired.map(dnsRecordKey));
+  const retainedIds = new Set();
+  const establishedKeys = new Set();
+  const records = [];
+  for (const record of current) {
+    const key = dnsRecordKey(record);
+    if (desiredKeys.has(key) && !establishedKeys.has(key)) {
+      retainedIds.add(record.id);
+      establishedKeys.add(key);
+      records.push(record);
     }
-    created.push(data.result);
   }
-  await recordDNSHistory(env, name, "mixed", current.records.map((r) => r.content).join(","), ips.join(","));
-  return { success: true, ok: true, name, message: "DNS 更新成功", created };
+
+  const missing = desired.filter((record) => !establishedKeys.has(dnsRecordKey(record)));
+  const createdIds = [];
+  let pivot = null;
+  if (missing.length && current.length && retainedIds.size === 0) {
+    const previous = current[0];
+    const next = missing.shift();
+    const updated = await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records/${previous.id}`, {
+      method: "PUT",
+      body: JSON.stringify({ ...next, name, proxied: false, ttl })
+    });
+    if (!updated.success) return { ok: false, error: cfErrors(updated), records: [] };
+    pivot = { previous, next };
+    retainedIds.add(previous.id);
+    establishedKeys.add(dnsRecordKey(next));
+    records.push(updated.result || { id: previous.id, ...next });
+  }
+
+  for (const record of missing) {
+    const created = await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records`, {
+      method: "POST",
+      body: JSON.stringify({ ...record, name, proxied: false, ttl })
+    });
+    if (!created.success) {
+      await rollbackDNSReplacement(env, name, createdIds, pivot, ttl);
+      return { ok: false, error: cfErrors(created), records: [] };
+    }
+    if (created.result?.id) createdIds.push(created.result.id);
+    records.push(created.result || record);
+  }
+
+  const obsolete = current.filter((record) => !retainedIds.has(record.id));
+  for (const record of obsolete) {
+    const removed = await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records/${record.id}`, { method: "DELETE" });
+    if (!removed.success) {
+      return {
+        ok: false,
+        partial: true,
+        error: `新记录已生效，但旧记录 ${record.content || record.id} 清理失败：${cfErrors(removed)}`,
+        records
+      };
+    }
+  }
+  return { ok: true, records };
+}
+
+async function rollbackDNSReplacement(env, name, createdIds, pivot, ttl) {
+  for (const id of createdIds) {
+    try {
+      await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records/${id}`, { method: "DELETE" });
+    } catch {}
+  }
+  if (!pivot?.previous?.id) return;
+  try {
+    await cfJSON(env, `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/dns_records/${pivot.previous.id}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        type: pivot.previous.type,
+        name,
+        content: pivot.previous.content,
+        proxied: Boolean(pivot.previous.proxied),
+        ttl: Number(pivot.previous.ttl || ttl)
+      })
+    });
+  } catch {}
 }
 
 function dnsDomain(env) {
@@ -5283,7 +5602,7 @@ async function telegramAPI(env, method, payload) {
 }
 
 async function ensureKVStore(env) {
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT)`).run();
+  await ensureSchema(env);
 }
 
 async function getTelegramLastMessageId(env, chatId) {
@@ -5556,13 +5875,23 @@ async function readJSON(request) {
   }
 }
 
-function html(body, status = 200) {
+function html(body, status = 200, extraHeaders = {}) {
   return new Response(body, {
     status,
     headers: {
       "content-type": "text/html; charset=utf-8",
-      "cache-control": "no-store"
+      "cache-control": "no-store",
+      ...extraHeaders
     }
+  });
+}
+
+function adminPage(body, nonce) {
+  return html(body, 200, {
+    "content-security-policy": `default-src 'self'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`,
+    "referrer-policy": "no-referrer",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY"
   });
 }
 
@@ -5604,7 +5933,7 @@ function escapeHTML(value) {
   }[char]));
 }
 
-function adminHTML(env = {}) {
+function adminHTML(env = {}, nonce = "") {
   const labels = JSON.stringify(Object.fromEntries(CLIENT_PROFILES.map((item) => [item.id, item.label]))).replace(/</g, "\\u003c");
   const dispatchDomain = dnsDomain(env);
   return `<!doctype html>
@@ -6011,30 +6340,45 @@ body.theme-cyber .chip.primary{color:var(--accent);box-shadow:0 0 12px rgba(0,24
 .badge.ok{color:var(--ok);border-color:color-mix(in srgb, var(--ok) 30%, transparent);background:color-mix(in srgb, var(--ok) 12%, transparent)}
 .badge.warn{color:var(--warn);border-color:color-mix(in srgb, var(--warn) 30%, transparent);background:color-mix(in srgb, var(--warn) 12%, transparent)}
 
-.node-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
+.node-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px;align-items:start}
 .emby-card{
-  position:relative;overflow:hidden;display:flex;flex-direction:column;gap:0;
-  padding:0;border-radius:20px;min-width:0;
+  position:relative;overflow:hidden;padding:0;border-radius:18px;min-width:0;perspective:1200px;
   transition:transform .2s var(--ease), box-shadow .2s var(--ease);
 }
+.card-flip-shell{
+  display:grid;min-width:0;transform-style:preserve-3d;will-change:transform;
+  transition:transform .38s cubic-bezier(.22,.74,.22,1)
+}
+.emby-card.is-flipped .card-flip-shell{transform:rotateY(180deg)}
+.card-face{
+  grid-area:1/1;min-width:0;display:flex;flex-direction:column;
+  backface-visibility:hidden;-webkit-backface-visibility:hidden
+}
+.card-front{pointer-events:auto}
+.card-back{transform:rotateY(180deg);pointer-events:none}
+.emby-card.is-flipped .card-front{pointer-events:none}
+.emby-card.is-flipped .card-back{pointer-events:auto}
 .emby-card:before{
   content:"";position:absolute;inset:0 auto 0 0;width:3px;
   background:var(--grad-accent);
 }
-.emby-card:after{
-  content:"";position:absolute;right:-40px;top:-40px;width:120px;height:120px;border-radius:50%;
-  background:radial-gradient(circle, color-mix(in srgb, var(--accent) 18%, transparent), transparent 68%);
-  pointer-events:none;
-}
 .emby-card:hover{transform:translateY(-3px);box-shadow:var(--shadow-lg), inset 0 1px 0 var(--highlight)}
+.emby-card.is-pressed{transform:translateY(-1px) scale(.992)}
 body.theme-cyber .emby-card:hover{
   box-shadow:0 0 0 1px rgba(0,245,212,.16), 0 18px 40px rgba(0,0,0,.45), 0 0 30px rgba(255,0,122,.06);
 }
 .emby-card .card-top{
-  display:flex;justify-content:space-between;align-items:flex-start;gap:10px;
+  display:flex;justify-content:space-between;align-items:center;gap:10px;
   padding:14px 14px 12px;border-bottom:1px solid var(--line);
-  background:linear-gradient(105deg, color-mix(in srgb, var(--accent) 10%, transparent), transparent 58%);
+  background:color-mix(in srgb, var(--accent) 5%, transparent);
 }
+.card-top-actions{display:flex;align-items:center;gap:7px;flex:0 0 auto}
+.card-flip-btn{
+  width:30px;height:30px;min-height:30px;padding:0;border:1px solid var(--line);border-radius:10px;
+  display:inline-grid;place-items:center;background:var(--glass-soft);color:var(--muted);
+  font-size:16px;line-height:1;cursor:pointer;transition:transform .16s var(--ease),color .16s var(--ease),background .16s var(--ease)
+}
+.card-flip-btn:hover{color:var(--ink);background:var(--accent-soft);transform:rotate(20deg)}
 .card-title-group{display:flex;align-items:center;gap:10px;min-width:0}
 .emby-icon{
   width:42px;height:42px;border-radius:14px;border:1px solid var(--line);
@@ -6046,14 +6390,46 @@ body.theme-cyber .emby-card:hover{
 .card-title{min-width:0}
 .card-title b{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
 .card-title small{display:block;color:var(--muted);font-size:11px;margin-top:2px}
-.emby-card .card-body{display:grid;gap:8px;padding:12px 14px}
-.card-feature-actions{display:flex;gap:8px;flex-wrap:wrap;padding-top:4px}
-.card-feature-actions .btn{flex:1;min-width:110px}
-.emby-card .card-footer{
-  display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;
-  margin-top:auto;padding:12px 14px;border-top:1px dashed var(--line);
-  background:linear-gradient(180deg, transparent, var(--glass-soft));
+.emby-card .card-body{display:grid;gap:12px;padding:12px 14px 14px}
+.route-summary{
+  display:grid;grid-template-columns:minmax(0,1.35fr) minmax(150px,.65fr);gap:10px;
+  padding:12px;border:1px solid var(--line);border-radius:14px;background:var(--glass-soft)
 }
+.route-current{display:grid;align-content:center;gap:5px;min-width:0}
+.route-eyebrow{color:var(--muted);font-size:10px;font-weight:760}
+.route-value{display:flex;align-items:center;gap:8px;min-height:28px}
+.route-value i{width:9px;height:9px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 4px color-mix(in srgb,var(--muted) 15%,transparent)}
+.route-value b{font-size:20px;line-height:1.15;letter-spacing:0;color:var(--ink)}
+.route-current.direct .route-value i{background:#10B981;box-shadow:0 0 0 4px rgba(16,185,129,.14)}
+.route-current.proxy .route-value i{background:#0EA5E9;box-shadow:0 0 0 4px rgba(14,165,233,.14)}
+.route-current small{color:var(--muted);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.route-facts{display:grid;grid-template-columns:1fr;gap:7px;border-left:1px solid var(--line);padding-left:10px}
+.route-fact{display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:11px}
+.route-fact span{color:var(--muted)}
+.route-fact b{color:var(--ink);font-size:11px;text-align:right}
+.route-latency{font-variant-numeric:tabular-nums}
+.route-latency.good{color:var(--ok)}
+.route-latency.mid{color:var(--warn)}
+.route-latency.bad{color:var(--danger)}
+.route-latency.pending{color:var(--muted)}
+.card-meta-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.card-meta-item{min-width:0;padding:9px 10px;border-top:1px solid var(--line)}
+.card-meta-item span{display:block;color:var(--muted);font-size:10px;font-weight:720}
+.card-meta-item b{display:block;margin-top:4px;color:var(--ink);font-size:12px;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card-meta-item small{display:block;margin-top:2px;color:var(--muted);font-size:10px;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card-back .card-body{gap:14px}
+.card-back-heading{display:grid;gap:3px}
+.card-back-heading b{font-size:13px;color:var(--ink)}
+.card-back-heading small{font-size:10px;color:var(--muted)}
+.card-back-section{display:grid;gap:9px;padding:10px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.card-back-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
+.card-back-actions .btn{width:100%;min-width:0}
+.card-back-footer{display:grid;grid-template-columns:1fr;gap:7px;margin-top:auto;padding:11px 14px;border-top:1px solid var(--line);background:var(--glass-soft)}
+.emby-card .card-footer{
+  display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;
+  margin-top:auto;padding:11px 14px;border-top:1px solid var(--line);background:var(--glass-soft)
+}
+.emby-card .card-footer .btn{width:100%;min-width:0;padding:0 7px}
 .info-row{display:grid;grid-template-columns:78px 1fr;gap:8px;align-items:start;font-size:12px}
 .info-label{color:var(--muted);font-weight:760}
 .info-value{min-width:0;text-align:left;word-break:break-all;color:var(--ink)}
@@ -6078,6 +6454,9 @@ body.theme-cyber .emby-card:hover{
   width:100%;border:1px solid var(--line);border-radius:16px;overflow:auto;
   background:var(--glass-soft);box-shadow:inset 0 1px 0 var(--highlight)
 }
+.log-client{display:grid;gap:3px;min-width:150px;max-width:260px}
+.log-client b{font-size:12px;color:var(--ink);letter-spacing:0}
+.log-client small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:10px;font-family:var(--mono)}
 table{width:100%;border-collapse:collapse;min-width:720px}
 th,td{padding:12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle;color:var(--ink)}
 th{
@@ -6154,8 +6533,8 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
 .notice{display:none}
 .page-tabs{display:none !important}
 .mobile-nav{
-  display:none;position:fixed;left:50%;bottom:12px;transform:translateX(-50%);z-index:200;
-  gap:6px;padding:7px;border-radius:18px;max-width:calc(100vw - 16px);overflow:auto;
+  display:none;position:relative;z-index:200;
+  gap:6px;padding:7px;border-radius:18px;width:100%;overflow:auto;
   background:var(--glass-strong);border:1px solid var(--line);
   box-shadow:var(--shadow-lg), inset 0 1px 0 var(--highlight);
   backdrop-filter:blur(22px) saturate(1.25);
@@ -6182,9 +6561,14 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
 }
 @media (prefers-reduced-motion: reduce){
   *{animation:none !important;transition:none !important}
+  .card-flip-shell{transform:none !important}
+  .card-face{backface-visibility:visible;-webkit-backface-visibility:visible}
+  .card-back{display:none;transform:none}
+  .emby-card.is-flipped .card-front{display:none}
+  .emby-card.is-flipped .card-back{display:flex}
 }
 @media(max-width:980px){
-  body{padding:12px 12px 88px}
+  body{padding:12px}
   .app-shell{grid-template-columns:1fr}
   .sidebar{display:none}
   .main-panel{padding-top:42px}
@@ -6195,6 +6579,7 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
   }
   .side-nav{display:none}
   .mobile-nav{display:flex}
+  .mobile-nav .side-link{flex:1 1 0;justify-content:center;padding:0 8px}
   .stat-strip,.metrics,.chart-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
   .split-2{grid-template-columns:1fr}
   .network-workspace{grid-template-columns:1fr}
@@ -6207,6 +6592,7 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
 @media(max-width:560px){
   .hero-bar{flex-direction:column;align-items:flex-start}
   .panel-head{flex-direction:column;align-items:stretch}
+  .form-section-title{align-items:flex-start;flex-direction:column;gap:3px}
   .panel-head>.toolbar-inline{width:100%}
   .hero-actions,.toolbar-inline{width:100%}
   .hero-actions .btn,.toolbar-inline .btn{flex:1}
@@ -6215,6 +6601,12 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
   .stat-strip,.metrics{grid-template-columns:1fr 1fr}
   .chart-grid{grid-template-columns:1fr}
   .node-grid{grid-template-columns:1fr}
+  .emby-card:hover{transform:none}
+  .route-summary{grid-template-columns:minmax(0,1.2fr) minmax(118px,.8fr);padding:10px}
+  .route-value b{font-size:18px}
+  .route-facts{padding-left:9px}
+  .card-meta-item{padding:8px 6px}
+  .emby-card .card-footer{grid-template-columns:repeat(2,minmax(0,1fr))}
   .form-grid,.node-form,.option-row{grid-template-columns:1fr}
   .network-source-grid{grid-template-columns:1fr}
   .network-source-block{padding:0 0 14px}
@@ -6234,6 +6626,17 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
   .ip-table td:last-child .btn{flex:1}
   .ip-table tr.ip-empty-row{margin:0;padding:22px 12px;border:0;background:transparent;box-shadow:none}
   .ip-table tr.ip-empty-row td{position:static;display:block;width:100%;max-width:none;padding:0;text-align:center}
+  .visitor-table{border:0;background:transparent;overflow:visible}
+  .visitor-table table,.visitor-table tbody,.visitor-table tr,.visitor-table td{display:block;width:100%;min-width:0}
+  .visitor-table thead{display:none}
+  .visitor-table tbody{display:grid;gap:10px}
+  .visitor-table tr{padding:10px 12px;border:1px solid var(--line);border-radius:14px;background:var(--glass-soft);box-shadow:inset 0 1px 0 var(--highlight)}
+  .visitor-table td{display:grid;grid-template-columns:88px minmax(0,1fr);gap:8px;border:0;padding:5px 0;align-items:start;word-break:break-word}
+  .visitor-table td::before{content:attr(data-label);color:var(--muted);font-size:10px;font-weight:760}
+  .visitor-table .log-client{min-width:0;max-width:none}
+  .visitor-table .log-client small{overflow:visible;text-overflow:clip;white-space:normal;word-break:break-all;line-height:1.45}
+  .visitor-table .visitor-empty{display:block;text-align:center;padding:18px 0;color:var(--text-sec)}
+  .visitor-table .visitor-empty::before{display:none}
 }
 
 /* compact top actions */
@@ -6269,11 +6672,6 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
 .theme-icon-btn:hover{transform:translateY(-1px)}
 .menu-pop .theme-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;color:var(--muted);font-size:12px}
 .login-theme-float{position:fixed;top:12px;right:12px;z-index:5}
-.latency-chip{font-variant-numeric:tabular-nums}
-.latency-chip.good{color:var(--ok);border-color:color-mix(in srgb, var(--ok) 30%, transparent);background:color-mix(in srgb, var(--ok) 12%, transparent)}
-.latency-chip.mid{color:var(--warn);border-color:color-mix(in srgb, var(--warn) 30%, transparent);background:color-mix(in srgb, var(--warn) 12%, transparent)}
-.latency-chip.bad{color:var(--danger);border-color:color-mix(in srgb, var(--danger) 30%, transparent);background:color-mix(in srgb, var(--danger) 12%, transparent)}
-.latency-chip.pending{color:var(--muted)}
 #nodeEditorPanel[hidden],#deployBody[hidden]{display:none !important}
 .pie-wrap{display:grid;grid-template-columns:140px 1fr;gap:12px;align-items:center;min-height:150px}
 .pie-svg{width:140px;height:140px;filter:drop-shadow(0 8px 16px rgba(0,0,0,.12))}
@@ -6354,6 +6752,12 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
         <div class="mobile-edge-item"><span>出口</span><b id="mobileTraceEgress" class="mono">--</b></div>
         <div class="mobile-edge-item"><span><i id="mobileRttDot" class="dot" style="display:inline-block;vertical-align:middle;margin-right:4px"></i>RTT</span><b id="mobileRttValue" class="mono">--</b></div>
       </div>
+      <nav class="mobile-nav">
+        <button class="side-link active" data-page-tab="nodes" type="button">线路</button>
+        <button class="side-link" data-page-tab="network" type="button">网络</button>
+        <button class="side-link" data-page-tab="dashboard" type="button">性能</button>
+        <button class="side-link" data-page-tab="deploy" type="button">更新</button>
+      </nav>
       <header class="hero-bar glass">
         <div>
           <div class="section-kicker">控制台</div>
@@ -6410,7 +6814,7 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
               <div class="form-grid node-form">
                 <div class="field full w12"><label>服务器线路</label><textarea id="targets" placeholder="https://media.example.com&#10;https://backup.example.com"></textarea></div>
                 <div class="field w12"><label>独立视频线路（每行一条）</label><textarea id="streamTarget" placeholder="https://stream-a.example.com&#10;https://stream-b.example.com&#10;留空使用服务器线路"></textarea></div>
-                <div class="field w4"><label>视频选线策略</label><select id="streamStrategy"><option value="auto">自动健康与延迟优先</option><option value="priority">严格配置顺序，故障后切换</option></select></div>
+                <div class="field w4"><label>中转视频选线</label><select id="streamStrategy"><option value="auto">响应与健康择优</option><option value="priority">严格配置顺序，故障后切换</option></select></div>
                 <div class="field w4"><label>视频首包超时（毫秒）</label><input id="streamTimeoutMs" type="number" min="500" max="10000" step="100" value="2500"></div>
                 <div class="field w4"><label>线路诊断</label><button class="btn" id="testEditedStreamBtn" type="button">测试所有视频线路</button></div>
               </div>
@@ -6420,13 +6824,14 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
               <div class="form-grid node-form">
                 <div class="field w4"><label>模拟客户端</label><select id="clientProfile">${clientProfileOptionsHTML()}</select></div>
                 <div class="field w4"><label>Header</label><select id="headerMode"><option value="off">保守 off</option><option value="realip_only">严格 realip_only</option><option value="dual">兼容 dual</option><option value="strict">强力 strict</option></select></div>
-                <div class="field w4"><label>播放</label><select id="streamMode"><option value="proxy">中转播放</option><option value="direct">直连播放</option><option value="auto">自动</option></select></div>
+                <div class="field w4"><label>播放方式</label><select id="streamMode"><option value="proxy">中转播放（默认）</option><option value="direct">固定直连</option><option value="auto">条件直连（鉴权兼容时）</option></select></div>
                 <div class="option-row">
                   <label class="check"><input id="impersonate" type="checkbox" checked>启用模拟客户端</label>
-                  <label class="check"><input id="directExternal" type="checkbox">自动模式允许直链</label>
+                  <label class="check"><input id="directExternal" type="checkbox">条件直连时允许外部直链</label>
                   <label class="check"><input id="cacheImage" type="checkbox" checked>海报及图片缓存</label>
                   <label class="check"><input id="enabled" type="checkbox" checked>启用节点</label>
                 </div>
+                <div class="hint" style="grid-column:1/-1">不读取视频正文测速。条件直连只判断请求与鉴权能否安全直链；多条中转线路按响应耗时和近期失败状态选择。</div>
               </div>
             </div>
             <div class="form-section" id="watchStrategySection">
@@ -6601,10 +7006,10 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
             </div>
           </div>
           <div class="panel-body">
-            <div class="form-section-title" style="margin:4px 0 10px"><b>真实性能</b><span>来自 Worker 实际代理请求，不是浏览器模拟测速</span></div>
+            <div class="form-section-title" style="margin:4px 0 10px"><b>真实性能</b><span>统计响应建立耗时、成功率与线路切换；不读取视频正文测速</span></div>
             <div class="stat-strip" style="margin-bottom:14px">
               <div class="stat-tile"><span>代理请求</span><b id="perfRequests">--</b><em id="perfWindow">最近 24 小时</em></div>
-              <div class="stat-tile"><span>P50 / P95</span><b id="perfPercentiles" style="font-size:18px">--</b><em>总处理耗时</em></div>
+              <div class="stat-tile"><span>P50 / P95</span><b id="perfPercentiles" style="font-size:18px">--</b><em>响应建立耗时</em></div>
               <div class="stat-tile"><span>平均上游</span><b id="perfUpstream">--</b><em>首包与重定向</em></div>
               <div class="stat-tile"><span>错误 / 切线</span><b id="perfFailures" style="font-size:18px">--</b><em>真实请求累计</em></div>
             </div>
@@ -6616,7 +7021,7 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
             </div>
             <div class="table-wrapper" style="margin-bottom:14px">
               <table>
-                <thead><tr><th>节点</th><th>类型</th><th>实际线路</th><th>尝试</th><th>成功率</th><th>平均耗时</th><th>最近活动</th></tr></thead>
+                <thead><tr><th>节点</th><th>类型</th><th>实际线路</th><th>尝试</th><th>成功率</th><th>平均响应</th><th>最近活动</th></tr></thead>
                 <tbody id="performanceLineRows"><tr><td colspan="7" style="text-align:center;color:var(--text-sec)">暂无线路数据</td></tr></tbody>
               </table>
             </div>
@@ -6628,10 +7033,10 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
               <div class="stat-tile"><span>D1 日期</span><b id="statsDay" style="font-size:18px">--</b><em>北京时间</em></div>
             </div>
             <div id="dashboardCharts" class="chart-grid"></div>
-            <div class="table-wrapper" style="margin-top:12px">
+            <div class="table-wrapper visitor-table" style="margin-top:12px">
               <table>
-                <thead><tr><th>时间</th><th>节点</th><th>IP</th><th>地区</th><th>状态</th><th>路径</th></tr></thead>
-                <tbody id="logRows"><tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无数据</td></tr></tbody>
+                <thead><tr><th>时间</th><th>节点</th><th>IP / 地区</th><th>状态</th><th>入站客户端</th><th>出站模拟客户端</th><th>路径</th></tr></thead>
+                <tbody id="logRows"><tr><td class="visitor-empty" colspan="7">暂无数据</td></tr></tbody>
               </table>
             </div>
             <pre id="statsOut" class="output" style="margin-top:14px"></pre>
@@ -6665,15 +7070,9 @@ body.theme-cyber .dialog-backdrop{background:rgba(0,0,0,.55)}
     </div>
   </div>
 
-  <nav class="mobile-nav">
-    <button class="side-link active" data-page-tab="nodes" type="button">线路</button>
-    <button class="side-link" data-page-tab="network" type="button">网络</button>
-    <button class="side-link" data-page-tab="dashboard" type="button">性能</button>
-    <button class="side-link" data-page-tab="deploy" type="button">更新</button>
-  </nav>
 </div>
 
-<script>
+<script nonce="${escapeHTML(nonce)}">
 let nodes = [];
 let latencyMap = {};
 let stats = null;
@@ -6688,7 +7087,8 @@ const DEFAULT_NODE_ICON_CLIENT = ${JSON.stringify(DEFAULT_NODE_ICON)};
 const DISPATCH_ORIGIN = ${JSON.stringify(dispatchDomain ? "https://" + dispatchDomain : "")};
 const $ = (id) => document.getElementById(id);
 const tokenKey = "embyproxy_cf_admin_token";
-let adminToken = localStorage.getItem(tokenKey) || "";
+localStorage.removeItem(tokenKey);
+let adminToken = sessionStorage.getItem(tokenKey) || "";
 function showLogin(){
   document.body.classList.remove("authed");
   $("loginToken").value = "";
@@ -6703,7 +7103,7 @@ function saveToken(){
   if (!token) return showToast("请输入访问密码");
   $("loginError").textContent = "";
   adminToken = token;
-  localStorage.setItem(tokenKey, token);
+  sessionStorage.setItem(tokenKey, token);
   document.body.classList.add("authed");
   switchPage("nodes");
   loadNodes({ quietAuth: true });
@@ -6714,7 +7114,7 @@ function saveToken(){
 }
 function logout(){
   adminToken = "";
-  localStorage.removeItem(tokenKey);
+  sessionStorage.removeItem(tokenKey);
   nodes = [];
   document.body.classList.remove("authed");
   showLogin();
@@ -6789,7 +7189,7 @@ function handleError(error, quietAuth = false) {
   if (error?.status === 401) {
     const wasAuthed = document.body.classList.contains("authed");
     adminToken = "";
-    localStorage.removeItem(tokenKey);
+    sessionStorage.removeItem(tokenKey);
     showLogin();
     if (!quietAuth) uiAlert(wasAuthed ? "登录已失效，请重新输入访问密码。" : "访问密码不正确。", "需要重新登录");
     return;
@@ -6831,56 +7231,113 @@ function renderNodes(){
     const url = proxyURL(n);
     const firstTarget = (n.targets || [])[0] || "";
     const icon = iconHTML(n);
-    const keep = keepaliveHTML(n);
-    const emby = n.embyUser
-      ? '<span class="chip ok">' + esc(n.embyUser) + '</span>' + (n.embyPlayId ? '<span class="chip">ID ' + esc(n.embyPlayId) + '</span>' : '<span class="chip">自动选片</span>')
-      : '<span class="chip warn">Emby 未配置</span>';
-    const autoWatch = n.autoWatch && n.embyUser && n.embyPassword
-      ? '<span class="chip ok">到期自动观看</span>'
-      : '<span class="chip">仅到期提醒</span>';
+    const keep = cardKeepaliveSummary(n);
     const videoLines = String(n.streamTarget || "").split(/\\n+/).map(v => v.trim()).filter(Boolean);
+    const videoCount = videoLines.length || (n.targets || []).length;
     const lat = latencyMap[n.name];
-    let latChip = '<span class="chip latency-chip pending" data-latency-for="' + attr(n.name) + '">未测速</span>';
-    if (lat && lat.ms >= 0) {
-      const cls = lat.ms < 180 ? "good" : (lat.ms < 450 ? "mid" : "bad");
-      latChip = '<span class="chip latency-chip ' + cls + '" data-latency-for="' + attr(n.name) + '">' + lat.ms + ' ms</span>';
-    } else if (lat && lat.ms < 0) {
-      latChip = '<span class="chip latency-chip bad" data-latency-for="' + attr(n.name) + '">超时</span>';
-    } else if (lat && lat.pending) {
-      latChip = '<span class="chip latency-chip pending" data-latency-for="' + attr(n.name) + '">测速中…</span>';
-    }
-    return '<article class="emby-card" data-search="' + attr([n.name,n.displayName,n.tag,n.remark,firstTarget].join(" ")) + '">' +
-      '<div class="card-top"><div class="card-title-group"><div class="emby-icon">' + icon + '</div><div class="card-title"><b>' + esc(n.displayName || n.name) + '</b><small>' + esc(n.name) + (n.tag ? " · " + esc(n.tag) : "") + '</small></div></div><span class="badge ' + (n.enabled ? "ok" : "warn") + '">' + (n.enabled ? "启用" : "停用") + '</span></div>' +
-      '<div class="card-body">' +
-        '<div class="chip-row">' +
-          latChip +
-          '<span class="chip primary">' + esc(n.headerMode || "dual") + '</span>' +
-          '<span class="chip">' + esc(n.streamMode || "proxy") + '</span>' +
-          '<span class="chip">视频 ' + (videoLines.length || (n.targets || []).length) + ' 线 · ' + esc(n.streamStrategy === "priority" ? "顺序" : "自动") + '</span>' +
-          '<span class="chip">' + (n.impersonate === false ? "模拟关" : esc(CLIENT_LABELS[n.clientProfile] || n.clientProfile || "client")) + '</span>' +
-          autoWatch +
-          emby +
-        '</div>' +
-        infoRow("接入", '<span class="mono masked" data-secret="' + attr(url) + '">••••••••••••</span> <button class="btn small" data-act="reveal" data-name="' + attr(n.name) + '">显示</button>') +
-        infoRow("上游", '<span class="masked" data-secret="' + attr((n.targets || []).join("\\n")) + '">' + esc(firstTarget ? "••••••••••••" : "未配置") + '</span>') +
-        infoRow("视频", (videoLines.length ? (videoLines.length + ' 条独立线路 · ' + Number(n.streamTimeoutMs || 2500) + 'ms 切换') : '跟随服务器线路') + ' <button class="btn small" data-act="stream" data-name="' + attr(n.name) + '">诊断</button>') +
-        infoRow("保活", keep) +
-        '<div class="card-feature-actions"><button class="btn small" data-act="stream-edit" data-name="' + attr(n.name) + '">视频配置</button><button class="btn small" data-act="watch-edit" data-name="' + attr(n.name) + '">观看策略</button></div>' +
-        (n.secret ? infoRow("密钥", '<span class="masked" data-secret="' + attr(n.secret) + '">••••••</span>') : '') +
+    const latencyText = lat?.pending ? "测速中…" : (lat?.ms >= 0 ? lat.ms + " ms" : (lat?.ms < 0 ? "超时" : "未测速"));
+    const route = n.playbackRoute || {};
+    const routeMode = route.mode === "direct" ? "direct" : (route.mode === "proxy" ? "proxy" : "empty");
+    const routeLabel = routeMode === "direct"
+      ? (Number(route.status || 0) === 307 ? "拖动直连回退" : "直连重定向")
+      : (routeMode === "proxy" ? "中转响应" : "暂无记录");
+    const routeDetail = route.ts
+      ? relativeTimeClient(route.ts) + (route.status ? " · HTTP " + route.status : "") + (routeMode === "direct" ? " · 不代表客户端已播成功" : "")
+      : "出现中转响应或直连重定向后显示";
+    const configuredMode = n.streamMode === "direct" ? "固定直连" : (n.streamMode === "auto" ? "条件直连" : "固定中转");
+    const recentStatusText = route.status ? ("HTTP " + route.status) : "暂无记录";
+    const lineStrategyDetail = n.streamStrategy === "priority"
+      ? "按配置顺序使用，当前线路失败后切换"
+      : "按响应耗时与近期失败状态选择，不读取视频正文测速";
+    const simulatedClient = n.impersonate === false ? "未启用" : (CLIENT_LABELS[n.clientProfile] || n.clientProfile || "未知");
+    const simulatedDevice = n.impersonate === false ? "保留入站身份" : (n.clientProfile === "hills_windows" ? "Windows 设备" : "设备 OnePlus-PKG110");
+    const watchAutomatic = Boolean(n.autoWatch && n.embyUser && n.embyPassword);
+    const watchLabel = watchAutomatic ? "到期自动观看" : "仅到期提醒";
+    const watchDetail = n.embyUser ? ("账号 " + n.embyUser) : "未配置观看账号";
+    const cardLabel = (n.displayName || n.name) + "，点击查看连接与更多操作";
+    return '<article class="emby-card" tabindex="0" aria-expanded="false" aria-label="' + attr(cardLabel) + '" data-name="' + attr(n.name) + '" data-search="' + attr([n.name,n.displayName,n.tag,n.remark,firstTarget].join(" ")) + '">' +
+      '<div class="card-flip-shell">' +
+        '<section class="card-face card-front" aria-hidden="false">' +
+          '<div class="card-top"><div class="card-title-group"><div class="emby-icon">' + icon + '</div><div class="card-title"><b>' + esc(n.displayName || n.name) + '</b><small>' + esc(n.name) + (n.tag ? " · " + esc(n.tag) : "") + '</small></div></div><div class="card-top-actions"><span class="badge ' + (n.enabled ? "ok" : "warn") + '">' + (n.enabled ? "启用" : "停用") + '</span><button class="card-flip-btn" type="button" data-act="flip" title="查看连接与更多操作" aria-label="查看连接与更多操作">↻</button></div></div>' +
+          '<div class="card-body">' +
+            '<div class="route-summary">' +
+              '<div class="route-current ' + routeMode + '"><span class="route-eyebrow">最近播放路径</span><div class="route-value"><i></i><b>' + esc(routeLabel) + '</b></div><small title="' + attr(routeDetail) + '">' + esc(routeDetail) + '</small></div>' +
+              '<div class="route-facts"><div class="route-fact"><span>配置</span><b>' + esc(configuredMode) + '</b></div><div class="route-fact"><span>延迟</span><b class="route-latency" data-latency-for="' + attr(n.name) + '">' + esc(latencyText) + '</b></div><div class="route-fact"><span>最近响应</span><b title="' + attr(routeDetail) + '">' + esc(recentStatusText) + '</b></div></div>' +
+            '</div>' +
+            '<div class="card-meta-grid">' +
+              cardMetaItem("模拟身份", simulatedClient, simulatedDevice) +
+              cardMetaItem("中转视频线路", videoCount + " 条 · " + (n.streamStrategy === "priority" ? "配置顺序" : "响应择优"), lineStrategyDetail) +
+              cardMetaItem("观看保活", keep.label, keep.detail) +
+              cardMetaItem("模拟观看", watchLabel, watchDetail) +
+            '</div>' +
+          '</div>' +
+          '<div class="card-footer"><button class="btn small" data-act="copy" data-name="' + attr(n.name) + '">复制</button><button class="btn small" data-act="edit" data-name="' + attr(n.name) + '">编辑</button><button class="btn small" data-act="ping" data-name="' + attr(n.name) + '">测速</button><button class="btn small primary" data-act="keepalive" data-name="' + attr(n.name) + '">已观看</button></div>' +
+        '</section>' +
+        '<section class="card-face card-back" aria-hidden="true" inert>' +
+          '<div class="card-top"><div class="card-title-group"><div class="emby-icon">' + icon + '</div><div class="card-title"><b>' + esc(n.displayName || n.name) + '</b><small>连接与管理</small></div></div><button class="card-flip-btn" type="button" data-act="flip" title="返回状态" aria-label="返回状态">↻</button></div>' +
+          '<div class="card-body">' +
+            '<div class="card-back-heading"><b>接入与上游</b><small>敏感信息默认隐藏</small></div>' +
+            '<div class="card-back-section">' +
+              infoRow("接入", '<span class="mono masked" data-secret="' + attr(url) + '">••••••••••••</span> <button class="btn small" data-act="reveal" data-name="' + attr(n.name) + '">显示</button>') +
+              infoRow("上游", '<span class="masked" data-secret="' + attr((n.targets || []).join("\\n")) + '">' + esc(firstTarget ? "••••••••••••" : "未配置") + '</span>') +
+              (n.secret ? infoRow("密钥", '<span class="masked" data-secret="' + attr(n.secret) + '">••••••</span>') : '') +
+            '</div>' +
+            '<div class="card-back-heading"><b>线路与管理</b><small>配置、排序和删除</small></div>' +
+            '<div class="card-back-actions">' +
+              '<button class="btn small" data-act="stream" data-name="' + attr(n.name) + '">线路诊断</button>' +
+              '<button class="btn small" data-act="stream-edit" data-name="' + attr(n.name) + '">视频配置</button>' +
+              '<button class="btn small" data-act="watch-edit" data-name="' + attr(n.name) + '">观看策略</button>' +
+              '<button class="btn small" data-act="up" data-name="' + attr(n.name) + '" ' + (index === 0 ? "disabled" : "") + '>上移</button>' +
+              '<button class="btn small" data-act="down" data-name="' + attr(n.name) + '" ' + (index === list.length - 1 ? "disabled" : "") + '>下移</button>' +
+              '<button class="btn small danger" data-act="delete" data-name="' + attr(n.name) + '">删除</button>' +
+            '</div>' +
+          '</div>' +
+          '<div class="card-back-footer"><button class="btn small" type="button" data-act="flip">返回状态</button></div>' +
+        '</section>' +
       '</div>' +
-      '<div class="card-footer"><div class="card-actions"><button class="btn small" data-act="up" data-name="' + attr(n.name) + '" ' + (index === 0 ? "disabled" : "") + '>上移</button><button class="btn small" data-act="down" data-name="' + attr(n.name) + '" ' + (index === list.length - 1 ? "disabled" : "") + '>下移</button></div><div class="card-actions"><button class="btn small" data-act="copy" data-name="' + attr(n.name) + '">复制</button><button class="btn small" data-act="edit" data-name="' + attr(n.name) + '">编辑</button><button class="btn small" data-act="ping" data-name="' + attr(n.name) + '">测速</button><button class="btn small primary" data-act="keepalive" data-name="' + attr(n.name) + '">已观看</button><button class="btn small danger" data-act="delete" data-name="' + attr(n.name) + '">删除</button></div></div>' +
     '</article>';
   }).join("") || '<div class="empty">暂无节点。点右上角 ··· 或「新建」添加线路。</div>';
 }
 
 function infoRow(label, value){ return '<div class="info-row"><div class="info-label">' + esc(label) + '</div><div class="info-value">' + value + '</div></div>'; }
-function keepaliveHTML(n){
-  if (!n.renewDays) return '<span class="chip">保活关闭</span>';
+function cardMetaItem(label, value, detail){
+  return '<div class="card-meta-item"><span>' + esc(label) + '</span><b title="' + attr(value || "") + '">' + esc(value || "-") + '</b><small title="' + attr(detail || "") + '">' + esc(detail || "-") + '</small></div>';
+}
+function relativeTimeClient(ts){
+  const seconds = Math.max(0, Math.floor((Date.now() - Number(ts || 0)) / 1000));
+  if (seconds < 60) return "刚刚";
+  if (seconds < 3600) return Math.floor(seconds / 60) + " 分钟前";
+  if (seconds < 86400) return Math.floor(seconds / 3600) + " 小时前";
+  return Math.floor(seconds / 86400) + " 天前";
+}
+function cardKeepaliveSummary(n){
+  if (!n.renewDays) return { label:"未启用", detail:"未设置观看周期" };
   const k = n.keepalive || {};
-  const cls = k.status === "due" || k.status === "warn" ? "warn" : "ok";
-  const text = k.status === "due" ? "已超期 " + Math.abs(k.remainDays || 0) + " 天" : "剩余 " + (k.remainDays ?? n.renewDays) + " 天";
-  const last = k.lastPlayTs ? new Date(k.lastPlayTs).toLocaleString() : "无记录";
-  return '<span class="chip ' + cls + '">' + esc(text) + '</span><span class="chip">周期 ' + esc(n.renewDays) + ' 天</span><div class="hint" style="margin-top:4px">最近 ' + esc(last) + '</div>';
+  const label = k.status === "due" ? ("已超期 " + Math.abs(k.remainDays || 0) + " 天") : ("剩余 " + (k.remainDays ?? n.renewDays) + " 天");
+  const detail = k.lastPlayTs ? ("最近 " + relativeTimeClient(k.lastPlayTs)) : ("周期 " + n.renewDays + " 天 · 无播放记录");
+  return { label, detail };
+}
+function setCardFlipped(card, flipped){
+  if (!card) return;
+  const next = Boolean(flipped);
+  card.classList.toggle("is-flipped", next);
+  card.setAttribute("aria-expanded", String(next));
+  const front = card.querySelector(".card-front");
+  const back = card.querySelector(".card-back");
+  if (front) {
+    front.setAttribute("aria-hidden", String(next));
+    front.inert = next;
+  }
+  if (back) {
+    back.setAttribute("aria-hidden", String(!next));
+    back.inert = !next;
+  }
+}
+function toggleCardFlipped(card){
+  setCardFlipped(card, !card?.classList.contains("is-flipped"));
+}
+function isCardInteractiveTarget(target){
+  return Boolean(target?.closest?.("button,a,input,select,textarea,label,summary,[role=button]"));
 }
 function iconHTML(n){
   const icon = n.icon || DEFAULT_NODE_ICON_CLIENT;
@@ -7119,7 +7576,7 @@ function updateLatencyChip(name){
     return;
   }
   const lat = latencyMap[name];
-  el.className = 'chip latency-chip';
+  el.className = 'route-latency';
   if (!lat || lat.pending) {
     el.classList.add('pending');
     el.textContent = lat && lat.pending ? '测速中…' : '未测速';
@@ -7252,7 +7709,7 @@ function renderPerformance(){
     $("performanceNodeRows").innerHTML = (data.nodes || []).map((row) => '<tr><td>' + esc(row.node || "-") + '</td><td>' + Number(row.requests || 0).toLocaleString() + '</td><td>' + formatPerformanceMs(row.p50Ms) + '</td><td>' + formatPerformanceMs(row.p95Ms) + '</td><td>' + formatPerformanceMs(row.avgNodeMs) + '</td><td>' + formatPerformanceMs(row.avgUpstreamMs) + '</td><td>' + Number(row.errorRate || 0).toFixed(2) + '%</td><td>' + Number(row.failovers || 0) + '</td></tr>').join("") || '<tr><td colspan="8" style="text-align:center;color:var(--text-sec)">暂无性能数据</td></tr>';
   }
   if ($("performanceLineRows")) {
-    $("performanceLineRows").innerHTML = (data.lines || []).map((row) => '<tr><td>' + esc(row.node || "-") + '</td><td>' + esc(row.kind === "stream" ? "视频" : "API") + '</td><td class="mono">' + esc(row.label || "-") + '</td><td>' + Number(row.attempts || 0) + '</td><td>' + Number(row.successRate || 0).toFixed(1) + '%</td><td>' + formatPerformanceMs(row.avgMs) + '</td><td>' + (row.updatedAt ? esc(new Date(Number(row.updatedAt)).toLocaleString()) : "-") + '</td></tr>').join("") || '<tr><td colspan="7" style="text-align:center;color:var(--text-sec)">暂无线路数据</td></tr>';
+    $("performanceLineRows").innerHTML = (data.lines || []).map((row) => '<tr><td>' + esc(row.node || "-") + '</td><td>' + esc(row.kind === "stream" ? "中转视频" : "API") + '</td><td class="mono">' + esc(row.label || "-") + '</td><td>' + Number(row.attempts || 0) + '</td><td>' + Number(row.successRate || 0).toFixed(1) + '%</td><td>' + formatPerformanceMs(row.avgMs) + '</td><td>' + (row.updatedAt ? esc(new Date(Number(row.updatedAt)).toLocaleString()) : "-") + '</td></tr>').join("") || '<tr><td colspan="7" style="text-align:center;color:var(--text-sec)">暂无线路数据</td></tr>';
   }
 }
 async function loadAnalytics(){
@@ -7263,7 +7720,6 @@ async function loadAnalytics(){
     $("traffic7d").textContent = data.traffic7d || "--";
     $("traffic30d").textContent = data.traffic30d || "--";
     $("statsDay").textContent = stats?.day || new Date().toISOString().slice(0, 10);
-    $("logRows").innerHTML = (data.recents || []).map(r => '<tr><td>' + esc(r.timestamp || "") + '</td><td>' + esc(r.prefix || "") + '</td><td class="mono">' + esc(r.ip || "") + '</td><td>' + esc(r.country || "") + '</td><td></td><td>' + esc(r.ua || "") + '</td></tr>').join("") || '<tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无数据</td></tr>';
     $("statsOut").textContent = JSON.stringify(data, null, 2);
     renderDashboardCharts();
   } catch(e){ handleError(e); }
@@ -7386,8 +7842,23 @@ async function updateDNS(){
     loadDNS({ quiet: true });
   } catch(e){ handleError(e); }
 }
+function logClientCell(label, ua, device){
+  const details = [ua, device].filter(Boolean).join(" · ");
+  return '<div class="log-client"><b>' + esc(label || "未知") + '</b>' + (details ? '<small title="' + esc(details) + '">' + esc(details) + '</small>' : '') + '</div>';
+}
+function inboundClientLabel(ua){
+  const value = String(ua || "");
+  if (/yamby/i.test(value)) return "Yamby";
+  if (/hills windows/i.test(value)) return "Hills Windows";
+  if (/hills/i.test(value)) return "Hills";
+  if (/emby/i.test(value)) return "Emby";
+  return value.split(/[\\s\/(]/).filter(Boolean)[0] || "未知";
+}
 function renderLogs(rows){
-  $("logRows").innerHTML = rows.map(r => '<tr><td>' + esc(new Date(Number(r.ts || 0)).toLocaleString()) + '</td><td>' + esc(r.node || "") + '</td><td class="mono">' + esc(r.ip || "") + '</td><td>' + esc(r.country || "") + '</td><td>' + esc(r.status || "") + '</td><td>' + esc(r.path || "") + '</td></tr>').join("") || '<tr><td colspan="6" style="text-align:center;color:var(--text-sec)">暂无数据</td></tr>';
+  $("logRows").innerHTML = rows.map(r => {
+    const outboundLabel = r.outbound_profile === "disabled" ? "未启用模拟" : (CLIENT_LABELS[r.outbound_profile] || (r.outbound_profile ? r.outbound_profile : "历史未记录"));
+    return '<tr><td data-label="时间">' + esc(new Date(Number(r.ts || 0)).toLocaleString()) + '</td><td data-label="节点">' + esc(r.node || "") + '</td><td data-label="IP / 地区"><div><div class="mono">' + esc(r.ip || "") + '</div><small>' + esc(r.country || "") + '</small></div></td><td data-label="状态">' + esc(r.status || "") + '</td><td data-label="入站客户端">' + logClientCell(inboundClientLabel(r.ua), r.ua || "", "") + '</td><td data-label="出站模拟">' + logClientCell(outboundLabel, r.outbound_ua || "", r.outbound_device || "") + '</td><td data-label="路径" class="mono">' + esc(r.path || "") + '</td></tr>';
+  }).join("") || '<tr><td class="visitor-empty" colspan="7">暂无数据</td></tr>';
 }
 function resetForm(options = {}){
   $("formTitle").textContent = "部署 / 编辑媒体线路";
@@ -7589,18 +8060,14 @@ async function doLocalPing(value, tr, sourceLabel) {
   try {
     await fetch("https://" + value + "/cdn-cgi/trace", { mode: "no-cors", signal: controller.signal });
     clearTimeout(timer);
-    updateRowState(latTd, spdTd, Math.round(performance.now() - started), isIPv6 || isDomain);
+    updateRowState(latTd, spdTd, Math.round(performance.now() - started));
   } catch (err) {
     clearTimeout(timer);
-    if (err.name === "AbortError") markTimeout(latTd, spdTd, tr);
-    else updateRowState(latTd, spdTd, Math.round(performance.now() - started), isIPv6 || isDomain);
+    markTimeout(latTd, spdTd, tr);
   }
 }
-function updateRowState(latTd, spdTd, rawLatency, keepRaw) {
-  let latency = rawLatency;
-  if (!keepRaw) {
-    latency = rawLatency >= 500 ? rawLatency - 400 : Math.floor(40 + (rawLatency / 500) * 60) + Math.floor(Math.random() * 10);
-  }
+function updateRowState(latTd, spdTd, rawLatency) {
+  const latency = Math.max(0, Number(rawLatency || 0));
   latTd.textContent = latency + " ms";
   latTd.setAttribute("data-ms", String(latency));
   if (latency < 300) {
@@ -7807,8 +8274,50 @@ $("ipRows").addEventListener("click", async (event) => {
   if (single && await uiConfirm("确定要将调度域名解析到：\\n" + single.dataset.singleDns + "\\n\\n这会覆盖当前记录。", "唯一解析")) sendDNSRequest([single.dataset.singleDns]);
   if (remove) remove.closest("tr").remove();
 });
+let cardPointerState = null;
+$("nodeGrid").addEventListener("pointerdown", (event) => {
+  const card = event.target.closest(".emby-card");
+  if (!card || isCardInteractiveTarget(event.target)) return;
+  cardPointerState = { card, pointerId:event.pointerId, x:event.clientX, y:event.clientY, moved:false };
+  card.classList.add("is-pressed");
+});
+$("nodeGrid").addEventListener("pointermove", (event) => {
+  const state = cardPointerState;
+  if (!state || state.pointerId !== event.pointerId) return;
+  if (Math.hypot(event.clientX - state.x, event.clientY - state.y) > 10) {
+    state.moved = true;
+    state.card.classList.remove("is-pressed");
+  }
+});
+function finishCardPointer(event){
+  const state = cardPointerState;
+  if (!state || (event.pointerId != null && state.pointerId !== event.pointerId)) return;
+  state.card.classList.remove("is-pressed");
+  if (state.moved) state.card.dataset.suppressFlipUntil = String(Date.now() + 350);
+  cardPointerState = null;
+}
+$("nodeGrid").addEventListener("pointerup", finishCardPointer);
+$("nodeGrid").addEventListener("pointercancel", finishCardPointer);
+$("nodeGrid").addEventListener("keydown", (event) => {
+  const card = event.target.closest(".emby-card");
+  if (!card || event.target !== card || !["Enter", " "].includes(event.key)) return;
+  event.preventDefault();
+  toggleCardFlipped(card);
+});
 $("nodeGrid").addEventListener("click", (event) => {
+  const card = event.target.closest(".emby-card");
   const btn = event.target.closest("button[data-act]");
+  if (btn?.dataset.act === "flip") {
+    toggleCardFlipped(card);
+    return;
+  }
+  if (!btn && card && !isCardInteractiveTarget(event.target)) {
+    if (Number(card.dataset.suppressFlipUntil || 0) > Date.now()) {
+      return;
+    }
+    if (!String(window.getSelection?.() || "")) toggleCardFlipped(card);
+    return;
+  }
   if (!btn) return;
   const name = btn.dataset.name;
   if (btn.dataset.act === "copy") copyText(proxyURL(nodes.find(n => n.name === name) || {}));
